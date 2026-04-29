@@ -10,23 +10,41 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   try {
-    const { prompt, model, agent, searchEnabled, search_enabled, messages = [], sessionId, tenantId = 'shift', attachments = [] } = req.body;
+    const body = req.body || {};
+    // Aceptar AMBAS variantes: el frontend del Express server.ts manda
+    // snake_case (tenant_id, session_id, preferred_agent), el legacy
+    // mandaba camelCase. Hacemos fallback en cada par.
+    const messages: any[] = Array.isArray(body.messages) ? body.messages : [];
+    const tenantId       = body.tenant_id     || body.tenantId     || 'shift';
+    const sessionId      = body.session_id    || body.sessionId    || null;
+    const agentInput     = body.preferred_agent || body.agent      || null;
+    const model          = body.model         || 'Shifty 2.0 by Shift AI';
+    const isSearchEnabled = body.search_enabled === true || body.searchEnabled === true;
+    const attachments    = Array.isArray(body.attachments) ? body.attachments : [];
+    const messageIdIn    = body.message_id    || null;
 
-    // Support both camelCase and snake_case from frontend
-    const isSearchEnabled = searchEnabled === true || search_enabled === true;
+    // Si el frontend mandó un campo `prompt` (legacy), lo agregamos como
+    // último mensaje user. Si no, asumimos que el último item de messages
+    // YA es el turn actual del user — no duplicar.
+    const apiMessages: any[] = messages.map((m: any) => ({
+      role: m.role,
+      content: m.content,
+      agent_id: m.agentActive || undefined,
+    }));
+    if (typeof body.prompt === 'string' && body.prompt.length > 0) {
+      apiMessages.push({ role: 'user', content: body.prompt });
+    }
+    const lastUserContent = apiMessages
+      .slice()
+      .reverse()
+      .find((m: any) => m.role === 'user')?.content || '';
 
-    console.log(`[Vercel Gateway] Forwarding request to Swarm: tenant=${tenantId}, agent=${agent}, sessionId=${sessionId || "none"}, search=${isSearchEnabled}, attachments=${attachments.length}`);
+    console.log(`[Vercel Gateway] tenant=${tenantId} agent=${agentInput} session=${sessionId || "none"} msgs=${apiMessages.length}`);
 
-    const swarmAgentId = AGENT_MAP[agent] || "shiftai";
-    const swarmModel = MODEL_MAP[model] || "Claude 3.5 Sonnet";
+    const swarmAgentId = (agentInput && AGENT_MAP[agentInput]) || agentInput || "shiftai";
+    const swarmModel   = MODEL_MAP[model] || "Claude 3.5 Sonnet";
 
-    const apiMessages = [
-      ...messages.map((m: any) => ({ role: m.role, content: m.content, agent_id: m.agentActive || undefined })),
-      { role: "user", content: prompt }
-    ];
-
-    // Detect if user wants a debate
-    const isDebate = isDebateRequest(prompt);
+    const isDebate = isDebateRequest(lastUserContent);
     const targetEndpoint = isDebate ? "/swarm/debate" : "/swarm/chat";
 
     console.log(`[Vercel Gateway] Routing to: ${targetEndpoint}`);
@@ -58,6 +76,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const data = await swarmResponse.json();
 
+    // message_id estable para anclar el widget <cerebro-feedback> al
+    // training_pair correcto en Cerebro. Si el frontend lo mandó, lo
+    // respetamos; si no, generamos uno determinístico por turn.
+    const studioMessageId = messageIdIn
+      || `studio-${tenantId}-${sessionId || "anon"}-${Date.now()}`;
+
     // Peaje ingest — sync await porque Vercel functions matan el
     // process al volver, así que fire-and-forget pierde la llamada.
     // 100-200 ms extra de latencia por respuesta a cambio de cero
@@ -75,6 +99,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             agentId: data.agent_active || swarmAgentId,
             messages: apiMessages,
             response: data.content,
+            message_id: studioMessageId,
+            upstream_model: data.model_used || swarmModel,
           }),
         });
       } catch (ingestErr) {
@@ -88,7 +114,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       agent_active: data.agent_active || swarmAgentId,
       source: isDebate ? "swarm_debate" : "swarm_cerebro",
       tenantId: tenantId,
-      debate_participants: data.debate_participants || null
+      debate_participants: data.debate_participants || null,
+      upstream_model: data.model_used || data.upstream_model || swarmModel,
+      message_id: studioMessageId,
     });
 
   } catch (error) {
