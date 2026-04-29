@@ -50,6 +50,14 @@ export default function App() {
       return;
     }
 
+    // Si supabase es null (env vars faltantes y sin bypass), degradamos
+    // a anon en vez de crashear con `null.auth`. El warning del cliente
+    // ya alertó en consola.
+    if (!supabase) {
+      setSession(null);
+      return;
+    }
+
     supabase.auth.getSession()
       .then(({ data: { session } }) => setSession(session))
       .catch((err) => {
