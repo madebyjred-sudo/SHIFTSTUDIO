@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Shift AI Gateway</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <!-- Cerebro feedback widget — single-source, hosted by Cerebro itself.
+         Registers <cerebro-feedback> custom element. Mismo elemento
+         usado por CL2, Eco, Sentinel — cambios al widget llegan a todas
+         las apps en el siguiente refresh sin npm publish ni rebuild. -->
+    <script type="module"
+            src="https://shift-cerebro-production.up.railway.app/widget/cerebro-feedback.js">
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+

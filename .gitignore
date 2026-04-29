@@ -1,0 +1,13 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# Agent scratch
+Lab_Reports_Drafts/
+Lab_Scripts/
+.mcp.json
