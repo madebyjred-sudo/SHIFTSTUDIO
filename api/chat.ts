@@ -47,6 +47,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const isDebate = isDebateRequest(lastUserContent);
     const targetEndpoint = isDebate ? "/swarm/debate" : "/swarm/chat";
 
+    // [DEBUG] Loggea el payload completo que va al Swarm para diagnosticar
+    // por qué los agentes responden saludos genéricos en vez de procesar
+    // el prompt real. Logs en Vercel → Logs tab.
+    console.log("[Vercel Gateway DEBUG] Swarm payload:", JSON.stringify({
+      endpoint: targetEndpoint,
+      preferred_agent: swarmAgentId,
+      model: swarmModel,
+      messages_count: apiMessages.length,
+      last_user_msg_preview: lastUserContent.slice(0, 120),
+      tenant_id: tenantId,
+      session_id: sessionId,
+    }));
+
     console.log(`[Vercel Gateway] Routing to: ${targetEndpoint}`);
 
     // THE PYTHON BRIDGE: Always call FastAPI
