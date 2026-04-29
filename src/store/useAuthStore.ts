@@ -41,7 +41,9 @@ export const useAuthStore = create<AuthState>((set) => ({
     },
 
     logout: async () => {
-        await supabase.auth.signOut()
+        if (supabase) {
+            await supabase.auth.signOut()
+        }
         // onAuthStateChange en App.tsx detectará el cambio y mostrará AuthView
         set({
             session: null,

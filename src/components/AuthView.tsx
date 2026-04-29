@@ -21,6 +21,12 @@ export function AuthView() {
         setError(null)
         setLoading(true)
 
+        if (!supabase) {
+            setError('Auth no está configurada. Pedile al admin que setee VITE_SUPABASE_URL y VITE_SUPABASE_ANON_KEY (o VITE_BYPASS_AUTH=true para anon mode).')
+            setLoading(false)
+            return
+        }
+
         try {
             const { error: authError } = await supabase.auth.signInWithPassword({
                 email,
