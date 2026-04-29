@@ -55,8 +55,10 @@ export const MODEL_MAP: Record<string, string> = {
 
 /**
  * Detect if user prompt should trigger debate mode.
+ * Defensive: acepta undefined/null/non-string sin crashear.
  */
-export function isDebateRequest(prompt: string): boolean {
+export function isDebateRequest(prompt: unknown): boolean {
+  if (typeof prompt !== "string" || prompt.length === 0) return false;
   const lower = prompt.toLowerCase();
   return lower.includes("debate") || lower.includes("compara perspectivas");
 }
