@@ -79,6 +79,20 @@ export default function App() {
     return () => subscription.unsubscribe();
   }, [setSession, bypassAuth]);
 
+  // ─── 401 from workspace API → force re-auth ─────────────────────
+  // workspaceApi.handleJson dispatches a `workspace:unauthorized` event
+  // when a request comes back 401 (stale JWT, server kicked us, etc.).
+  // We clear the auth session here so the AuthView guard kicks in and
+  // the user can sign back in cleanly. Important #6 from T6 review.
+  useEffect(() => {
+    const handler = () => {
+      if (bypassAuth) return; // auth bypass mode: ignore
+      useAuthStore.getState().setSession(null);
+    };
+    window.addEventListener('workspace:unauthorized', handler);
+    return () => window.removeEventListener('workspace:unauthorized', handler);
+  }, [bypassAuth]);
+
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     if (params.get("mode") === "embed") {

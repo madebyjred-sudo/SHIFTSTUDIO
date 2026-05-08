@@ -73,6 +73,7 @@ function gridPosition(index: number): { x: number; y: number } {
 function toRFNode(n: WorkspaceNode, workspaceId: string, callbacks: {
   onDelete: (id: string) => void;
   onSelect: (id: string) => void;
+  onUpdate: (id: string, patch: Partial<WorkspaceNode>) => void;
 }): Node {
   const t = (n.type ?? 'hoja').toString().toLowerCase();
   const rfType: 'hoja' | 'image' | 'audio' | 'document' =
@@ -89,6 +90,7 @@ function toRFNode(n: WorkspaceNode, workspaceId: string, callbacks: {
       workspaceId,
       onDelete: callbacks.onDelete,
       onSelect: callbacks.onSelect,
+      onUpdate: callbacks.onUpdate,
     },
     selected: false,
     draggable: true,
@@ -125,31 +127,62 @@ function CanvasInner({
   const [pptxError, setPptxError] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const positionSaveTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  // Use a Map so we can iterate it cleanly on unmount.
+  const positionSaveTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  // Tracks every stray setTimeout we kick off (fitView delay, architect
+  // stagger, etc.) so we can clear them on unmount. Important #3.
+  const pendingTimers = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
+
+  // Helper: schedule a timer that auto-removes itself from the tracking
+  // set once it fires. Returned id can be passed to clearTimeout.
+  const scheduleTimer = useCallback((fn: () => void, delay: number) => {
+    const id = setTimeout(() => {
+      pendingTimers.current.delete(id);
+      fn();
+    }, delay);
+    pendingTimers.current.add(id);
+    return id;
+  }, []);
 
   useEffect(() => { setDraftTitle(title); }, [title]);
+
+  // ── Selection ref (lets handleDelete read the latest selectedNodeId
+  //    without re-creating its identity on every selection change).
+  //    Important #4. ─────────────────────────────────────────────────
+  const selectedNodeIdRef = useRef(selectedNodeId);
+  useEffect(() => { selectedNodeIdRef.current = selectedNodeId; }, [selectedNodeId]);
 
   // ── Delete callback ──────────────────────────────────────────────
   const handleDelete = useCallback(async (nodeId: string) => {
     setNodes((ns) => ns.filter((n) => n.id !== nodeId));
-    if (selectedNodeId === nodeId) setSelectedNodeId(null);
+    if (selectedNodeIdRef.current === nodeId) setSelectedNodeId(null);
     await deleteNode(workspaceId, nodeId).catch(() => null);
-  }, [workspaceId, selectedNodeId, setNodes]);
+  }, [workspaceId, setNodes]);
 
   // ── Select callback ──────────────────────────────────────────────
   const handleSelect = useCallback((nodeId: string) => {
     setSelectedNodeId(nodeId);
   }, []);
 
+  // ── Update callback (merge title/subtitle/content/etc into RF data
+  //    so re-renders see fresh fields). Important #5. ───────────────
+  const handleNodeUpdate = useCallback((nodeId: string, patch: Partial<WorkspaceNode>) => {
+    setNodes((ns) => ns.map((n) =>
+      n.id === nodeId
+        ? { ...n, data: { ...n.data, ...patch } }
+        : n
+    ));
+  }, [setNodes]);
+
   // ── Load nodes ───────────────────────────────────────────────────
   useEffect(() => {
     listNodes(workspaceId, { withContent: true })
       .then((apiNodes) => {
         const rfNodes = apiNodes.map((n) =>
-          toRFNode(n, workspaceId, { onDelete: handleDelete, onSelect: handleSelect }),
+          toRFNode(n, workspaceId, { onDelete: handleDelete, onSelect: handleSelect, onUpdate: handleNodeUpdate }),
         );
         setNodes(rfNodes);
-        setTimeout(() => fitView({ padding: 0.2, duration: 500 }), 100);
+        scheduleTimer(() => fitView({ padding: 0.2, duration: 500 }), 100);
       })
       .catch(() => null)
       .finally(() => setLoading(false));
@@ -161,10 +194,18 @@ function CanvasInner({
     setNodes((ns) =>
       ns.map((n) => ({
         ...n,
-        data: { ...n.data, onDelete: handleDelete, onSelect: handleSelect },
+        data: { ...n.data, onDelete: handleDelete, onSelect: handleSelect, onUpdate: handleNodeUpdate },
       })),
     );
-  }, [handleDelete, handleSelect, setNodes]);
+  }, [handleDelete, handleSelect, handleNodeUpdate, setNodes]);
+
+  // ── Cleanup all pending timers on unmount. Important #2 + #3. ────
+  useEffect(() => () => {
+    positionSaveTimers.current.forEach((t) => clearTimeout(t));
+    positionSaveTimers.current.clear();
+    pendingTimers.current.forEach((t) => clearTimeout(t));
+    pendingTimers.current.clear();
+  }, []);
 
   // ── Persist position on drag end (debounced 300ms) ───────────────
   const handleNodesChange = useCallback((changes: NodeChange[]) => {
@@ -172,10 +213,13 @@ function CanvasInner({
     for (const c of changes) {
       if (c.type === 'position' && !c.dragging && c.position) {
         const { id, position } = c;
-        if (positionSaveTimers.current[id]) clearTimeout(positionSaveTimers.current[id]);
-        positionSaveTimers.current[id] = setTimeout(() => {
+        const existing = positionSaveTimers.current.get(id);
+        if (existing) clearTimeout(existing);
+        const timer = setTimeout(() => {
+          positionSaveTimers.current.delete(id);
           updateNode(workspaceId, id, { x: position.x, y: position.y }).catch(() => null);
         }, 300);
+        positionSaveTimers.current.set(id, timer);
       }
     }
   }, [onNodesChange, workspaceId]);
@@ -206,14 +250,14 @@ function CanvasInner({
         x: position.x, y: position.y,
         width: NODE_W, height: NODE_H,
       });
-      const rfNode = toRFNode(apiNode, workspaceId, { onDelete: handleDelete, onSelect: handleSelect });
+      const rfNode = toRFNode(apiNode, workspaceId, { onDelete: handleDelete, onSelect: handleSelect, onUpdate: handleNodeUpdate });
       setNodes((ns) => [...ns, rfNode]);
       setSelectedNodeId(apiNode.id);
-      setTimeout(() => fitView({ padding: 0.15, duration: 400 }), 50);
+      scheduleTimer(() => fitView({ padding: 0.15, duration: 400 }), 50);
     } catch {
       // graceful — node didn't save, don't add to canvas
     }
-  }, [workspaceId, nodes.length, setNodes, fitView, handleDelete, handleSelect]);
+  }, [workspaceId, nodes.length, setNodes, fitView, handleDelete, handleSelect, handleNodeUpdate, scheduleTimer]);
 
   // ── Upload asset ─────────────────────────────────────────────────
   const handleFilesPicked = useCallback(async (files: FileList | null) => {
@@ -227,13 +271,13 @@ function CanvasInner({
         y: basePos.y + offset,
       }).catch(() => null);
       if (apiNode) {
-        const rfNode = toRFNode(apiNode, workspaceId, { onDelete: handleDelete, onSelect: handleSelect });
+        const rfNode = toRFNode(apiNode, workspaceId, { onDelete: handleDelete, onSelect: handleSelect, onUpdate: handleNodeUpdate });
         setNodes((ns) => [...ns, rfNode]);
       }
       i++;
     }
-    setTimeout(() => fitView({ padding: 0.15, duration: 400 }), 60);
-  }, [workspaceId, nodes.length, setNodes, fitView, handleDelete, handleSelect]);
+    scheduleTimer(() => fitView({ padding: 0.15, duration: 400 }), 60);
+  }, [workspaceId, nodes.length, setNodes, fitView, handleDelete, handleSelect, handleNodeUpdate, scheduleTimer]);
 
   // ── Double-click pane → add hoja at click ────────────────────────
   const handlePaneDoubleClick = useCallback((e: React.MouseEvent) => {
@@ -252,10 +296,10 @@ function CanvasInner({
       // Stagger materialization
       for (let i = 0; i < newNodes.length; i++) {
         const n = newNodes[i];
-        const rf = toRFNode(n, workspaceId, { onDelete: handleDelete, onSelect: handleSelect });
-        setTimeout(() => setNodes((ns) => [...ns, rf]), i * 120);
+        const rf = toRFNode(n, workspaceId, { onDelete: handleDelete, onSelect: handleSelect, onUpdate: handleNodeUpdate });
+        scheduleTimer(() => setNodes((ns) => [...ns, rf]), i * 120);
       }
-      setTimeout(() => fitView({ padding: 0.18, duration: 600 }), newNodes.length * 120 + 100);
+      scheduleTimer(() => fitView({ padding: 0.18, duration: 600 }), newNodes.length * 120 + 100);
       setArchitectPrompt('');
       setArchitectOpen(false);
     } catch (err) {
@@ -263,7 +307,7 @@ function CanvasInner({
     } finally {
       setArchitectRunning(false);
     }
-  }, [architectPrompt, architectRunning, workspaceId, setNodes, fitView, handleDelete, handleSelect]);
+  }, [architectPrompt, architectRunning, workspaceId, setNodes, fitView, handleDelete, handleSelect, handleNodeUpdate, scheduleTimer]);
 
   // ── Export ───────────────────────────────────────────────────────
   const handleExport = useCallback(async (format: 'md' | 'docx' | 'pptx') => {
