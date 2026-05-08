@@ -24,7 +24,7 @@
  * document-level capture-phase context-menu hack (no Studio context-menu
  * lib yet). T7-T10 will reintroduce Studio versions.
  */
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ReactFlow, Background, BackgroundVariant, Controls, MiniMap, Panel,
   ReactFlowProvider, useNodesState, useReactFlow,
@@ -36,7 +36,7 @@ import {
   FileDown, FileText, Download, Loader2,
 } from 'lucide-react';
 import { TopDock } from '@/components/top-dock';
-import { AnimatedAiInput } from '@/components/animated-ai-input';
+import { ChatPanel } from '@/components/workspace/ChatPanel';
 import { HojaNode } from '@/components/hoja/HojaNode';
 import { AssetNode } from '@/components/hoja/AssetNode';
 import { HojaFormatMenu } from '@/components/hoja/HojaFormatMenu';
@@ -44,10 +44,11 @@ import { HojaSelectionMenu } from '@/components/hoja/HojaSelectionMenu';
 import { navigate } from '@/lib/router';
 import { cn } from '@/lib/utils';
 import {
-  listNodes, createNode, updateNode, deleteNode, getNode, importAsset,
+  listNodes, createNode, updateNode, deleteNode, importAsset,
   updateWorkspace, exportWorkspace, runArchitect, getWorkspace,
   type WorkspaceNode, type PptxExportResult,
 } from '@/services/workspaceApi';
+import type { WorkspaceActionPayload } from '@/services/workspaceTurnStream';
 
 // ─── Node type registration ───────────────────────────────────────────
 const NODE_TYPES = {
@@ -287,6 +288,65 @@ function CanvasInner({
     void handleAddHoja({ x: pos.x - NODE_W / 2, y: pos.y - NODE_H / 2 });
   }, [screenToFlowPosition, handleAddHoja]);
 
+  // ── Hoja titles list (for ChatPanel context) ─────────────────────
+  // Recomputed when nodes mutate. Subtitle preserved so Atlas's
+  // edit_by_match heuristic has more signal to disambiguate.
+  const hojaTitles = useMemo(() => {
+    return nodes
+      .filter((n) => {
+        const t = (n.data as { type?: string }).type;
+        return !t || t === 'hoja';
+      })
+      .map((n) => {
+        const d = n.data as { title?: string; subtitle?: string };
+        return {
+          id: n.id,
+          title: d.title?.trim() || 'Sin título',
+          subtitle: d.subtitle ?? null,
+        };
+      });
+  }, [nodes]);
+
+  // ── ChatPanel → canvas bridge ────────────────────────────────────
+  // Branches on action.intent and applies node mutations to RF state.
+  // Re-uses the same toRFNode + scheduleTimer pattern as the architect
+  // path so timer cleanup remains centralized (Important #3).
+  const handleWorkspaceAction = useCallback((action: WorkspaceActionPayload) => {
+    if (action.intent === 'build') {
+      const newNodes = action.nodes ?? [];
+      if (newNodes.length === 0) return;
+      for (let i = 0; i < newNodes.length; i++) {
+        const n = newNodes[i];
+        const rf = toRFNode(n, workspaceId, {
+          onDelete: handleDelete,
+          onSelect: handleSelect,
+          onUpdate: handleNodeUpdate,
+        });
+        scheduleTimer(() => setNodes((ns) => [...ns, rf]), i * 120);
+      }
+      scheduleTimer(() => fitView({ padding: 0.18, duration: 600 }), newNodes.length * 120 + 100);
+      return;
+    }
+
+    if (action.intent === 'edit_selected' || action.intent === 'edit_by_match') {
+      const targetId = action.node_id;
+      const newMd = action.new_content;
+      if (!targetId || typeof newMd !== 'string') return;
+      setNodes((ns) => ns.map((n) => {
+        if (n.id !== targetId) return n;
+        const prev = (n.data as { content?: { md?: string } }).content ?? {};
+        return {
+          ...n,
+          data: {
+            ...n.data,
+            content: { ...prev, md: newMd },
+          },
+        };
+      }));
+      return;
+    }
+  }, [workspaceId, setNodes, fitView, handleDelete, handleSelect, handleNodeUpdate, scheduleTimer]);
+
   // ── Architect ────────────────────────────────────────────────────
   const handleArchitectRun = useCallback(async () => {
     const prompt = architectPrompt.trim();
@@ -343,10 +403,16 @@ function CanvasInner({
 
   return (
     <div className="flex h-full">
-      {/* ── Chat Panel (Studio's existing AnimatedAiInput in compact) ── */}
-      <div className="hidden lg:flex flex-col min-h-0 w-[340px] shrink-0 border-r border-black/8 dark:border-white/8">
-        <section className="h-full bg-white/70 dark:bg-white/5 backdrop-blur-2xl overflow-hidden">
-          <AnimatedAiInput compact />
+      {/* ── Chat Panel (workspace-scoped /turn streaming) ───────────── */}
+      <div className="hidden lg:flex flex-col min-h-0 w-[360px] shrink-0 border-r border-white/50 dark:border-white/10">
+        <section className="h-full min-h-0 bg-white/70 dark:bg-white/5 backdrop-blur-2xl overflow-hidden shadow-[0_8px_35px_rgba(0,0,0,0.06)]">
+          <ChatPanel
+            workspaceId={workspaceId}
+            workspaceTitle={title}
+            selectedNodeId={selectedNodeId}
+            hojaTitles={hojaTitles}
+            onWorkspaceAction={handleWorkspaceAction}
+          />
         </section>
       </div>
 
