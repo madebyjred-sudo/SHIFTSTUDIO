@@ -1158,6 +1158,20 @@ workspaceRouter.post('/:id/turn', async (req: Request, res: Response) => {
     role: 'user' | 'assistant';
     content: string;
   }>;
+  // Validate + coerce: drop any entry that isn't a clean
+  // {role:'user'|'assistant', content:string}. Defends against malicious
+  // role:'system' injection (would override our system prompt) and
+  // non-string content (would crash the upstream JSON encode). Cap at the
+  // last 20 turns as a defense-in-depth bound on context bloat.
+  const safeHistory = history
+    .filter(
+      (m): m is { role: 'user' | 'assistant'; content: string } =>
+        !!m &&
+        typeof m === 'object' &&
+        (m.role === 'user' || m.role === 'assistant') &&
+        typeof m.content === 'string',
+    )
+    .slice(-20);
 
   if (!query) {
     res.status(400).json({ ok: false, error: 'query_required' });
@@ -1251,6 +1265,15 @@ Do NOT include prose. Return only the JSON object.`;
 
   // ── chat: SSE-stream a direct OpenRouter call ──
   if (intent === 'chat') {
+    // Wire client-disconnect → upstream abort. If the user closes the
+    // tab mid-stream, OpenRouter would otherwise keep generating (paid
+    // tokens) and res.write would keep firing on a half-closed socket
+    // (~90s of ERR_STREAM_WRITE_AFTER_END warnings). The controller
+    // signal is threaded into streamOpenRouter, where combineSignals
+    // merges it with the timeout signal.
+    const abortController = new AbortController();
+    req.on('close', () => abortController.abort());
+
     // Pull workspace metadata + selected hoja + asset / hoja blocks
     // in parallel — same shape as CL2 but pointing at studio_* tables.
     const [
@@ -1404,6 +1427,7 @@ Do NOT include prose. Return only the JSON object.`;
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders?.();
 
+    if (res.writableEnded) return;
     res.write(
       `event: meta\ndata: ${JSON.stringify({
         intent: 'chat',
@@ -1413,10 +1437,10 @@ Do NOT include prose. Return only the JSON object.`;
       })}\n\n`,
     );
 
-    // Build OpenRouter messages: system + history + current user query.
+    // Build OpenRouter messages: system + safe history + current user query.
     const orMessages: OpenRouterMessage[] = [
       { role: 'system', content: scopeSystemPrompt },
-      ...history.map<OpenRouterMessage>((m) => ({ role: m.role, content: m.content })),
+      ...safeHistory.map<OpenRouterMessage>((m) => ({ role: m.role, content: m.content })),
       { role: 'user', content: query },
     ];
 
@@ -1429,12 +1453,14 @@ Do NOT include prose. Return only the JSON object.`;
         temperature: 0.5,
         max_tokens: 4_000,
         timeoutMs: 90_000,
+        signal: abortController.signal,
         onChunk: (text) => {
           assembled += text;
           tokensForwarded++;
           // Frontend's streamWorkspaceTurn parser expects {type, payload}
           // envelopes — match that contract for drop-in compatibility
           // with the CL2-style chat parser the Studio canvas uses.
+          if (res.writableEnded) return;
           res.write(`data: ${JSON.stringify({ type: 'token', payload: text })}\n\n`);
         },
       });
@@ -1444,17 +1470,21 @@ Do NOT include prose. Return only the JSON object.`;
     } catch (streamErr) {
       const msg = (streamErr as Error).message;
       console.warn('[workspace/turn] chat stream failed:', msg);
-      res.write(
-        `data: ${JSON.stringify({
-          type: 'token',
-          payload: `\n\n_[error: ${msg}]_`,
-        })}\n\n`,
-      );
+      if (!res.writableEnded) {
+        res.write(
+          `data: ${JSON.stringify({
+            type: 'token',
+            payload: `\n\n_[error: ${msg}]_`,
+          })}\n\n`,
+        );
+      }
     }
 
-    res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
-    res.write(`data: [DONE]\n\n`);
-    res.end();
+    if (!res.writableEnded) {
+      res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
+      res.write(`data: [DONE]\n\n`);
+      res.end();
+    }
 
     // ── Peaje ingest (fire-and-forget) ──
     // Compute message_id and upstream_model fallbacks at THIS call site
@@ -1470,7 +1500,7 @@ Do NOT include prose. Return only the JSON object.`;
       sessionId: id, // workspace id IS the session for peaje purposes
       agentId,
       messages: [
-        ...history.map((m) => ({ role: m.role, content: m.content })),
+        ...safeHistory.map((m) => ({ role: m.role, content: m.content })),
         { role: 'user' as const, content: query },
       ],
       response: assembled,
