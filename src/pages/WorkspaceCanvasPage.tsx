@@ -123,6 +123,10 @@ function CanvasInner({
   // T9 — quick-hoja modal (replaces inline architect prompt panel)
   const [quickHojaOpen, setQuickHojaOpen] = useState(false);
 
+  // Surface errors from create/import/export so the user sees what's
+  // actually happening when a click "does nothing". Auto-dismissed after 6s.
+  const [actionError, setActionError] = useState<{ title: string; detail: string } | null>(null);
+
   // T9 — pptx export pipeline:
   //   options modal → exportWorkspace → result modal.
   // We cache the last submitted options on the page so the regenerate
@@ -257,6 +261,13 @@ function CanvasInner({
     return () => window.removeEventListener('keydown', handler);
   }, [selectedNodeId, handleDelete]);
 
+  // ── Surface a backend error in the inline banner. Auto-dismiss 6s. ──
+  const showActionError = useCallback((title: string, detail: string) => {
+    console.error(`[workspace] ${title}:`, detail);
+    setActionError({ title, detail });
+    scheduleTimer(() => setActionError(null), 6000);
+  }, [scheduleTimer]);
+
   // ── Add hoja ─────────────────────────────────────────────────────
   const handleAddHoja = useCallback(async (pos?: { x: number; y: number }) => {
     const position = pos ?? gridPosition(nodes.length);
@@ -271,30 +282,46 @@ function CanvasInner({
       setNodes((ns) => [...ns, rfNode]);
       setSelectedNodeId(apiNode.id);
       scheduleTimer(() => fitView({ padding: 0.15, duration: 400 }), 50);
-    } catch {
-      // graceful — node didn't save, don't add to canvas
+    } catch (err) {
+      showActionError(
+        'No pudimos crear la hoja',
+        err instanceof Error ? err.message : 'Error desconocido',
+      );
     }
-  }, [workspaceId, nodes.length, setNodes, fitView, handleDelete, handleSelect, handleNodeUpdate, scheduleTimer]);
+  }, [workspaceId, nodes.length, setNodes, fitView, handleDelete, handleSelect, handleNodeUpdate, scheduleTimer, showActionError]);
 
   // ── Upload asset ─────────────────────────────────────────────────
+  // Process every file in the batch even if some fail. We keep a
+  // running list of failures and report them after the loop so the
+  // banner reflects the worst case without silencing successes.
   const handleFilesPicked = useCallback(async (files: FileList | null) => {
     if (!files || files.length === 0) return;
     const basePos = gridPosition(nodes.length);
     let i = 0;
+    const failures: string[] = [];
     for (const file of Array.from(files)) {
       const offset = i * 24;
-      const apiNode = await importAsset(workspaceId, file, {
-        x: basePos.x + offset,
-        y: basePos.y + offset,
-      }).catch(() => null);
-      if (apiNode) {
+      try {
+        const apiNode = await importAsset(workspaceId, file, {
+          x: basePos.x + offset,
+          y: basePos.y + offset,
+        });
         const rfNode = toRFNode(apiNode, workspaceId, { onDelete: handleDelete, onSelect: handleSelect, onUpdate: handleNodeUpdate });
         setNodes((ns) => [...ns, rfNode]);
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : 'Error desconocido';
+        failures.push(`${file.name}: ${detail}`);
       }
       i++;
     }
+    if (failures.length > 0) {
+      const title = failures.length === 1
+        ? 'No pudimos subir el archivo'
+        : `No pudimos subir ${failures.length} archivos`;
+      showActionError(title, failures.join(' · '));
+    }
     scheduleTimer(() => fitView({ padding: 0.15, duration: 400 }), 60);
-  }, [workspaceId, nodes.length, setNodes, fitView, handleDelete, handleSelect, handleNodeUpdate, scheduleTimer]);
+  }, [workspaceId, nodes.length, setNodes, fitView, handleDelete, handleSelect, handleNodeUpdate, scheduleTimer, showActionError]);
 
   // ── Double-click pane → add hoja at click ────────────────────────
   const handlePaneDoubleClick = useCallback((e: React.MouseEvent) => {
@@ -396,12 +423,15 @@ function CanvasInner({
       } else {
         await exportWorkspace(workspaceId, 'md', { workspaceTitle: title });
       }
-    } catch {
-      // Non-pptx failures are silent here; T11 may add a toast surface.
+    } catch (err) {
+      showActionError(
+        `No pudimos exportar (${format})`,
+        err instanceof Error ? err.message : 'Error desconocido',
+      );
     } finally {
       setExporting(null);
     }
-  }, [workspaceId, title, exporting]);
+  }, [workspaceId, title, exporting, showActionError]);
 
   // Options modal → fired when generation succeeds. Cache opts (so a
   // future "generar de nuevo" pre-fills the form) and pop the result.
@@ -478,6 +508,27 @@ function CanvasInner({
 
       {/* ── Canvas ────────────────────────────────────────────────── */}
       <div className="flex-1 relative h-full">
+        {/* Inline action error banner — surfaces backend failures from
+             create/import so the user sees the real reason instead of a
+             silent no-op. Auto-dismissed after 6s, also dismissable. */}
+        {actionError && (
+          <div
+            role="alert"
+            className="absolute left-1/2 top-3 z-40 -translate-x-1/2 max-w-[min(560px,calc(100%-2rem))] rounded-xl bg-rose-50 dark:bg-rose-900/25 border border-rose-200 dark:border-rose-700/40 px-4 py-3 flex items-start justify-between gap-3 shadow-lg animate-in fade-in slide-in-from-top-2 duration-200"
+          >
+            <div className="min-w-0">
+              <p className="text-sm font-medium text-rose-900 dark:text-rose-200">{actionError.title}</p>
+              <p className="text-xs text-rose-700/80 dark:text-rose-300/70 mt-0.5 break-words">{actionError.detail}</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setActionError(null)}
+              aria-label="Cerrar error"
+              className="text-rose-700 dark:text-rose-300 hover:opacity-70 text-lg leading-none shrink-0"
+            >×</button>
+          </div>
+        )}
+
         {loading && (
           <div
             className="absolute inset-0 z-30 flex items-center justify-center bg-[#f8f9fc]/85 dark:bg-[#080d1a]/85 backdrop-blur-sm animate-in fade-in duration-200"

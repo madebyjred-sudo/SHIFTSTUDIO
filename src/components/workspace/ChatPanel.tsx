@@ -6,24 +6,18 @@
  * streaming chat panel wired to `POST /api/workspace/:id/turn`. Handles the
  * full intent surface:
  *
- *   • chat          → SSE stream into an assistant bubble (Lexa).
- *   • build         → JSON envelope with `nodes[]` (Atlas).
- *   • edit_selected → JSON envelope with `node_id` + `new_content` (Atlas).
+ *   • chat          → SSE stream into an assistant bubble.
+ *   • build         → JSON envelope with `nodes[]`.
+ *   • edit_selected → JSON envelope with `node_id` + `new_content`.
  *   • edit_by_match → same shape; server matched the target by title.
+ *
+ * Single-input flow (no agent picker): the BFF's classifier picks the
+ * intent server-side from the user's prompt + selection state, so the
+ * client just sends the query and renders whatever the server returns.
  *
  * The parent (WorkspaceCanvasPage) receives non-chat envelopes via
  * `onWorkspaceAction` and is responsible for inserting / patching nodes on
  * the canvas. This panel only owns the chat surface.
- *
- * State is in-component for now; T11 may persist via Supabase (see
- * `.shifty-replication-playbook.md`). History is capped at 30 messages so
- * the JWT POST body stays bounded.
- *
- * Ported (rebranded, neutralized) from
- *   /Users/juan/Downloads/shift-cl2/apps/web/src/components/hoja/LexaContextPanel.tsx
- *
- * Drops CL2-specific tokens (cl2-burgundy, cl2-accent, expediente refs) and
- * adopts Studio's glass + indigo system.
  */
 import {
   useCallback,
@@ -34,7 +28,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
 } from 'react';
 import {
-  ArrowUp, BookOpen, Layers, Loader2, MessageSquareText, Sparkles, StopCircle,
+  ArrowUp, BookOpen, Loader2, Sparkles, StopCircle,
 } from 'lucide-react';
 import { marked } from 'marked';
 import { cn } from '@/lib/utils';
@@ -47,24 +41,16 @@ import {
 
 // ─── Types ────────────────────────────────────────────────────────────
 
-type AgentId = 'lexa' | 'atlas';
-
 interface ChatMessage {
   id: string;
   role: 'user' | 'assistant' | 'system';
   content: string;
-  /** Synthetic system messages (e.g. "Atlas creó 4 hojas") render with a different style. */
+  /** Synthetic system messages (e.g. "Se crearon 4 hojas") render with a different style. */
   variant?: 'default' | 'action';
-  agent?: AgentId;
   createdAt: number;
 }
 
 const HISTORY_CAP = 30;
-
-const AGENT_META: Record<AgentId, { label: string; tagline: string; icon: typeof MessageSquareText }> = {
-  lexa: { label: 'Lexa', tagline: 'Conversa y analiza', icon: MessageSquareText },
-  atlas: { label: 'Atlas', tagline: 'Construye y edita hojas', icon: Layers },
-};
 
 interface ChatPanelProps {
   workspaceId: string;
@@ -102,7 +88,6 @@ export function ChatPanel({
   const [streaming, setStreaming] = useState(false);
   const [streamingText, setStreamingText] = useState('');
   const [streamingIntent, setStreamingIntent] = useState<string | null>(null);
-  const [agent, setAgent] = useState<AgentId>('lexa');
   const [error, setError] = useState<string | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
@@ -151,6 +136,8 @@ export function ChatPanel({
   }, [messages]);
 
   // ── Send turn ─────────────────────────────────────────────────────
+  // No agent_id: backend classifier auto-routes. Less surface area for
+  // non-power users, fewer brand-confusion liabilities.
   const handleSend = useCallback(async () => {
     const trimmed = input.trim();
     if (!trimmed || streaming) return;
@@ -179,7 +166,7 @@ export function ChatPanel({
     await streamWorkspaceTurn({
       workspaceId,
       query: trimmed,
-      agentId: agent,
+      // agentId omitted on purpose — server classifier picks the intent.
       selectedNodeId: selectedNodeId ?? null,
       hojaTitles,
       deepInsight: false,
@@ -209,7 +196,6 @@ export function ChatPanel({
             {
               id: `a-${Date.now()}`,
               role: 'assistant',
-              agent: 'atlas',
               content: confirmation,
               variant: 'action',
               createdAt: Date.now(),
@@ -226,7 +212,6 @@ export function ChatPanel({
               {
                 id: `a-${Date.now()}`,
                 role: 'assistant',
-                agent,
                 content: text,
                 createdAt: Date.now(),
               },
@@ -243,7 +228,7 @@ export function ChatPanel({
     setStreamingIntent(null);
     if (abortRef.current === ac) abortRef.current = null;
   }, [
-    input, streaming, buildHistory, workspaceId, agent, selectedNodeId, hojaTitles, onWorkspaceAction,
+    input, streaming, buildHistory, workspaceId, selectedNodeId, hojaTitles, onWorkspaceAction,
   ]);
 
   // ── Stop streaming ────────────────────────────────────────────────
@@ -258,7 +243,6 @@ export function ChatPanel({
         {
           id: `a-${Date.now()}`,
           role: 'assistant',
-          agent,
           content: text,
           createdAt: Date.now(),
         },
@@ -268,7 +252,7 @@ export function ChatPanel({
     setStreamingText('');
     setStreaming(false);
     setStreamingIntent(null);
-  }, [agent]);
+  }, []);
 
   // ── Keyboard: Cmd/Ctrl+Enter to send, Enter alone = newline ──────
   const handleKeyDown = useCallback((e: ReactKeyboardEvent<HTMLTextAreaElement>) => {
@@ -279,61 +263,32 @@ export function ChatPanel({
   }, [handleSend]);
 
   // ── Render ────────────────────────────────────────────────────────
-  const isAtlasBuilding = streaming && (streamingIntent === 'build' || agent === 'atlas');
+  // When the server signals a `build` intent, the response is one
+  // JSON envelope (no streaming tokens), so we show a short loader
+  // instead of the bouncing-dots streaming bubble.
+  const isBuildingNodes = streaming && streamingIntent === 'build';
 
   return (
     <div className="flex h-full min-h-0 flex-col">
       {/* ── Header ─────────────────────────────────────────────── */}
       <header className="px-4 pt-4 pb-3 border-b border-black/8 dark:border-white/8">
         <div className="flex items-center gap-2">
-          <div className="w-7 h-7 rounded-lg bg-[#1534dc]/12 dark:bg-[#1534dc]/20 flex items-center justify-center shrink-0">
-            <Sparkles className="w-3.5 h-3.5 text-[#1534dc]" />
+          <div className="w-7 h-7 rounded-lg bg-[#1534dc]/12 dark:bg-[#8b5cf6]/20 flex items-center justify-center shrink-0">
+            <Sparkles className="w-3.5 h-3.5 text-[#1534dc] dark:text-[#8b5cf6]" />
           </div>
           <div className="flex-1 min-w-0">
             <p className="text-[13px] font-semibold text-[#0e1745] dark:text-white truncate">
               {workspaceTitle ?? 'Workspace'}
             </p>
             <p className="text-[10.5px] text-[#0e1745]/45 dark:text-white/45 truncate">
-              {AGENT_META[agent].tagline}
+              Conversa, analiza y construye hojas
             </p>
           </div>
         </div>
 
-        {/* ── Agent picker (segmented control) ────────────────── */}
-        <div
-          role="tablist"
-          aria-label="Seleccionar agente"
-          className="mt-3 grid grid-cols-2 gap-1 p-1 rounded-xl bg-black/5 dark:bg-white/[0.04]"
-        >
-          {(['lexa', 'atlas'] as const).map((id) => {
-            const Icon = AGENT_META[id].icon;
-            const active = agent === id;
-            return (
-              <button
-                key={id}
-                role="tab"
-                aria-selected={active}
-                aria-label={`Agente ${AGENT_META[id].label}`}
-                onClick={() => setAgent(id)}
-                className={cn(
-                  'flex items-center justify-center gap-1.5 py-1.5 px-2 rounded-lg text-[11.5px] font-medium transition-all',
-                  active
-                    ? id === 'atlas'
-                      ? 'bg-[#7A3B47] text-white shadow-sm'
-                      : 'bg-white dark:bg-white/[0.10] shadow-sm text-[#0e1745] dark:text-white'
-                    : 'text-[#0e1745]/55 dark:text-white/55 hover:text-[#0e1745] dark:hover:text-white/85',
-                )}
-              >
-                <Icon className="w-3 h-3" />
-                {AGENT_META[id].label}
-              </button>
-            );
-          })}
-        </div>
-
         {/* ── Selected hoja chip ──────────────────────────────── */}
         {selectedHoja ? (
-          <div className="mt-3 flex items-center gap-2 px-3 py-2 rounded-xl bg-[#1534dc]/8 dark:bg-[#8b5cf6]/15 border border-[#1534dc]/15 dark:border-[#8b5cf6]/25 animate-in fade-in slide-in-from-top-1 duration-200">
+          <div className="mt-3 flex items-center gap-2 px-3 py-2 rounded-xl bg-[#1534dc]/8 dark:bg-[#8b5cf6]/12 border border-[#1534dc]/15 dark:border-[#8b5cf6]/20 animate-in fade-in slide-in-from-top-1 duration-200">
             <BookOpen className="w-3 h-3 text-[#1534dc] dark:text-[#8b5cf6] shrink-0" aria-hidden />
             <p className="text-[11px] font-medium text-[#1534dc] dark:text-[#a892ee] truncate">
               Hoja seleccionada: "{selectedHoja.title || 'Sin título'}"
@@ -358,9 +313,8 @@ export function ChatPanel({
         {/* Streaming bubble */}
         {streaming && (
           <StreamingBubble
-            agent={agent}
             text={streamingText}
-            isAtlasBuilding={isAtlasBuilding && !streamingText}
+            isBuildingNodes={isBuildingNodes && !streamingText}
           />
         )}
 
@@ -399,11 +353,9 @@ export function ChatPanel({
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder={agent === 'atlas'
-              ? 'Pedile a Atlas que arme un set de hojas o edite la seleccionada…'
-              : selectedHoja
-                ? `Preguntale a Lexa sobre "${selectedHoja.title}"…`
-                : 'Conversá con Lexa sobre tu workspace…'}
+            placeholder={selectedHoja
+              ? `Conversá sobre "${selectedHoja.title}" o pedí una nueva hoja…`
+              : 'Conversá sobre tu workspace o pedí una nueva hoja…'}
             rows={2}
             disabled={streaming}
             aria-label="Mensaje al chat del workspace"
@@ -432,9 +384,7 @@ export function ChatPanel({
                   aria-label="Enviar mensaje"
                   className={cn(
                     'flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-white text-[12px] font-semibold transition-colors disabled:opacity-40',
-                    agent === 'atlas'
-                      ? 'bg-[#7A3B47] hover:bg-[#6a3340]'
-                      : 'bg-[#1534dc] hover:bg-[#1230c0]',
+                    'bg-[#1534dc] hover:bg-[#1230c0] dark:bg-[#8b5cf6] dark:hover:bg-[#7a4cf2]',
                   )}
                 >
                   <ArrowUp className="w-3.5 h-3.5" />
@@ -454,11 +404,11 @@ export function ChatPanel({
 function EmptyState() {
   return (
     <div className="flex flex-col items-center justify-center py-10 px-4 text-center animate-in fade-in slide-in-from-bottom-2 duration-300">
-      <div className="w-10 h-10 rounded-2xl bg-gradient-to-br from-[#1534dc]/12 to-[#8b5cf6]/10 dark:from-[#1534dc]/25 dark:to-[#8b5cf6]/20 flex items-center justify-center mb-3">
+      <div className="w-10 h-10 rounded-2xl bg-[#1534dc]/10 dark:bg-[#8b5cf6]/15 flex items-center justify-center mb-3">
         <Sparkles className="w-5 h-5 text-[#1534dc]/70 dark:text-[#8b5cf6]/85" aria-hidden />
       </div>
       <p className="text-[12px] text-[#0e1745]/60 dark:text-white/55 leading-relaxed max-w-[260px]">
-        Pedile a Lexa que analice la hoja seleccionada, o a Atlas que arme un análisis nuevo.
+        Pedí un análisis sobre la hoja seleccionada, o describí un set de hojas para que se generen en el canvas.
       </p>
     </div>
   );
@@ -471,8 +421,8 @@ function MessageBubble({ message }: { message: ChatMessage }) {
   if (isAction) {
     return (
       <div className="flex justify-center animate-in fade-in slide-in-from-bottom-1 duration-200">
-        <div className="rounded-full bg-[#7A3B47]/10 dark:bg-[#7A3B47]/25 border border-[#7A3B47]/20 dark:border-[#7A3B47]/35 px-3 py-1">
-          <p className="text-[11px] font-medium text-[#7A3B47] dark:text-[#c5828d]">{message.content}</p>
+        <div className="rounded-full bg-[#1534dc]/8 dark:bg-[#8b5cf6]/15 border border-[#1534dc]/15 dark:border-[#8b5cf6]/25 px-3 py-1">
+          <p className="text-[11px] font-medium text-[#1534dc] dark:text-[#a892ee]">{message.content}</p>
         </div>
       </div>
     );
@@ -502,23 +452,21 @@ function MessageBubble({ message }: { message: ChatMessage }) {
 }
 
 function StreamingBubble({
-  agent,
   text,
-  isAtlasBuilding,
+  isBuildingNodes,
 }: {
-  agent: AgentId;
   text: string;
-  isAtlasBuilding: boolean;
+  isBuildingNodes: boolean;
 }) {
-  // Atlas in build mode: show a phase loader instead of a streaming bubble
-  // (the server returns a single JSON envelope, not tokens).
-  if (isAtlasBuilding) {
+  // Build mode: server returns a single JSON envelope (no token stream),
+  // so we render a neutral phase loader instead of bouncing dots.
+  if (isBuildingNodes) {
     return (
       <div className="flex justify-start animate-in fade-in slide-in-from-bottom-1 duration-200">
         <div className="rounded-2xl px-4 py-3 max-w-[88%] bg-white/85 dark:bg-white/[0.06] border border-black/5 dark:border-white/10">
           <div className="flex items-center gap-2">
-            <Loader2 className="w-3.5 h-3.5 text-[#7A3B47] dark:text-[#c5828d] animate-spin" aria-hidden />
-            <p className="text-[12px] font-medium text-[#7A3B47] dark:text-[#c5828d]">Atlas está armando…</p>
+            <Loader2 className="w-3.5 h-3.5 text-[#1534dc] dark:text-[#8b5cf6] animate-spin" aria-hidden />
+            <p className="text-[12px] font-medium text-[#0e1745]/70 dark:text-white/70">Trabajando en eso…</p>
           </div>
         </div>
       </div>
@@ -550,7 +498,7 @@ function StreamingBubble({
               />
             ))}
             <span className="ml-2 text-[11px] text-[#0e1745]/55 dark:text-white/55">
-              {agent === 'atlas' ? 'Atlas' : 'Lexa'} está pensando…
+              Pensando…
             </span>
           </span>
         )}
@@ -567,14 +515,14 @@ function buildActionConfirmation(
 ): string {
   if (action.intent === 'build') {
     const n = action.nodes?.length ?? 0;
-    if (n <= 0) return 'Atlas no creó hojas en este turno.';
-    if (n === 1) return 'Atlas creó 1 hoja en el canvas.';
-    return `Atlas creó ${n} hojas en el canvas.`;
+    if (n <= 0) return 'No se crearon hojas en este turno.';
+    if (n === 1) return 'Se creó 1 hoja en el canvas.';
+    return `Se crearon ${n} hojas en el canvas.`;
   }
   if (action.intent === 'edit_selected' || action.intent === 'edit_by_match') {
     const target = hojaTitles.find((h) => h.id === action.node_id);
     const title = target?.title?.trim() || 'la hoja';
-    return `Atlas editó "${title}".`;
+    return `Se actualizó "${title}".`;
   }
   return 'Acción aplicada.';
 }

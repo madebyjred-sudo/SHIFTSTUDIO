@@ -60,15 +60,20 @@ import {
 import { createSlashExtension } from './HojaSlashExtension';
 
 // ─── Color accents (left-edge bar) ────────────────────────────────────
-// Mirrors the T6 token set so AssetNode + HojaNode read consistently.
-// Dark mode variants brighten cool tones so the accent stays legible
-// against the near-black surface.
+// Studio palette pared down to two tones: the primary blue/violet for
+// most hojas and a neutral gray for secondary cards. Burgundy/ink/sage/
+// amber are kept for backwards compatibility with rows already in the DB
+// (server allowlist still accepts them) but render as desaturated grays
+// in dark mode so an old workspace doesn't look like a candy shop.
+//
+// Saturation in dark mode is held at /30 (was /55 for default and full
+// opacity for the rest) to keep accents calm against #080d1a.
 const COLOR_ACCENTS: Record<NodeColor, string> = {
-  default:  'bg-[#1534dc]/30 dark:bg-[#8b5cf6]/55',
-  burgundy: 'bg-[#7A3B47] dark:bg-[#a8525f]',
-  ink:      'bg-[#0e1745] dark:bg-[#5b6890]',
-  sage:     'bg-emerald-500 dark:bg-emerald-400',
-  amber:    'bg-amber-500 dark:bg-amber-400',
+  default:  'bg-[#1534dc]/30 dark:bg-[#8b5cf6]/30',
+  burgundy: 'bg-[#6b7280]/40 dark:bg-[#9ca3af]/30',
+  ink:      'bg-[#6b7280]/40 dark:bg-[#9ca3af]/30',
+  sage:     'bg-[#6b7280]/40 dark:bg-[#9ca3af]/30',
+  amber:    'bg-[#6b7280]/40 dark:bg-[#9ca3af]/30',
 };
 
 // ─── Markdown ↔ HTML bridge ───────────────────────────────────────────

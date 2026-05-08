@@ -111,6 +111,20 @@ export async function streamWorkspaceTurn(args: StreamWorkspaceTurnArgs): Promis
 
   let res: Response;
   try {
+    // agent_id is forwarded only when the caller explicitly passed one.
+    // Default behavior is to OMIT it so the BFF's classifier picks the
+    // intent from the prompt + selection state. The Workspace ChatPanel
+    // no longer exposes an agent picker; this branch keeps the field
+    // available for any future caller that still wants to force routing.
+    const body: Record<string, unknown> = {
+      query: args.query,
+      selected_node_id: args.selectedNodeId ?? null,
+      hoja_titles: args.hojaTitles ?? [],
+      deep_insight: args.deepInsight ?? false,
+      history: args.history ?? [],
+    };
+    if (args.agentId) body.agent_id = args.agentId;
+
     res = await fetch(`/api/workspace/${args.workspaceId}/turn`, {
       method: 'POST',
       headers: {
@@ -118,14 +132,7 @@ export async function streamWorkspaceTurn(args: StreamWorkspaceTurnArgs): Promis
         'x-tenant-id': 'shift',
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
-      body: JSON.stringify({
-        query: args.query,
-        agent_id: args.agentId,
-        selected_node_id: args.selectedNodeId ?? null,
-        hoja_titles: args.hojaTitles ?? [],
-        deep_insight: args.deepInsight ?? false,
-        history: args.history ?? [],
-      }),
+      body: JSON.stringify(body),
       signal: args.signal,
     });
   } catch (err) {

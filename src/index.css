@@ -260,8 +260,9 @@ button {
     background: rgba(14, 23, 69, 0.07);
     color: inherit;
 }
+/* Neutral, unsaturated bg in dark mode — drops any color tint. */
 .dark .hoja-prose code {
-    background: rgba(255, 255, 255, 0.10);
+    background: rgba(255, 255, 255, 0.08);
 }
 .hoja-prose mark {
     border-radius: 2px;
@@ -362,16 +363,17 @@ button {
     text-decoration: line-through;
 }
 
-/* Blockquote — left border accent (matches Studio blue, theme-aware). */
+/* Blockquote — neutral gray border in both modes; the accent color is
+   reserved for primary touchpoints (links, send button). */
 .hoja-prose blockquote {
-    border-left: 3px solid #1534dc;
+    border-left: 3px solid rgba(14, 23, 69, 0.20);
     padding: 0.25em 0 0.25em 0.85em;
     margin: 0.6em 0;
     color: rgba(14, 23, 69, 0.78);
     font-style: italic;
 }
 .dark .hoja-prose blockquote {
-    border-left-color: #8b5cf6;
+    border-left-color: rgba(255, 255, 255, 0.15);
     color: rgba(255, 255, 255, 0.78);
 }
 .hoja-prose blockquote p {

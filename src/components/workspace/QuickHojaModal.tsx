@@ -2,21 +2,11 @@
  * @file QuickHojaModal.tsx
  * @description Modal that replaces the inline architect prompt panel.
  *
- * Two agents in one surface:
- *   • Lexa  — single-hoja quick capture (1 hoja, ~5-8 word title + body)
- *   • Atlas — multi-hoja architect (3-7 related hojas in one canvas pass)
- *
- * Both routes hit `runArchitect()` so the parent only needs to handle a
- * single `onCreated(nodes)` callback. The Lexa flow injects a hint into
- * the prompt asking the architect to return ONE hoja; the Atlas flow lets
- * the architect choose its own count.
- *
- * Adapted (concept + flow) from CL2's
- *   /Users/juan/Downloads/shift-cl2/apps/web/src/components/hoja/LexaQuickHojaModal.tsx
- *
- * Drops CL2-specific copy (expediente / SIL / fracciones / Hacendarios).
- * Uses Studio's indigo + violet (light/dark) and burgundy literals — no
- * cl2-burgundy classes.
+ * Single-mode flow: the user describes what they want and the BFF's
+ * architect chooses how many hojas to create (1-7). Used to expose a
+ * Lexa (1 hoja) / Atlas (3-7 hojas) tab pair, which (a) leaked CL2 brand
+ * vocabulary into Studio and (b) added a dial that non-power users
+ * shouldn't need. Server-side classifier handles disambiguation.
  *
  * Visual contract:
  *   • Portal-rendered into document.body, z-50.
@@ -29,13 +19,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { motion, AnimatePresence } from 'motion/react';
-import { Loader2, Sparkles, X, Wand2, Layers } from 'lucide-react';
+import { Loader2, Sparkles, X } from 'lucide-react';
 import { runArchitect, type WorkspaceNode } from '@/services/workspaceApi';
 import { cn } from '@/lib/utils';
 
 // ─── Types ────────────────────────────────────────────────────────────
-
-type AgentId = 'lexa' | 'atlas';
 
 interface Props {
   open: boolean;
@@ -50,7 +38,6 @@ const MAX_LEN = 500;
 // ─── Component ────────────────────────────────────────────────────────
 
 export function QuickHojaModal({ open, onClose, workspaceId, onCreated }: Props) {
-  const [agent, setAgent] = useState<AgentId>('lexa');
   const [prompt, setPrompt] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -66,7 +53,6 @@ export function QuickHojaModal({ open, onClose, workspaceId, onCreated }: Props)
     setPrompt('');
     setError(null);
     setLoading(false);
-    setAgent('lexa');
     const t = setTimeout(() => textareaRef.current?.focus(), 50);
     return () => {
       clearTimeout(t);
@@ -101,24 +87,14 @@ export function QuickHojaModal({ open, onClose, workspaceId, onCreated }: Props)
     setLoading(true);
     setError(null);
 
-    // Build a hint for Lexa to keep the response to a single hoja.
-    // For Atlas we just forward the prompt — the architect picks 3-7.
-    const finalPrompt = agent === 'lexa'
-      ? `[modo rápido — devolvé exactamente UNA hoja, no más] ${p}`
-      : p;
-
-    // Track an AbortController so cleanup or close-mid-flight cancels.
     const ac = new AbortController();
     abortRef.current?.abort();
     abortRef.current = ac;
 
     try {
-      const { nodes } = await runArchitect(workspaceId, finalPrompt);
+      const { nodes } = await runArchitect(workspaceId, p);
       if (ac.signal.aborted) return;
-      // Lexa hint sometimes returns >1 hoja anyway; if user picked Lexa,
-      // trim to the first node so the contract holds.
-      const out = agent === 'lexa' && nodes.length > 1 ? [nodes[0]] : nodes;
-      onCreated(out);
+      onCreated(nodes);
       onClose();
     } catch (err) {
       if (ac.signal.aborted) return;
@@ -127,7 +103,7 @@ export function QuickHojaModal({ open, onClose, workspaceId, onCreated }: Props)
       if (abortRef.current === ac) abortRef.current = null;
       setLoading(false);
     }
-  }, [prompt, loading, agent, workspaceId, onCreated, onClose]);
+  }, [prompt, loading, workspaceId, onCreated, onClose]);
 
   // ── Backdrop click closes (when not loading) ────────────────────────
   const handleBackdropClick = useCallback(() => {
@@ -137,15 +113,10 @@ export function QuickHojaModal({ open, onClose, workspaceId, onCreated }: Props)
 
   if (!open) return null;
 
-  const submitLabel =
-    loading
-      ? agent === 'lexa' ? 'Lexa está pensando…' : 'Atlas está armando…'
-      : agent === 'lexa' ? 'Crear hoja' : 'Generar hojas';
+  const submitLabel = loading ? 'Generando hojas…' : 'Generar';
 
   const placeholder =
-    agent === 'lexa'
-      ? 'Ej: Una hoja con el resumen ejecutivo de la nueva campaña Q3.'
-      : 'Ej: Plan de marca para una fintech LATAM — posicionamiento, audiencia, mensaje, tono, plan de lanzamiento.';
+    'Ej: Plan de marca para una fintech LATAM — posicionamiento, audiencia, mensaje, tono, plan de lanzamiento.';
 
   const charCount = prompt.length;
   const charPct = Math.min(charCount / MAX_LEN, 1);
@@ -189,10 +160,10 @@ export function QuickHojaModal({ open, onClose, workspaceId, onCreated }: Props)
               </div>
               <div className="min-w-0">
                 <div id="quick-hoja-title" className="text-[13px] font-semibold text-[#0e1745] dark:text-white">
-                  Nueva hoja con IA
+                  Generar hojas con IA
                 </div>
                 <div className="text-[11px] text-[#0e1745]/55 dark:text-white/50 truncate">
-                  Pedile a Lexa una hoja rápida o a Atlas un set completo.
+                  Describí lo que querés y se arman las hojas en el canvas.
                 </div>
               </div>
             </div>
@@ -209,54 +180,10 @@ export function QuickHojaModal({ open, onClose, workspaceId, onCreated }: Props)
 
           {/* ── Body ─────────────────────────────────────────────── */}
           <div className="px-5 py-4 space-y-4 overflow-y-auto">
-            {/* Agent picker — segmented control */}
-            <div
-              role="radiogroup"
-              aria-label="Elegir agente"
-              className="grid grid-cols-2 gap-1.5 p-1 rounded-2xl bg-black/3 dark:bg-white/5 border border-black/5 dark:border-white/8"
-            >
-              <button
-                type="button"
-                role="radio"
-                aria-checked={agent === 'lexa'}
-                aria-label="Agente Lexa — una hoja rápida"
-                disabled={loading}
-                onClick={() => setAgent('lexa')}
-                className={cn(
-                  'flex items-center justify-center gap-2 px-3 py-2 rounded-xl text-[12.5px] font-semibold transition-all',
-                  agent === 'lexa'
-                    ? 'bg-white dark:bg-[#161e3d] text-[#1534dc] dark:text-[#8b5cf6] shadow-sm border border-black/5 dark:border-white/10'
-                    : 'text-[#0e1745]/55 dark:text-white/55 hover:text-[#0e1745] dark:hover:text-white',
-                  'disabled:opacity-50 disabled:cursor-not-allowed',
-                )}
-              >
-                <Wand2 className="w-3.5 h-3.5" />
-                Lexa · 1 hoja
-              </button>
-              <button
-                type="button"
-                role="radio"
-                aria-checked={agent === 'atlas'}
-                aria-label="Agente Atlas — múltiples hojas"
-                disabled={loading}
-                onClick={() => setAgent('atlas')}
-                className={cn(
-                  'flex items-center justify-center gap-2 px-3 py-2 rounded-xl text-[12.5px] font-semibold transition-all',
-                  agent === 'atlas'
-                    ? 'bg-white dark:bg-[#161e3d] text-[#1534dc] dark:text-[#8b5cf6] shadow-sm border border-black/5 dark:border-white/10'
-                    : 'text-[#0e1745]/55 dark:text-white/55 hover:text-[#0e1745] dark:hover:text-white',
-                  'disabled:opacity-50 disabled:cursor-not-allowed',
-                )}
-              >
-                <Layers className="w-3.5 h-3.5" />
-                Atlas · 3-7 hojas
-              </button>
-            </div>
-
             {/* Prompt textarea */}
             <div>
               <label htmlFor="quick-hoja-prompt" className="sr-only">
-                Describí la hoja que querés
+                Describí las hojas que querés
               </label>
               <textarea
                 id="quick-hoja-prompt"
@@ -276,7 +203,7 @@ export function QuickHojaModal({ open, onClose, workspaceId, onCreated }: Props)
                 maxLength={MAX_LEN}
                 disabled={loading}
                 placeholder={placeholder}
-                aria-label="Descripción de la hoja"
+                aria-label="Descripción de las hojas"
                 className="w-full resize-none rounded-2xl bg-black/3 dark:bg-white/5 border border-black/8 dark:border-white/10 px-3.5 py-2.5 text-[13px] text-[#0e1745] dark:text-white placeholder:text-[#0e1745]/35 dark:placeholder:text-white/30 focus:outline-none focus:border-[#1534dc]/40 dark:focus:border-[#8b5cf6]/40 disabled:opacity-60 transition-colors"
               />
 
