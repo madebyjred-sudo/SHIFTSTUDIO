@@ -1725,6 +1725,11 @@ workspaceRouter.post('/:id/export', async (req: Request, res: Response) => {
     return;
   }
 
+  // Ownership gate runs first — same pattern as every other T3/T4 endpoint
+  // in this file. Once `ownedWorkspace` returns true, the workspace fetch
+  // below can drop its `user_id` filter (the row is already proven ours).
+  if (!(await ownedWorkspace(userId, id, res))) return;
+
   try {
     // Fetch workspace metadata + all nodes in one round-trip.
     const [{ data: ws, error: wsErr }, { data: nodes, error: nErr }] = await Promise.all([
@@ -1732,7 +1737,6 @@ workspaceRouter.post('/:id/export', async (req: Request, res: Response) => {
         .from('studio_workspaces')
         .select('id, title, description, last_pptx')
         .eq('id', id)
-        .eq('user_id', userId)
         .maybeSingle(),
       supabaseAdmin!
         .from('studio_workspace_nodes')
@@ -1901,32 +1905,66 @@ workspaceRouter.post('/:id/export', async (req: Request, res: Response) => {
       italics?: boolean;
     };
     function parseInline(input: string): InlineToken[] {
-      const tokens: InlineToken[] = [];
-      // Mask out code spans first
+      // Use distinct sentinels for code vs links. We pick control chars
+      // (U+0001 / U+0002) that are vanishingly unlikely to occur in user
+      // markdown — that way bare digits in user content (e.g. "año 2024")
+      // never collide with placeholder indices the way they did in the
+      // original `\d+`-based scheme.
+      const C_OPEN = 'C';
+      const C_CLOSE = '';
+      const L_OPEN = 'L';
+      const L_CLOSE = '';
+
+      // 1) Mask out code spans first so backtick contents aren't reparsed
+      //    as bold/italic/links.
       const codePlaceholders: string[] = [];
       let masked = input.replace(/`([^`]+)`/g, (_, code) => {
+        const idx = codePlaceholders.length;
         codePlaceholders.push(code);
-        return `${codePlaceholders.length - 1}`;
-      });
-      // Mask links [text](url)
-      const linkPlaceholders: Array<{ text: string; url: string }> = [];
-      masked = masked.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, t, u) => {
-        linkPlaceholders.push({ text: t, url: u });
-        return `${linkPlaceholders.length - 1}`;
+        return `${C_OPEN}${idx}${C_CLOSE}`;
       });
 
-      // Now walk the masked string for bold/italic
-      const pieces = masked.split(/(\*\*[^*]+\*\*|\*[^*]+\*|\d+|\d+)/g).filter(Boolean);
+      // 2) Mask links [text](url). Done after code so a link inside
+      //    backticks stays literal.
+      const linkPlaceholders: Array<{ text: string; url: string }> = [];
+      masked = masked.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, t, u) => {
+        const idx = linkPlaceholders.length;
+        linkPlaceholders.push({ text: t, url: u });
+        return `${L_OPEN}${idx}${L_CLOSE}`;
+      });
+
+      // 3) Split on bold/italic AND on each sentinel separately. Because
+      //    each placeholder has a distinct sentinel pair, the matcher
+      //    can tell code from link without colliding on bare integers.
+      const splitter = new RegExp(
+        [
+          '(\\*\\*[^*]+\\*\\*)',          // **bold**
+          '(\\*[^*]+\\*)',                 // *italic*
+          `(${C_OPEN}\\d+${C_CLOSE})`,    // code sentinel
+          `(${L_OPEN}\\d+${L_CLOSE})`,    // link sentinel
+        ].join('|'),
+        'g',
+      );
+      const pieces = masked.split(splitter).filter((p) => p !== undefined && p !== '');
+
+      const tokens: InlineToken[] = [];
+      const codeRe = new RegExp(`^${C_OPEN}(\\d+)${C_CLOSE}$`);
+      const linkRe = new RegExp(`^${L_OPEN}(\\d+)${L_CLOSE}$`);
       for (const piece of pieces) {
-        const codeMatch = piece.match(/^(\d+)$/);
+        const codeMatch = piece.match(codeRe);
         if (codeMatch) {
-          tokens.push({ type: 'code', text: codePlaceholders[Number(codeMatch[1])] });
+          const idx = Number(codeMatch[1]);
+          const text = codePlaceholders[idx] ?? '';
+          tokens.push({ type: 'code', text });
           continue;
         }
-        const linkMatch = piece.match(/^(\d+)$/);
+        const linkMatch = piece.match(linkRe);
         if (linkMatch) {
-          const { text, url } = linkPlaceholders[Number(linkMatch[1])];
-          tokens.push({ type: 'link', text, url });
+          const idx = Number(linkMatch[1]);
+          const link = linkPlaceholders[idx];
+          if (link) {
+            tokens.push({ type: 'link', text: link.text, url: link.url });
+          }
           continue;
         }
         if (/^\*\*[^*]+\*\*$/.test(piece)) {
@@ -1937,7 +1975,7 @@ workspaceRouter.post('/:id/export', async (req: Request, res: Response) => {
           tokens.push({ type: 'text', text: piece.slice(1, -1), italics: true });
           continue;
         }
-        tokens.push({ type: 'text', text: piece });
+        if (piece) tokens.push({ type: 'text', text: piece });
       }
       return tokens;
     }
@@ -2495,11 +2533,6 @@ workspaceRouter.post('/:id/export', async (req: Request, res: Response) => {
 // Ported from CL2 (lines 1051-1272). Renames: bucket name is now
 // `studio-workspace-assets`; table is `studio_workspace_nodes`.
 
-const importUpload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 100 * 1024 * 1024 }, // 100MB cap
-});
-
 const ASSET_TYPE_ALLOWLIST: Record<string, 'image' | 'audio' | 'document'> = {
   // images
   'image/png': 'image',
@@ -2520,6 +2553,55 @@ const ASSET_TYPE_ALLOWLIST: Record<string, 'image' | 'audio' | 'document'> = {
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'document',
   'text/plain': 'document',
   'text/markdown': 'document',
+};
+
+// Multer with fileFilter that rejects non-allowlisted MIME types BEFORE
+// buffering the body to RAM — that way a malicious / mistaken upload of a
+// 100MB ZIP with an `image/` claim doesn't churn memory just to be rejected
+// downstream. The in-route check below stays as a defensive double-check.
+const importUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 100 * 1024 * 1024 }, // 100MB cap
+  fileFilter: (_req, file, cb) => {
+    if (!ASSET_TYPE_ALLOWLIST[file.mimetype]) {
+      cb(new multer.MulterError('LIMIT_UNEXPECTED_FILE', file.mimetype));
+      return;
+    }
+    cb(null, true);
+  },
+});
+
+// Wraps `importUpload.single('file')` so multer errors surface as JSON
+// envelopes instead of being swallowed by Express's default error handler
+// (which 500s with HTML — useless for the React import modal).
+const importMiddleware = (
+  req: Request,
+  res: Response,
+  next: (err?: unknown) => void,
+) => {
+  importUpload.single('file')(req, res, (err: unknown) => {
+    if (err instanceof multer.MulterError) {
+      const statusMap: Record<string, number> = {
+        LIMIT_FILE_SIZE: 413,
+        LIMIT_UNEXPECTED_FILE: 400,
+      };
+      res.status(statusMap[err.code] ?? 400).json({
+        ok: false,
+        error: err.code === 'LIMIT_FILE_SIZE' ? 'file_too_large' : 'multer_error',
+        detail: err.message,
+      });
+      return;
+    }
+    if (err) {
+      res.status(500).json({
+        ok: false,
+        error: 'upload_error',
+        detail: (err as Error).message,
+      });
+      return;
+    }
+    next();
+  });
 };
 
 const STUDIO_ASSETS_BUCKET = 'studio-workspace-assets';
@@ -2553,21 +2635,41 @@ async function getPDFParse(): Promise<any> {
  * seleccionada". Without extraction the model only saw filename+size,
  * so it'd reply "no hay contenido".
  */
+/** Hard cap above which we skip parser invocation. mammoth + pdf-parse
+ *  decompress in memory on top of the multer buffer; on a 100MB doc that
+ *  pushes us past 250-300MB resident very quickly and the parsers
+ *  routinely OOM or hang. The asset still uploads — we just don't have
+ *  searchable text for it. */
+const ASSET_EXTRACT_MAX_BYTES = 50_000_000; // 50 MB
+
 async function extractAssetText(buffer: Buffer, mime: string): Promise<string | null> {
   // Plain text + markdown — just decode.
   if (mime === 'text/plain' || mime === 'text/markdown') {
     return buffer.toString('utf-8').slice(0, ASSET_EXTRACT_MAX_CHARS);
   }
+  // Per-format size cap. Above this we skip extraction outright — the
+  // parsers (mammoth / pdf-parse) overflow before they finish.
+  if (buffer.length > ASSET_EXTRACT_MAX_BYTES) {
+    console.warn(
+      `[workspace] asset_extract_skipped_oversize mime=${mime} bytes=${buffer.length} cap=${ASSET_EXTRACT_MAX_BYTES}`,
+    );
+    return null;
+  }
   // PDF
   if (mime === 'application/pdf') {
     const PDFParse = await getPDFParse();
     const parser = new PDFParse({ data: buffer });
-    const parsed = await parser.getText();
-    await parser.destroy?.();
-    const txt = ((parsed.text ?? '') as string).trim();
-    return txt.length > ASSET_EXTRACT_MAX_CHARS
-      ? txt.slice(0, ASSET_EXTRACT_MAX_CHARS) + '\n\n[…truncado por longitud]'
-      : txt;
+    try {
+      const parsed = await parser.getText();
+      const txt = ((parsed.text ?? '') as string).trim();
+      return txt.length > ASSET_EXTRACT_MAX_CHARS
+        ? txt.slice(0, ASSET_EXTRACT_MAX_CHARS) + '\n\n[…truncado por longitud]'
+        : txt;
+    } finally {
+      // Always release native handles, even when getText throws — otherwise
+      // a broken PDF leaks the worker for the lifetime of the process.
+      await parser.destroy?.().catch(() => null);
+    }
   }
   // DOCX (the new MS Word format). The legacy .doc binary is not
   // supported by mammoth — those will skip extraction.
@@ -2587,20 +2689,33 @@ let _bucketEnsured = false;
 async function ensureAssetsBucket() {
   if (_bucketEnsured) return;
   if (!supabaseAdmin) return;
-  // Service-role client can create buckets. Idempotent — if it exists,
-  // we get a 409 we silently swallow.
-  await supabaseAdmin.storage
-    .createBucket(STUDIO_ASSETS_BUCKET, {
-      public: true,
-      fileSizeLimit: 100 * 1024 * 1024,
-    })
-    .catch(() => null);
-  _bucketEnsured = true;
+  // Service-role client can create buckets. The 409 ("already exists")
+  // response is success-equivalent — flip the flag. For any OTHER error
+  // (network blip, transient 5xx), keep the flag false so the next
+  // import retries. The original code flipped the flag unconditionally,
+  // which silently broke imports forever after a single transient
+  // create-bucket failure.
+  const { error } = await supabaseAdmin.storage.createBucket(STUDIO_ASSETS_BUCKET, {
+    public: true,
+    fileSizeLimit: 100 * 1024 * 1024,
+  });
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const statusCode = (error as any)?.statusCode;
+  if (
+    !error ||
+    error.message?.includes('already exists') ||
+    statusCode === '409' ||
+    statusCode === 409
+  ) {
+    _bucketEnsured = true;
+  } else {
+    console.warn('[workspace] bucket ensure failed:', error.message);
+  }
 }
 
 workspaceRouter.post(
   '/:id/nodes/import',
-  importUpload.single('file'),
+  importMiddleware,
   async (req: Request, res: Response) => {
     if (!dbReady(res)) return;
     const userId = await requireUser(req, res);
@@ -2677,6 +2792,15 @@ workspaceRouter.post(
         console.warn(
           `[workspace] asset_extract_failed mime=${mime} bytes=${req.file.size} error=${(extractErr as Error).message}`,
         );
+      }
+
+      // Release the multer buffer reference now that both the upload and
+      // the extraction are done. The Buffer object itself stays alive
+      // until the request finishes (Express holds `req`), but swapping
+      // the field to a 0-byte Buffer drops the big allocation so GC can
+      // reclaim it before we serialize the response.
+      if (req.file) {
+        req.file.buffer = Buffer.alloc(0);
       }
 
       // Insert node row

@@ -162,8 +162,20 @@ export async function runWorkspacePptxExport(
   if (!force && cache?.generatedAt && cache.exportUrl && cache.gammaUrl) {
     const ageMs = Date.now() - new Date(cache.generatedAt).getTime();
     const oneHour = 60 * 60 * 1000;
+    // Stable stringify so {tono, audiencia} and {audiencia, tono} hash
+    // the same. Default JSON.stringify preserves insertion order, which
+    // means a different client-side form mount order would silently bust
+    // the cache and burn Gamma credits.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const stableStringify = (o: any): string => {
+      if (o == null) return 'null';
+      if (typeof o !== 'object') return JSON.stringify(o);
+      if (Array.isArray(o)) return `[${o.map(stableStringify).join(',')}]`;
+      const keys = Object.keys(o).sort();
+      return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(o[k])}`).join(',')}}`;
+    };
     const optionsChanged = opts.options
-      ? JSON.stringify(opts.options) !== JSON.stringify(cache.options ?? null)
+      ? stableStringify(opts.options) !== stableStringify(cache.options ?? null)
       : false;
     if (ageMs >= 0 && ageMs < oneHour && !optionsChanged) {
       console.log(
