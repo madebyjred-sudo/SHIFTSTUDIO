@@ -39,6 +39,8 @@ import { TopDock } from '@/components/top-dock';
 import { AnimatedAiInput } from '@/components/animated-ai-input';
 import { HojaNode } from '@/components/hoja/HojaNode';
 import { AssetNode } from '@/components/hoja/AssetNode';
+import { HojaFormatMenu } from '@/components/hoja/HojaFormatMenu';
+import { HojaSelectionMenu } from '@/components/hoja/HojaSelectionMenu';
 import { navigate } from '@/lib/router';
 import { cn } from '@/lib/utils';
 import {
@@ -564,6 +566,10 @@ function CanvasInner({
             </Panel>
           )}
         </ReactFlow>
+
+        {/* Floating overlays: format toolbar + selection-bound AI menu. Listen to TipTap selection events globally. */}
+        <HojaFormatMenu workspaceId={workspaceId} />
+        <HojaSelectionMenu workspaceId={workspaceId} />
       </div>
 
       {/* Hidden file input for uploads */}
