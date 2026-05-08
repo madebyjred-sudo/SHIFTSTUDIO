@@ -34,7 +34,9 @@
  *   GET    /:id/attach-context        ordered hoja markdown for chat context
  *   POST   /citations                 save chunk to user inbox / pinned to node
  */
+import crypto from 'node:crypto';
 import { Router, type Request, type Response } from 'express';
+import multer from 'multer';
 import { supabaseAdmin } from '../services/supabaseAdminClient.js';
 import { getUserIdFromRequest, isValidUuid } from '../services/auth.js';
 import {
@@ -44,6 +46,7 @@ import {
 } from '../services/openRouterDirect.js';
 import { firePeajeIngest } from '../services/peajeClient.js';
 import { getApprovedRag } from '../services/puntoMedioClient.js';
+import { GammaApiError } from '../services/gammaApi.js';
 
 export const workspaceRouter = Router();
 
@@ -1680,3 +1683,1144 @@ Do NOT include prose. Return only the JSON object.`;
   // Should never reach here.
   res.status(400).json({ ok: false, error: 'unhandled_intent', intent });
 });
+
+// ═══════════════════════════════════════════════════════════════════════
+// EXPORT — md / docx / pptx
+// ═══════════════════════════════════════════════════════════════════════
+//
+// POST /api/workspace/:id/export
+//   body: { format: 'md' | 'docx' | 'pptx', force?: boolean, options?: PptxOptions }
+//
+// MD path: synthesizes the full canvas as one markdown document with TOC
+// and per-hoja sections. DOCX path: parses the same markdown into a styled
+// Word document via the `docx` package (inline parser handles bold,
+// italic, code, links, headings, lists, blockquotes, code fences, hr).
+// PPTX path: delegates to runWorkspacePptxExport which calls Gamma API.
+//
+// Ported from CL2's POST /api/workspace/:id/export (lines 348-911 of CL2's
+// routes/workspace.ts). Renames applied:
+//   - workspaces → studio_workspaces
+//   - workspace_nodes → studio_workspace_nodes
+//   - "_Generado por CL2_" → "_Generado por Shifty Studio_"
+//   - DOCX creator/footer "CL2 — Inteligencia Legislativa" / "CL2 · " →
+//     "Shifty Studio" / "Shifty Studio · "
+//   - Cover-page eyebrow "INTELIGENCIA LEGISLATIVA · ASAMBLEA DE COSTA RICA"
+//     dropped (Studio is neutral; cover stays clean).
+//   - Stats line locale 'es-CR' → 'es-419' (Studio is Spanish LATAM).
+//   - Drops the legacy "last_pptx column missing" retry — migration 0003
+//     ships the column from day 1.
+workspaceRouter.post('/:id/export', async (req: Request, res: Response) => {
+  if (!dbReady(res)) return;
+  const userId = await requireUser(req, res);
+  if (!userId) return;
+  const { id } = req.params;
+  if (!isValidUuid(id)) {
+    res.status(400).json({ ok: false, error: 'invalid_uuid' });
+    return;
+  }
+
+  const format = (req.body?.format ?? 'md') as string;
+  if (!['md', 'docx', 'pptx'].includes(format)) {
+    res.status(400).json({ ok: false, error: 'invalid_format', hint: 'md|docx|pptx' });
+    return;
+  }
+
+  try {
+    // Fetch workspace metadata + all nodes in one round-trip.
+    const [{ data: ws, error: wsErr }, { data: nodes, error: nErr }] = await Promise.all([
+      supabaseAdmin!
+        .from('studio_workspaces')
+        .select('id, title, description, last_pptx')
+        .eq('id', id)
+        .eq('user_id', userId)
+        .maybeSingle(),
+      supabaseAdmin!
+        .from('studio_workspace_nodes')
+        .select('id, title, subtitle, content, x, y, color, type')
+        .eq('workspace_id', id),
+    ]);
+    if (wsErr || !ws) {
+      res.status(404).json({ ok: false, error: 'workspace_not_found' });
+      return;
+    }
+    if (nErr) throw new Error(nErr.message);
+
+    // Reading order: top-to-bottom, then left-to-right. Snap y to row
+    // bands of 200px so two hojas at slightly different y don't flip
+    // randomly — visually-aligned hojas stay aligned in the doc.
+    const ordered = (nodes ?? []).slice().sort((a, b) => {
+      const yA = Math.floor((a.y as number) / 200);
+      const yB = Math.floor((b.y as number) / 200);
+      if (yA !== yB) return yA - yB;
+      return (a.x as number) - (b.x as number);
+    });
+
+    const safeName =
+      String(ws.title)
+        .replace(/[^\w\s-]/g, '')
+        .trim()
+        .replace(/\s+/g, '_') || 'workspace';
+
+    if (format === 'md') {
+      const lines: string[] = [];
+      lines.push(`# ${ws.title}`);
+      if (ws.description) lines.push('', `_${ws.description}_`);
+      lines.push(
+        '',
+        `_Generado por Shifty Studio · ${ordered.length} hoja${ordered.length === 1 ? '' : 's'}_`,
+        '',
+      );
+
+      // TOC
+      if (ordered.length > 1) {
+        lines.push('## Contenido', '');
+        ordered.forEach((n, i) => {
+          lines.push(`${i + 1}. ${n.title}`);
+        });
+        lines.push('');
+      }
+
+      // Body
+      for (const n of ordered) {
+        lines.push('---', '');
+        lines.push(`## ${n.title}`);
+        if (n.subtitle) lines.push('', `_${n.subtitle}_`);
+        const md = ((n.content as Record<string, unknown>)?.md as string) ?? '';
+        if (md.trim()) lines.push('', md.trim());
+        lines.push('');
+      }
+
+      const body = lines.join('\n');
+      res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="${safeName}.md"`);
+      res.send(body);
+      return;
+    }
+
+    // ── PPTX via Gamma API ───────────────────────────────────────────
+    // Strategy: build the SAME markdown the md format produces, but use
+    // explicit "\n---\n" slide breaks (already present between hojas) so
+    // Gamma respects the canvas structure 1:1.
+    //
+    // We block until completion (max ~5min) and return a JSON envelope
+    // with the signed download URL. The client opens it in a new tab;
+    // the URL is valid for ~1 week per Gamma's CDN policy.
+    if (format === 'pptx') {
+      const force = Boolean(req.body?.force);
+      const options = (req.body?.options ?? undefined) as
+        | undefined
+        | {
+            tono?: string;
+            audiencia?: string;
+            proposito?: string;
+            marca?: string;
+            emojis?: boolean;
+          };
+      const { runWorkspacePptxExport: runPptx } = await import('../services/workspacePptxExport.js');
+      try {
+        const result = await runPptx({ workspaceId: id, userId, force, options });
+        console.log(
+          `[workspace] export pptx ok workspaceId=${id} hojas=${ordered.length} generationId=${result.generationId} cached=${result.cached}`,
+        );
+        res.json({
+          ok: true,
+          format: 'pptx',
+          cached: result.cached,
+          generatedAt: result.generatedAt,
+          filename: result.filename,
+          url: result.exportUrl,
+          gammaUrl: result.gammaUrl,
+          generationId: result.generationId,
+        });
+        return;
+      } catch (err) {
+        if (err instanceof GammaApiError) {
+          console.warn(
+            `[workspace] export pptx failed workspaceId=${id} code=${err.code} error=${err.message}`,
+          );
+          const statusMap: Record<string, number> = {
+            auth: 503,
+            insufficient_credits: 402,
+            forbidden: 403,
+            bad_request: 400,
+            rate_limited: 429,
+            timeout: 504,
+            failed: 502,
+            no_export_url: 502,
+            upstream: 502,
+            network: 502,
+          };
+          res.status(statusMap[err.code] ?? 500).json({
+            ok: false,
+            error: err.code,
+            detail: err.message,
+          });
+          return;
+        }
+        throw err;
+      }
+    }
+
+    // ─── DOCX ─────────────────────────────────────────────────────
+    let docxLib: typeof import('docx');
+    try {
+      docxLib = await import('docx');
+    } catch {
+      res
+        .status(501)
+        .json({ ok: false, error: 'docx_not_installed', hint: 'Run: npm install docx' });
+      return;
+    }
+    const {
+      Document,
+      Packer,
+      Paragraph,
+      HeadingLevel,
+      TextRun,
+      PageBreak,
+      AlignmentType,
+      Footer,
+      Header,
+      PageNumber,
+      NumberFormat,
+      BorderStyle,
+      ExternalHyperlink,
+      LevelFormat,
+      convertInchesToTwip,
+    } = docxLib;
+
+    // ─── Inline markdown parser ──────────────────────────────────
+    // Walks **bold**, *italic*, `code`, [text](url) into TextRun array.
+    // Order matters: code first (so backtick contents aren't reparsed),
+    // then bold (** before *), then italic, then links last.
+    type InlineToken = {
+      type: 'text' | 'code' | 'link';
+      text: string;
+      url?: string;
+      bold?: boolean;
+      italics?: boolean;
+    };
+    function parseInline(input: string): InlineToken[] {
+      const tokens: InlineToken[] = [];
+      // Mask out code spans first
+      const codePlaceholders: string[] = [];
+      let masked = input.replace(/`([^`]+)`/g, (_, code) => {
+        codePlaceholders.push(code);
+        return `${codePlaceholders.length - 1}`;
+      });
+      // Mask links [text](url)
+      const linkPlaceholders: Array<{ text: string; url: string }> = [];
+      masked = masked.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, t, u) => {
+        linkPlaceholders.push({ text: t, url: u });
+        return `${linkPlaceholders.length - 1}`;
+      });
+
+      // Now walk the masked string for bold/italic
+      const pieces = masked.split(/(\*\*[^*]+\*\*|\*[^*]+\*|\d+|\d+)/g).filter(Boolean);
+      for (const piece of pieces) {
+        const codeMatch = piece.match(/^(\d+)$/);
+        if (codeMatch) {
+          tokens.push({ type: 'code', text: codePlaceholders[Number(codeMatch[1])] });
+          continue;
+        }
+        const linkMatch = piece.match(/^(\d+)$/);
+        if (linkMatch) {
+          const { text, url } = linkPlaceholders[Number(linkMatch[1])];
+          tokens.push({ type: 'link', text, url });
+          continue;
+        }
+        if (/^\*\*[^*]+\*\*$/.test(piece)) {
+          tokens.push({ type: 'text', text: piece.slice(2, -2), bold: true });
+          continue;
+        }
+        if (/^\*[^*]+\*$/.test(piece)) {
+          tokens.push({ type: 'text', text: piece.slice(1, -1), italics: true });
+          continue;
+        }
+        tokens.push({ type: 'text', text: piece });
+      }
+      return tokens;
+    }
+
+    function inlineToRuns(
+      input: string,
+    ): Array<InstanceType<typeof TextRun> | InstanceType<typeof ExternalHyperlink>> {
+      const out: Array<InstanceType<typeof TextRun> | InstanceType<typeof ExternalHyperlink>> = [];
+      for (const tk of parseInline(input)) {
+        if (tk.type === 'code') {
+          out.push(
+            new TextRun({
+              text: tk.text,
+              font: { name: 'Consolas' },
+              color: '6B2438',
+              shading: { fill: 'F5EEEF', type: 'clear' as never, color: 'auto' },
+              size: 20,
+            }),
+          );
+        } else if (tk.type === 'link' && tk.url) {
+          out.push(
+            new ExternalHyperlink({
+              link: tk.url,
+              children: [new TextRun({ text: tk.text, color: '7A3B47', underline: {} })],
+            }),
+          );
+        } else {
+          out.push(new TextRun({ text: tk.text, bold: tk.bold, italics: tk.italics }));
+        }
+      }
+      return out.length > 0 ? out : [new TextRun({ text: input })];
+    }
+
+    // ─── Block parser ─────────────────────────────────────────────
+    function mdBlocksToParagraphs(md: string): InstanceType<typeof Paragraph>[] {
+      const out: InstanceType<typeof Paragraph>[] = [];
+      const lines = md.split('\n');
+      let i = 0;
+      while (i < lines.length) {
+        const line = lines[i];
+        const trimmed = line.trim();
+
+        // Empty line — skip
+        if (!trimmed) {
+          i++;
+          continue;
+        }
+
+        // Horizontal rule
+        if (/^(---|___|\*\*\*)\s*$/.test(trimmed)) {
+          out.push(
+            new Paragraph({
+              border: {
+                bottom: { color: 'CCCCCC', space: 1, style: BorderStyle.SINGLE, size: 6 },
+              },
+            }),
+          );
+          i++;
+          continue;
+        }
+
+        // ATX headings ###/##/#
+        if (/^####\s+/.test(trimmed)) {
+          out.push(
+            new Paragraph({
+              children: inlineToRuns(trimmed.replace(/^####\s+/, '')),
+              heading: HeadingLevel.HEADING_4,
+            }),
+          );
+          i++;
+          continue;
+        }
+        if (/^###\s+/.test(trimmed)) {
+          out.push(
+            new Paragraph({
+              children: inlineToRuns(trimmed.replace(/^###\s+/, '')),
+              heading: HeadingLevel.HEADING_3,
+            }),
+          );
+          i++;
+          continue;
+        }
+        if (/^##\s+/.test(trimmed)) {
+          out.push(
+            new Paragraph({
+              children: inlineToRuns(trimmed.replace(/^##\s+/, '')),
+              heading: HeadingLevel.HEADING_2,
+            }),
+          );
+          i++;
+          continue;
+        }
+        if (/^#\s+/.test(trimmed)) {
+          out.push(
+            new Paragraph({
+              children: inlineToRuns(trimmed.replace(/^#\s+/, '')),
+              heading: HeadingLevel.HEADING_3,
+            }),
+          );
+          i++;
+          continue;
+        }
+
+        // Code fence
+        if (/^```/.test(trimmed)) {
+          const codeLines: string[] = [];
+          i++;
+          while (i < lines.length && !/^```/.test(lines[i].trim())) {
+            codeLines.push(lines[i]);
+            i++;
+          }
+          i++; // skip closing fence
+          for (const cl of codeLines) {
+            out.push(
+              new Paragraph({
+                children: [
+                  new TextRun({
+                    text: cl,
+                    font: { name: 'Consolas' },
+                    size: 20,
+                    color: '24292E',
+                  }),
+                ],
+                shading: { fill: 'F6F8FA', type: 'clear' as never, color: 'auto' },
+                indent: { left: convertInchesToTwip(0.25) },
+              }),
+            );
+          }
+          continue;
+        }
+
+        // Block quote
+        if (/^>\s+/.test(trimmed)) {
+          const quoteLines: string[] = [];
+          while (i < lines.length && /^>\s+/.test(lines[i].trim())) {
+            quoteLines.push(lines[i].replace(/^\s*>\s+/, ''));
+            i++;
+          }
+          out.push(
+            new Paragraph({
+              children: inlineToRuns(quoteLines.join(' ')),
+              indent: { left: convertInchesToTwip(0.4) },
+              border: {
+                left: { color: '7A3B47', space: 8, style: BorderStyle.SINGLE, size: 18 },
+              },
+              spacing: { before: 80, after: 80 },
+            }),
+          );
+          continue;
+        }
+
+        // Numbered list
+        if (/^\d+\.\s+/.test(trimmed)) {
+          while (i < lines.length && /^\d+\.\s+/.test(lines[i].trim())) {
+            const itemText = lines[i].trim().replace(/^\d+\.\s+/, '');
+            out.push(
+              new Paragraph({
+                children: inlineToRuns(itemText),
+                numbering: { reference: 'studio-numbered', level: 0 },
+              }),
+            );
+            i++;
+          }
+          continue;
+        }
+
+        // Bullet list
+        if (/^[-*+]\s+/.test(trimmed)) {
+          while (i < lines.length && /^[-*+]\s+/.test(lines[i].trim())) {
+            const itemText = lines[i].trim().replace(/^[-*+]\s+/, '');
+            out.push(
+              new Paragraph({
+                children: inlineToRuns(itemText),
+                bullet: { level: 0 },
+              }),
+            );
+            i++;
+          }
+          continue;
+        }
+
+        // Paragraph — gather contiguous non-blank, non-special lines
+        const paraLines: string[] = [trimmed];
+        i++;
+        while (i < lines.length) {
+          const l = lines[i].trim();
+          if (!l) break;
+          if (/^(#{1,6}\s|>\s|[-*+]\s|\d+\.\s|```|---|___|\*\*\*$)/.test(l)) break;
+          paraLines.push(l);
+          i++;
+        }
+        out.push(
+          new Paragraph({
+            children: inlineToRuns(paraLines.join(' ')),
+            spacing: { before: 60, after: 60, line: 320 },
+          }),
+        );
+      }
+      return out;
+    }
+
+    // ─── Color accent per hoja ───────────────────────────────────
+    const HOJA_ACCENTS: Record<string, string> = {
+      default: '7A3B47',
+      burgundy: '7A3B47',
+      ink: '0E1745',
+      sage: '2F7A5C',
+      amber: 'B57F00',
+    };
+
+    const children: InstanceType<typeof Paragraph>[] = [];
+
+    // ─── Cover page ───────────────────────────────────────────────
+    // Title — large, centered (Studio drops the CL2 legislativo eyebrow).
+    children.push(
+      new Paragraph({
+        children: [
+          new TextRun({ text: String(ws.title), size: 56, bold: true, color: '0E1745' }),
+        ],
+        alignment: AlignmentType.CENTER,
+        spacing: { before: 1800, after: 200 },
+      }),
+    );
+
+    // Description / dek
+    if (ws.description && String(ws.description).trim()) {
+      children.push(
+        new Paragraph({
+          children: [
+            new TextRun({
+              text: String(ws.description),
+              italics: true,
+              size: 26,
+              color: '555555',
+            }),
+          ],
+          alignment: AlignmentType.CENTER,
+          spacing: { after: 400, line: 360 },
+        }),
+      );
+    }
+
+    // Divider rule
+    children.push(
+      new Paragraph({
+        border: {
+          bottom: { color: '7A3B47', space: 1, style: BorderStyle.SINGLE, size: 12 },
+        },
+        spacing: { before: 200, after: 200 },
+        alignment: AlignmentType.CENTER,
+        children: [],
+      }),
+    );
+
+    // Stats line
+    const dateStr = new Date().toLocaleDateString('es-419', {
+      day: 'numeric',
+      month: 'long',
+      year: 'numeric',
+    });
+    children.push(
+      new Paragraph({
+        children: [
+          new TextRun({
+            text: `${ordered.length} ${ordered.length === 1 ? 'hoja' : 'hojas'} · Generado el ${dateStr}`,
+            italics: true,
+            size: 22,
+            color: '888888',
+          }),
+        ],
+        alignment: AlignmentType.CENTER,
+        spacing: { after: 200 },
+      }),
+    );
+    children.push(
+      new Paragraph({
+        children: [new TextRun({ text: 'Shifty Studio', size: 18, color: 'AAAAAA' })],
+        alignment: AlignmentType.CENTER,
+      }),
+    );
+
+    // ─── TOC ──────────────────────────────────────────────────────
+    if (ordered.length > 1) {
+      children.push(new Paragraph({ children: [new PageBreak()] }));
+      children.push(
+        new Paragraph({
+          children: [
+            new TextRun({
+              text: 'CONTENIDO',
+              size: 22,
+              bold: true,
+              color: '7A3B47',
+              characterSpacing: 80,
+            }),
+          ],
+          spacing: { after: 240 },
+          border: {
+            bottom: { color: '7A3B47', space: 6, style: BorderStyle.SINGLE, size: 6 },
+          },
+        }),
+      );
+      ordered.forEach((n, i) => {
+        const num = String(i + 1).padStart(2, '0');
+        children.push(
+          new Paragraph({
+            children: [
+              new TextRun({ text: `${num}    `, color: '7A3B47', bold: true, size: 22 }),
+              new TextRun({ text: String(n.title), size: 22, color: '0E1745' }),
+              ...(n.subtitle
+                ? [
+                    new TextRun({
+                      text: `   —   ${n.subtitle}`,
+                      size: 20,
+                      italics: true,
+                      color: '888888',
+                    }),
+                  ]
+                : []),
+            ],
+            spacing: { before: 80, after: 80 },
+          }),
+        );
+      });
+    }
+
+    // ─── Body — one hoja per section ──────────────────────────────
+    ordered.forEach((n, i) => {
+      children.push(new Paragraph({ children: [new PageBreak()] }));
+      const accent = HOJA_ACCENTS[String(n.color)] ?? HOJA_ACCENTS.default;
+
+      // Hoja number eyebrow
+      children.push(
+        new Paragraph({
+          children: [
+            new TextRun({
+              text: `HOJA ${String(i + 1).padStart(2, '0')}`,
+              size: 16,
+              color: accent,
+              bold: true,
+              characterSpacing: 80,
+            }),
+          ],
+          spacing: { after: 120 },
+        }),
+      );
+      // Title
+      children.push(
+        new Paragraph({
+          children: [
+            new TextRun({ text: String(n.title), size: 40, bold: true, color: '0E1745' }),
+          ],
+          spacing: { after: 80 },
+        }),
+      );
+      // Subtitle
+      if (n.subtitle && String(n.subtitle).trim()) {
+        children.push(
+          new Paragraph({
+            children: [
+              new TextRun({
+                text: String(n.subtitle),
+                size: 24,
+                italics: true,
+                color: '666666',
+              }),
+            ],
+            spacing: { after: 240 },
+          }),
+        );
+      } else {
+        children.push(new Paragraph({ text: '', spacing: { after: 120 } }));
+      }
+      // Accent bar
+      children.push(
+        new Paragraph({
+          border: { bottom: { color: accent, space: 1, style: BorderStyle.SINGLE, size: 8 } },
+          spacing: { after: 240 },
+          children: [],
+        }),
+      );
+
+      // Body
+      const md = ((n.content as Record<string, unknown>)?.md as string) ?? '';
+      if (md.trim()) {
+        children.push(...mdBlocksToParagraphs(md));
+      } else {
+        children.push(
+          new Paragraph({
+            children: [
+              new TextRun({ text: '(Hoja sin contenido)', italics: true, color: 'BBBBBB' }),
+            ],
+          }),
+        );
+      }
+    });
+
+    // ─── Document with header/footer + numbering ──────────────────
+    const doc = new Document({
+      creator: 'Shifty Studio',
+      title: String(ws.title),
+      description: String(ws.description ?? ''),
+      numbering: {
+        config: [
+          {
+            reference: 'studio-numbered',
+            levels: [
+              {
+                level: 0,
+                format: LevelFormat.DECIMAL,
+                text: '%1.',
+                alignment: AlignmentType.START,
+                style: {
+                  paragraph: {
+                    indent: {
+                      left: convertInchesToTwip(0.5),
+                      hanging: convertInchesToTwip(0.25),
+                    },
+                  },
+                },
+              },
+            ],
+          },
+        ],
+      },
+      styles: {
+        default: {
+          document: { run: { font: { name: 'Calibri' }, size: 22 } },
+        },
+        paragraphStyles: [
+          {
+            id: 'Heading1',
+            name: 'Heading 1',
+            basedOn: 'Normal',
+            next: 'Normal',
+            run: { font: { name: 'Calibri' }, size: 36, bold: true, color: '0E1745' },
+            paragraph: { spacing: { before: 360, after: 160 } },
+          },
+          {
+            id: 'Heading2',
+            name: 'Heading 2',
+            basedOn: 'Normal',
+            next: 'Normal',
+            run: { font: { name: 'Calibri' }, size: 28, bold: true, color: '7A3B47' },
+            paragraph: { spacing: { before: 240, after: 120 } },
+          },
+          {
+            id: 'Heading3',
+            name: 'Heading 3',
+            basedOn: 'Normal',
+            next: 'Normal',
+            run: { font: { name: 'Calibri' }, size: 24, bold: true, color: '0E1745' },
+            paragraph: { spacing: { before: 200, after: 100 } },
+          },
+        ],
+      },
+      sections: [
+        {
+          properties: {
+            page: {
+              margin: {
+                top: convertInchesToTwip(1),
+                right: convertInchesToTwip(1),
+                bottom: convertInchesToTwip(1),
+                left: convertInchesToTwip(1),
+              },
+            },
+          },
+          headers: {
+            default: new Header({
+              children: [
+                new Paragraph({
+                  alignment: AlignmentType.RIGHT,
+                  children: [
+                    new TextRun({
+                      text: String(ws.title),
+                      size: 18,
+                      color: 'AAAAAA',
+                      italics: true,
+                    }),
+                  ],
+                }),
+              ],
+            }),
+          },
+          footers: {
+            default: new Footer({
+              children: [
+                new Paragraph({
+                  alignment: AlignmentType.CENTER,
+                  children: [
+                    new TextRun({ text: 'Shifty Studio · ', size: 16, color: 'AAAAAA' }),
+                    new TextRun({
+                      children: [PageNumber.CURRENT],
+                      size: 16,
+                      color: 'AAAAAA',
+                    }),
+                    new TextRun({ text: ' / ', size: 16, color: 'AAAAAA' }),
+                    new TextRun({
+                      children: [PageNumber.TOTAL_PAGES],
+                      size: 16,
+                      color: 'AAAAAA',
+                    }),
+                  ],
+                }),
+              ],
+            }),
+          },
+          children,
+        },
+      ],
+    });
+    // Suppress unused-var linting on optional helpers we keep in the
+    // destructure to make the surface explicit.
+    void NumberFormat;
+    const buffer = await Packer.toBuffer(doc);
+
+    console.log(
+      `[workspace] export ok workspaceId=${id} format=${format} hojas=${ordered.length} bytes=${buffer.length}`,
+    );
+
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    );
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName}.docx"`);
+    res.send(buffer);
+  } catch (err) {
+    console.warn('[workspace] export failed:', (err as Error).message);
+    res.status(500).json({ ok: false, error: (err as Error).message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// IMPORT — multipart asset upload (image / audio / document)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// POST /api/workspace/:id/nodes/import (multipart)
+//   field "file"   — required, single file ≤ 100MB
+//   field "x"/"y"  — optional, canvas position; defaults to grid next-slot
+//   field "width"/"height" — optional, defaults are type-aware
+//
+// Pipeline:
+//   1. multer parses the multipart, holds the buffer in memory
+//   2. We sniff the mime → decide node `type` (image/audio/document)
+//   3. Service-role Supabase client uploads to bucket `studio-workspace-assets`
+//      under `${userId}/${workspaceId}/${objectId}-${filename}`
+//   4. Get the public URL (bucket is public-read per migration)
+//   5. Insert studio_workspace_nodes row with type + content={url, ...}
+//   6. Best-effort text extraction for PDF / DOCX / md / txt
+//   7. Respond with the created node
+//
+// Bucket creation is lazy — first import in a fresh Supabase project will
+// create-or-update the bucket. The migration also creates it idempotently.
+//
+// Ported from CL2 (lines 1051-1272). Renames: bucket name is now
+// `studio-workspace-assets`; table is `studio_workspace_nodes`.
+
+const importUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 100 * 1024 * 1024 }, // 100MB cap
+});
+
+const ASSET_TYPE_ALLOWLIST: Record<string, 'image' | 'audio' | 'document'> = {
+  // images
+  'image/png': 'image',
+  'image/jpeg': 'image',
+  'image/gif': 'image',
+  'image/webp': 'image',
+  'image/svg+xml': 'image',
+  // audio
+  'audio/mpeg': 'audio',
+  'audio/mp4': 'audio',
+  'audio/wav': 'audio',
+  'audio/x-wav': 'audio',
+  'audio/ogg': 'audio',
+  'audio/webm': 'audio',
+  // documents
+  'application/pdf': 'document',
+  'application/msword': 'document',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'document',
+  'text/plain': 'document',
+  'text/markdown': 'document',
+};
+
+const STUDIO_ASSETS_BUCKET = 'studio-workspace-assets';
+
+/** Cap on extracted text we persist + forward to the LLM. ~15K tokens
+ *  with room to spare in a Sonnet/Opus context. Beyond this we truncate
+ *  with a marker so the model knows the source was longer. */
+const ASSET_EXTRACT_MAX_CHARS = 60_000;
+
+// pdf-parse v2 ESM bridge — lazy so the import cost only hits the
+// first PDF upload, not every API cold start.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let _PDFParse: any | null = null;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function getPDFParse(): Promise<any> {
+  if (_PDFParse) return _PDFParse;
+  const mod = await import('pdf-parse');
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  _PDFParse = (mod as any).PDFParse ?? (mod as any).default?.PDFParse;
+  if (!_PDFParse) throw new Error('pdf-parse: PDFParse class not found');
+  return _PDFParse;
+}
+
+/**
+ * Extract plain text from an uploaded asset buffer when feasible (PDF,
+ * DOCX, plain text, markdown). Returns `null` for non-textual types
+ * (images, audio) — the caller persists nothing in that case.
+ *
+ * Why on the SERVER: the user attached a doc to the canvas; from now on
+ * the chat sees this doc whenever the user asks "qué dice la hoja
+ * seleccionada". Without extraction the model only saw filename+size,
+ * so it'd reply "no hay contenido".
+ */
+async function extractAssetText(buffer: Buffer, mime: string): Promise<string | null> {
+  // Plain text + markdown — just decode.
+  if (mime === 'text/plain' || mime === 'text/markdown') {
+    return buffer.toString('utf-8').slice(0, ASSET_EXTRACT_MAX_CHARS);
+  }
+  // PDF
+  if (mime === 'application/pdf') {
+    const PDFParse = await getPDFParse();
+    const parser = new PDFParse({ data: buffer });
+    const parsed = await parser.getText();
+    await parser.destroy?.();
+    const txt = ((parsed.text ?? '') as string).trim();
+    return txt.length > ASSET_EXTRACT_MAX_CHARS
+      ? txt.slice(0, ASSET_EXTRACT_MAX_CHARS) + '\n\n[…truncado por longitud]'
+      : txt;
+  }
+  // DOCX (the new MS Word format). The legacy .doc binary is not
+  // supported by mammoth — those will skip extraction.
+  if (mime === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
+    const mammoth = await import('mammoth');
+    const { value } = await mammoth.extractRawText({ buffer });
+    const txt = (value ?? '').trim();
+    return txt.length > ASSET_EXTRACT_MAX_CHARS
+      ? txt.slice(0, ASSET_EXTRACT_MAX_CHARS) + '\n\n[…truncado por longitud]'
+      : txt;
+  }
+  // Images, audio, legacy .doc, etc. — nothing to extract.
+  return null;
+}
+
+let _bucketEnsured = false;
+async function ensureAssetsBucket() {
+  if (_bucketEnsured) return;
+  if (!supabaseAdmin) return;
+  // Service-role client can create buckets. Idempotent — if it exists,
+  // we get a 409 we silently swallow.
+  await supabaseAdmin.storage
+    .createBucket(STUDIO_ASSETS_BUCKET, {
+      public: true,
+      fileSizeLimit: 100 * 1024 * 1024,
+    })
+    .catch(() => null);
+  _bucketEnsured = true;
+}
+
+workspaceRouter.post(
+  '/:id/nodes/import',
+  importUpload.single('file'),
+  async (req: Request, res: Response) => {
+    if (!dbReady(res)) return;
+    const userId = await requireUser(req, res);
+    if (!userId) return;
+    // multer's middleware loosens `req.params` typing — coerce explicitly
+    // so tsc doesn't trip on `string | string[]` inference.
+    const id = String(req.params.id);
+    if (!isValidUuid(id)) {
+      res.status(400).json({ ok: false, error: 'invalid_uuid' });
+      return;
+    }
+    if (!(await ownedWorkspace(userId, id, res))) return;
+
+    if (!req.file) {
+      res.status(400).json({ ok: false, error: 'file_required' });
+      return;
+    }
+
+    const mime = req.file.mimetype;
+    const assetType = ASSET_TYPE_ALLOWLIST[mime];
+    if (!assetType) {
+      res.status(415).json({
+        ok: false,
+        error: 'unsupported_media_type',
+        detail: `MIME "${mime}" no permitido. Soportados: png/jpg/gif/webp/svg, mp3/m4a/wav/ogg/webm, pdf/docx/md/txt.`,
+      });
+      return;
+    }
+
+    await ensureAssetsBucket();
+
+    // Generate a stable name. We use a UUID prefix so two uploads with the
+    // same filename don't collide.
+    const safeName = (req.file.originalname || 'file').replace(/[^\w.\-]/g, '_').slice(0, 200);
+    const objectId = crypto.randomUUID();
+    const objectPath = `${userId}/${id}/${objectId}-${safeName}`;
+
+    try {
+      // Upload
+      const { error: upErr } = await supabaseAdmin!.storage
+        .from(STUDIO_ASSETS_BUCKET)
+        .upload(objectPath, req.file.buffer, {
+          contentType: mime,
+          upsert: false,
+        });
+      if (upErr) throw new Error(`upload: ${upErr.message}`);
+
+      // Public URL
+      const { data: urlData } = supabaseAdmin!.storage
+        .from(STUDIO_ASSETS_BUCKET)
+        .getPublicUrl(objectPath);
+      const publicUrl = urlData.publicUrl;
+
+      // Position + size (type-aware defaults)
+      const x = Number(req.body?.x ?? 80);
+      const y = Number(req.body?.y ?? 80);
+      const defaultDims = {
+        image: { width: 480, height: 360 },
+        audio: { width: 420, height: 140 },
+        document: { width: 380, height: 280 },
+      }[assetType];
+      const width = Number(req.body?.width ?? defaultDims.width);
+      const height = Number(req.body?.height ?? defaultDims.height);
+
+      // Best-effort text extraction for PDFs / DOCXs / plain text. Failure
+      // is non-fatal — the asset still gets uploaded and a node created,
+      // we just can't surface its text. (The extracted text feeds the
+      // workspace turn handler so "qué dice este documento" actually
+      // sees the body, not just the filename.)
+      let extractedText: string | null = null;
+      try {
+        extractedText = await extractAssetText(req.file.buffer, mime);
+      } catch (extractErr) {
+        console.warn(
+          `[workspace] asset_extract_failed mime=${mime} bytes=${req.file.size} error=${(extractErr as Error).message}`,
+        );
+      }
+
+      // Insert node row
+      const { data: node, error: nErr } = await supabaseAdmin!
+        .from('studio_workspace_nodes')
+        .insert({
+          workspace_id: id,
+          type: assetType,
+          x,
+          y,
+          width,
+          height,
+          title: req.file.originalname || safeName,
+          subtitle: `${assetType} · ${(req.file.size / 1024).toFixed(0)} KB`,
+          content: {
+            url: publicUrl,
+            path: objectPath,
+            filename: req.file.originalname || safeName,
+            size: req.file.size,
+            mime,
+            ...(extractedText && extractedText.length > 0
+              ? { extracted_text: extractedText }
+              : {}),
+          },
+          color: 'default',
+        })
+        .select('*')
+        .single();
+      if (nErr) {
+        // Clean up the orphan object on insert failure
+        await supabaseAdmin!.storage
+          .from(STUDIO_ASSETS_BUCKET)
+          .remove([objectPath])
+          .catch(() => null);
+        throw new Error(`insert: ${nErr.message}`);
+      }
+
+      console.log(
+        `[workspace] import ok workspaceId=${id} nodeId=${node.id} mime=${mime} bytes=${req.file.size} type=${assetType}`,
+      );
+
+      res.status(201).json({ ok: true, node });
+    } catch (err) {
+      console.warn(
+        `[workspace] import failed workspaceId=${id} mime=${mime} error=${(err as Error).message}`,
+      );
+      res.status(500).json({ ok: false, error: (err as Error).message });
+    }
+  },
+);
+
+// ═══════════════════════════════════════════════════════════════════════
+// REEXTRACT — re-run text extraction for an already-uploaded asset
+// ═══════════════════════════════════════════════════════════════════════
+//
+// POST /api/workspace/:id/nodes/:nodeId/reextract
+// Used to backfill nodes that were uploaded before the extractor existed.
+// Pulls the object from the storage bucket, runs extractAssetText,
+// persists into content.extracted_text. Idempotent.
+//
+// Ported from CL2 (lines 1281-1349). Tables → studio_workspace_nodes;
+// bucket → studio-workspace-assets.
+workspaceRouter.post(
+  '/:id/nodes/:nodeId/reextract',
+  async (req: Request, res: Response) => {
+    if (!dbReady(res)) return;
+    const userId = await requireUser(req, res);
+    if (!userId) return;
+    const id = String(req.params.id);
+    const nodeId = String(req.params.nodeId);
+    if (!isValidUuid(id)) {
+      res.status(400).json({ ok: false, error: 'invalid_uuid' });
+      return;
+    }
+    if (!isValidUuid(nodeId)) {
+      res.status(400).json({ ok: false, error: 'invalid_node_id' });
+      return;
+    }
+    if (!(await ownedWorkspace(userId, id, res))) return;
+
+    // Pull the node + its current content. The eq('workspace_id', id) is
+    // the second leg of the 2-step ownership check (ownedWorkspace already
+    // confirmed user owns the workspace).
+    const { data: node, error: getErr } = await supabaseAdmin!
+      .from('studio_workspace_nodes')
+      .select('id, type, content, title')
+      .eq('id', nodeId)
+      .eq('workspace_id', id)
+      .maybeSingle();
+    if (getErr || !node) {
+      res.status(404).json({ ok: false, error: 'node_not_found' });
+      return;
+    }
+    if (node.type !== 'document') {
+      res.status(400).json({ ok: false, error: 'not_a_document' });
+      return;
+    }
+
+    const c = (node.content ?? {}) as Record<string, unknown>;
+    const path = typeof c.path === 'string' ? c.path : null;
+    const mime = typeof c.mime === 'string' ? c.mime : null;
+    if (!path || !mime) {
+      res.status(400).json({ ok: false, error: 'missing_path_or_mime' });
+      return;
+    }
+
+    try {
+      // Download from the storage bucket directly (the service-role client
+      // has read access regardless of bucket policy).
+      const { data: blob, error: dlErr } = await supabaseAdmin!.storage
+        .from(STUDIO_ASSETS_BUCKET)
+        .download(path);
+      if (dlErr || !blob) {
+        res.status(502).json({ ok: false, error: 'download_failed', detail: dlErr?.message });
+        return;
+      }
+      const arrayBuf = await blob.arrayBuffer();
+      const buffer = Buffer.from(arrayBuf);
+
+      const extracted = await extractAssetText(buffer, mime);
+      if (!extracted) {
+        res.status(415).json({ ok: false, error: 'extractor_unsupported', mime });
+        return;
+      }
+
+      // Patch into content.extracted_text
+      const newContent = { ...c, extracted_text: extracted };
+      const { error: upErr } = await supabaseAdmin!
+        .from('studio_workspace_nodes')
+        .update({ content: newContent })
+        .eq('id', nodeId)
+        .eq('workspace_id', id);
+      if (upErr) throw new Error(`update: ${upErr.message}`);
+
+      res.json({
+        ok: true,
+        chars: extracted.length,
+        truncated: extracted.includes('[…truncado por longitud]'),
+      });
+    } catch (err) {
+      console.warn(
+        `[workspace] reextract failed nodeId=${nodeId} error=${(err as Error).message}`,
+      );
+      res.status(500).json({ ok: false, error: (err as Error).message });
+    }
+  },
+);
