@@ -149,11 +149,15 @@ export async function firePeajeIngest(args: PeajeIngestArgs): Promise<void> {
   try {
     await withTimeout(
       async (signal) => {
+        // Header shape mirrors server.ts (lines 155-168) and api/chat.ts
+        // (lines 105-118) inline ingest exactly: Content-Type only.
+        // Tenant routing is conveyed via the JSON body's `tenantId` field —
+        // no `X-Tenant-Id` header to keep this client a drop-in replacement
+        // for those inline fetches (per T2 review action item).
         const res = await fetch(`${SWARM_API_URL}/peaje/ingest`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'X-Tenant-Id': tenantId,
           },
           body: JSON.stringify(payload),
           signal,
