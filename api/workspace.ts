@@ -1,5 +1,5 @@
 /**
- * @file api/workspace/[...path].ts
+ * @file api/workspace.ts
  * @description Vercel serverless bridge for the Workspace BFF.
  *
  * WHY THIS FILE EXISTS
@@ -48,7 +48,7 @@
  */
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import express from 'express';
-import { workspaceRouter } from '../../src/routes/workspace.js';
+import { workspaceRouter } from '../src/routes/workspace.js';
 
 // One-shot Express app, lazily constructed on cold-start. Vercel keeps
 // the warm container around between invocations so this is built once
