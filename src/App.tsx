@@ -20,9 +20,14 @@ import { ShiftyNodeCanvas } from "./components/ShiftyNodeCanvas";
 import { useActiveGraphStore } from "./store";
 import { useAuthStore } from "./store/useAuthStore";
 import { supabase } from "./services/supabaseClient";
+import { useRoute, isWorkspacesList, matchWorkspaceId, navigate } from "./lib/router";
+import { WorkspacesListPage } from "./pages/WorkspacesListPage";
+import { WorkspaceCanvasPage } from "./pages/WorkspaceCanvasPage";
+import { LayoutGrid } from "lucide-react";
 
 export default function App() {
   const activeMode = useActiveGraphStore((state) => state.activeMode);
+  const currentPath = useRoute();
   const [isEmbedMode, setIsEmbedMode] = useState(false);
   const [isCerebroMode, setIsCerebroMode] = useState(false);
   const [tenantConfig, setTenantConfig] = useState({ tenantId: "shift", color: "#0047AB" });
@@ -112,6 +117,33 @@ export default function App() {
 
   if (!isAuthenticated && !bypassAuth) return <AuthView />;
 
+  // ─── Workspace routes: /workspaces and /workspaces/:id ─────────────
+  // These render full-screen, OUTSIDE the chat/canvas layout. They have
+  // their own TopDock + chrome. The default (`/` and everything else)
+  // falls through to the legacy chat/canvas mode below.
+  const path = currentPath;
+  if (isWorkspacesList(path)) {
+    return (
+      <ErrorBoundary>
+        <ThemeProvider>
+          <WorkspacesListPage />
+        </ThemeProvider>
+      </ErrorBoundary>
+    );
+  }
+  const workspaceIdFromPath = matchWorkspaceId(path);
+  if (workspaceIdFromPath) {
+    return (
+      <ErrorBoundary>
+        <ThemeProvider>
+          <ChatProvider>
+            <WorkspaceCanvasPage workspaceId={workspaceIdFromPath} />
+          </ChatProvider>
+        </ThemeProvider>
+      </ErrorBoundary>
+    );
+  }
+
   const isCanvas = activeMode === 'canvas';
 
   return (
@@ -164,7 +196,18 @@ export default function App() {
                   </div>
 
                   {/* Chat workspace */}
-                  <section className="flex-1 min-h-0 min-w-0 bg-white/70 dark:bg-white/5 backdrop-blur-2xl border border-white/50 dark:border-white/10 rounded-2xl shadow-[0_8px_35px_rgba(0,0,0,0.08)] dark:shadow-[0_8px_35px_rgba(0,0,0,0.3)] overflow-hidden">
+                  <section className="flex-1 min-h-0 min-w-0 bg-white/70 dark:bg-white/5 backdrop-blur-2xl border border-white/50 dark:border-white/10 rounded-2xl shadow-[0_8px_35px_rgba(0,0,0,0.08)] dark:shadow-[0_8px_35px_rgba(0,0,0,0.3)] overflow-hidden relative">
+                    {/* Workspaces nav — minimal entry; floats top-right
+                        of the chat surface so it stays out of the way of
+                        the AnimatedAiInput chrome. */}
+                    <button
+                      onClick={() => navigate('/workspaces')}
+                      title="Abrir mis workspaces"
+                      className="absolute top-3 right-3 z-30 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-white/85 dark:bg-white/10 backdrop-blur-xl border border-white/60 dark:border-white/15 text-[11.5px] font-semibold text-[#0e1745]/75 dark:text-white/75 hover:text-[#0e1745] dark:hover:text-white shadow-sm transition-colors"
+                    >
+                      <LayoutGrid className="w-3.5 h-3.5" />
+                      Workspaces
+                    </button>
                     <AnimatedAiInput onOpenHistory={openMobileDrawer} />
                   </section>
                 </>
