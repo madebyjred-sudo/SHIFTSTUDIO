@@ -37,6 +37,9 @@ import {
 } from 'lucide-react';
 import { TopDock } from '@/components/top-dock';
 import { ChatPanel } from '@/components/workspace/ChatPanel';
+import { QuickHojaModal } from '@/components/workspace/QuickHojaModal';
+import { PptxOptionsModal } from '@/components/workspace/PptxOptionsModal';
+import { PptxResultModal } from '@/components/workspace/PptxResultModal';
 import { HojaNode } from '@/components/hoja/HojaNode';
 import { AssetNode } from '@/components/hoja/AssetNode';
 import { HojaFormatMenu } from '@/components/hoja/HojaFormatMenu';
@@ -45,8 +48,8 @@ import { navigate } from '@/lib/router';
 import { cn } from '@/lib/utils';
 import {
   listNodes, createNode, updateNode, deleteNode, importAsset,
-  updateWorkspace, exportWorkspace, runArchitect, getWorkspace,
-  type WorkspaceNode, type PptxExportResult,
+  updateWorkspace, exportWorkspace, getWorkspace,
+  type WorkspaceNode, type PptxExportResult, type PptxOptions,
 } from '@/services/workspaceApi';
 import type { WorkspaceActionPayload } from '@/services/workspaceTurnStream';
 
@@ -117,17 +120,18 @@ function CanvasInner({
   const [editingTitle, setEditingTitle] = useState(false);
   const [draftTitle, setDraftTitle] = useState(title);
 
-  // Architect state — inline prompt panel
-  const [architectOpen, setArchitectOpen] = useState(false);
-  const [architectPrompt, setArchitectPrompt] = useState('');
-  const [architectRunning, setArchitectRunning] = useState(false);
-  const [architectError, setArchitectError] = useState<string | null>(null);
+  // T9 — quick-hoja modal (replaces inline architect prompt panel)
+  const [quickHojaOpen, setQuickHojaOpen] = useState(false);
 
-  // Export state — inline result panel
+  // T9 — pptx export pipeline:
+  //   options modal → exportWorkspace → result modal.
+  // We cache the last submitted options on the page so the regenerate
+  // path (and any reopen) pre-fills the form.
   const [exporting, setExporting] = useState<'md' | 'docx' | 'pptx' | null>(null);
   const [exportMenuOpen, setExportMenuOpen] = useState(false);
+  const [pptxOptionsOpen, setPptxOptionsOpen] = useState(false);
+  const [pptxOptionsCache, setPptxOptionsCache] = useState<PptxOptions | undefined>(undefined);
   const [pptxResult, setPptxResult] = useState<PptxExportResult | null>(null);
-  const [pptxError, setPptxError] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   // Use a Map so we can iterate it cleanly on unmount.
@@ -202,12 +206,18 @@ function CanvasInner({
     );
   }, [handleDelete, handleSelect, handleNodeUpdate, setNodes]);
 
-  // ── Cleanup all pending timers on unmount. Important #2 + #3. ────
+  // ── Cleanup all pending timers + dismiss modals on unmount.
+  //    Important #2 + #3 + T9 modal hygiene. ────────────────────────
   useEffect(() => () => {
     positionSaveTimers.current.forEach((t) => clearTimeout(t));
     positionSaveTimers.current.clear();
     pendingTimers.current.forEach((t) => clearTimeout(t));
     pendingTimers.current.clear();
+    // Modals own their own AbortController + timer cleanup, but make
+    // sure no stale `open` flag survives a route change.
+    setQuickHojaOpen(false);
+    setPptxOptionsOpen(false);
+    setPptxResult(null);
   }, []);
 
   // ── Persist position on drag end (debounced 300ms) ───────────────
@@ -347,51 +357,61 @@ function CanvasInner({
     }
   }, [workspaceId, setNodes, fitView, handleDelete, handleSelect, handleNodeUpdate, scheduleTimer]);
 
-  // ── Architect ────────────────────────────────────────────────────
-  const handleArchitectRun = useCallback(async () => {
-    const prompt = architectPrompt.trim();
-    if (!prompt || architectRunning) return;
-    setArchitectRunning(true);
-    setArchitectError(null);
-    try {
-      const { nodes: newNodes } = await runArchitect(workspaceId, prompt);
-      // Stagger materialization
-      for (let i = 0; i < newNodes.length; i++) {
-        const n = newNodes[i];
-        const rf = toRFNode(n, workspaceId, { onDelete: handleDelete, onSelect: handleSelect, onUpdate: handleNodeUpdate });
-        scheduleTimer(() => setNodes((ns) => [...ns, rf]), i * 120);
-      }
-      scheduleTimer(() => fitView({ padding: 0.18, duration: 600 }), newNodes.length * 120 + 100);
-      setArchitectPrompt('');
-      setArchitectOpen(false);
-    } catch (err) {
-      setArchitectError((err as Error).message);
-    } finally {
-      setArchitectRunning(false);
+  // ── Quick-hoja onCreated: same materialization path as the chat
+  //    `build` intent — stagger insert + fitView. ──────────────────
+  const handleQuickHojaCreated = useCallback((newNodes: WorkspaceNode[]) => {
+    if (newNodes.length === 0) return;
+    for (let i = 0; i < newNodes.length; i++) {
+      const n = newNodes[i];
+      const rf = toRFNode(n, workspaceId, {
+        onDelete: handleDelete,
+        onSelect: handleSelect,
+        onUpdate: handleNodeUpdate,
+      });
+      scheduleTimer(() => setNodes((ns) => [...ns, rf]), i * 120);
     }
-  }, [architectPrompt, architectRunning, workspaceId, setNodes, fitView, handleDelete, handleSelect, handleNodeUpdate, scheduleTimer]);
+    scheduleTimer(() => fitView({ padding: 0.18, duration: 600 }), newNodes.length * 120 + 100);
+  }, [workspaceId, setNodes, fitView, handleDelete, handleSelect, handleNodeUpdate, scheduleTimer]);
 
   // ── Export ───────────────────────────────────────────────────────
+  // md / docx → direct binary download (no modal needed).
+  // pptx     → open PptxOptionsModal; that modal owns the call and
+  //            hands `(opts, result)` back to onPptxOptionsSubmit.
   const handleExport = useCallback(async (format: 'md' | 'docx' | 'pptx') => {
     if (exporting) return;
-    setExporting(format);
     setExportMenuOpen(false);
-    setPptxError(null);
+    if (format === 'pptx') {
+      // Don't fire the request yet — let the user fill the form first.
+      setPptxOptionsOpen(true);
+      return;
+    }
+    setExporting(format);
     try {
-      if (format === 'pptx') {
-        const result = await exportWorkspace(workspaceId, 'pptx', { workspaceTitle: title });
-        setPptxResult(result);
-      } else if (format === 'docx') {
+      if (format === 'docx') {
         await exportWorkspace(workspaceId, 'docx', { workspaceTitle: title });
       } else {
         await exportWorkspace(workspaceId, 'md', { workspaceTitle: title });
       }
-    } catch (err) {
-      if (format === 'pptx') setPptxError((err as Error).message);
+    } catch {
+      // Non-pptx failures are silent here; T11 may add a toast surface.
     } finally {
       setExporting(null);
     }
   }, [workspaceId, title, exporting]);
+
+  // Options modal → fired when generation succeeds. Cache opts (so a
+  // future "generar de nuevo" pre-fills the form) and pop the result.
+  const handlePptxOptionsSubmit = useCallback((opts: PptxOptions, result: PptxExportResult) => {
+    setPptxOptionsCache(opts);
+    setPptxOptionsOpen(false);
+    setPptxResult(result);
+  }, []);
+
+  // Result modal → "Generar de nuevo" closes result and reopens options.
+  const handlePptxRegenerate = useCallback(() => {
+    setPptxResult(null);
+    setPptxOptionsOpen(true);
+  }, []);
 
   // ── Title commit ─────────────────────────────────────────────────
   const commitTitle = () => {
@@ -498,10 +518,11 @@ function CanvasInner({
           {/* Top-right: action toolbar */}
           <Panel position="top-right" className="m-3">
             <div className="flex items-center gap-2">
-              {/* Architect */}
+              {/* Quick hoja (Lexa) / Arquitecta (Atlas) — opens QuickHojaModal */}
               <button
-                onClick={() => setArchitectOpen((v) => !v)}
-                title="Pedirle al chat que arme un set de hojas"
+                onClick={() => setQuickHojaOpen(true)}
+                title="Crear una hoja rápida o un set con la arquitecta"
+                aria-label="Abrir modal de nueva hoja con IA"
                 className="flex items-center gap-2 px-3 py-2.5 rounded-xl bg-white/80 dark:bg-[#0b1120]/80 backdrop-blur-xl border border-white/60 dark:border-white/10 shadow-sm text-[13px] font-medium text-[#1534dc] dark:text-[#8b5cf6] hover:bg-white dark:hover:bg-[#0b1120] transition-colors"
               >
                 <Sparkles className="w-4 h-4" />
@@ -570,47 +591,6 @@ function CanvasInner({
             </div>
           </Panel>
 
-          {/* Architect inline panel */}
-          {architectOpen && (
-            <Panel position="top-center" className="mt-16">
-              <div className="w-[min(640px,80vw)] p-4 rounded-2xl bg-white/85 dark:bg-[#0b1120]/85 backdrop-blur-xl border border-white/60 dark:border-white/10 shadow-[0_8px_35px_rgba(0,0,0,0.10)] dark:shadow-[0_8px_35px_rgba(0,0,0,0.4)]">
-                <div className="flex items-center gap-2 mb-2">
-                  <Sparkles className="w-4 h-4 text-[#1534dc] dark:text-[#8b5cf6]" />
-                  <h3 className="text-[13px] font-semibold text-[#0e1745] dark:text-white">Arquitecta de hojas</h3>
-                </div>
-                <p className="text-[12px] text-[#0e1745]/55 dark:text-white/50 mb-3">
-                  Describí qué set de hojas necesitás. La arquitecta arma 3-6 hojas relacionadas en el canvas.
-                </p>
-                <textarea
-                  autoFocus
-                  value={architectPrompt}
-                  onChange={(e) => setArchitectPrompt(e.target.value)}
-                  placeholder="Ej. Un análisis de marca para una fintech LATAM: posicionamiento, audiencia, mensaje, tono, plan de lanzamiento."
-                  className="w-full min-h-[100px] resize-none rounded-xl bg-white dark:bg-white/[0.03] border border-black/8 dark:border-white/10 px-3 py-2 text-[13px] text-[#0e1745] dark:text-white placeholder:text-[#0e1745]/35 dark:placeholder:text-white/30 focus:outline-none focus:border-[#1534dc]/40"
-                />
-                {architectError && (
-                  <p className="mt-2 text-[12px] text-red-500">{architectError}</p>
-                )}
-                <div className="mt-3 flex justify-end gap-2">
-                  <button
-                    onClick={() => { setArchitectOpen(false); setArchitectError(null); }}
-                    className="px-3 py-1.5 rounded-lg text-[12.5px] font-medium text-[#0e1745]/65 dark:text-white/55 hover:bg-black/5 dark:hover:bg-white/8 transition-colors"
-                  >
-                    Cancelar
-                  </button>
-                  <button
-                    onClick={() => void handleArchitectRun()}
-                    disabled={!architectPrompt.trim() || architectRunning}
-                    className="flex items-center gap-1.5 px-4 py-1.5 rounded-lg bg-[#1534dc] text-white text-[12.5px] font-semibold hover:bg-[#1230c0] transition-colors disabled:opacity-60"
-                  >
-                    {architectRunning ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5" />}
-                    {architectRunning ? 'Generando…' : 'Generar'}
-                  </button>
-                </div>
-              </div>
-            </Panel>
-          )}
-
           {/* Empty state */}
           {nodes.length === 0 && !loading && (
             <Panel position="bottom-center" className="mb-10">
@@ -652,55 +632,35 @@ function CanvasInner({
         }}
       />
 
-      {/* Pptx result modal (placeholder — T9/T10 polish) */}
-      {(pptxResult || pptxError) && (
-        <div
-          className="fixed inset-0 z-[200] bg-black/60 backdrop-blur-sm flex items-center justify-center p-6"
-          onClick={() => { setPptxResult(null); setPptxError(null); }}
-        >
-          <div
-            className="max-w-md w-full p-6 rounded-2xl bg-white dark:bg-[#0b1120] border border-black/8 dark:border-white/10 shadow-2xl"
-            onClick={(e) => e.stopPropagation()}
-          >
-            {pptxResult && (
-              <>
-                <h3 className="text-[16px] font-semibold mb-1 text-[#0e1745] dark:text-white">Presentación lista</h3>
-                <p className="text-[13px] text-[#0e1745]/60 dark:text-white/55 mb-4 truncate">{pptxResult.filename}</p>
-                <div className="flex gap-2">
-                  <a
-                    href={pptxResult.gammaUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="flex-1 px-3 py-2 rounded-lg bg-[#1534dc] text-white text-[13px] font-semibold text-center hover:bg-[#1230c0] transition-colors"
-                  >
-                    Abrir en Gamma
-                  </a>
-                  <a
-                    href={pptxResult.exportUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="flex-1 px-3 py-2 rounded-lg bg-[#7A3B47]/10 text-[#7A3B47] text-[13px] font-semibold text-center hover:bg-[#7A3B47]/15 transition-colors"
-                  >
-                    Descargar .pptx
-                  </a>
-                </div>
-              </>
-            )}
-            {pptxError && (
-              <>
-                <h3 className="text-[16px] font-semibold mb-1 text-red-600">No se pudo generar la presentación</h3>
-                <p className="text-[13px] text-[#0e1745]/60 dark:text-white/55 mb-4 break-words">{pptxError}</p>
-                <button
-                  onClick={() => setPptxError(null)}
-                  className="px-3 py-2 rounded-lg bg-[#0e1745]/8 dark:bg-white/8 text-[13px] font-semibold"
-                >
-                  Cerrar
-                </button>
-              </>
-            )}
-          </div>
-        </div>
-      )}
+      {/* T9 — quick-hoja modal (replaces inline architect panel) */}
+      <QuickHojaModal
+        open={quickHojaOpen}
+        onClose={() => setQuickHojaOpen(false)}
+        workspaceId={workspaceId}
+        onCreated={(nodes) => {
+          setQuickHojaOpen(false);
+          handleQuickHojaCreated(nodes);
+        }}
+      />
+
+      {/* T9 — pptx pre-generation form (owns the exportWorkspace call) */}
+      <PptxOptionsModal
+        open={pptxOptionsOpen}
+        onClose={() => setPptxOptionsOpen(false)}
+        workspaceId={workspaceId}
+        workspaceTitle={title}
+        initial={pptxOptionsCache}
+        onSubmit={handlePptxOptionsSubmit}
+      />
+
+      {/* T9 — pptx result with explicit user-clicked CTAs */}
+      <PptxResultModal
+        open={Boolean(pptxResult)}
+        onClose={() => setPptxResult(null)}
+        result={pptxResult}
+        onRegenerate={handlePptxRegenerate}
+        workspaceTitle={title}
+      />
     </div>
   );
 }
