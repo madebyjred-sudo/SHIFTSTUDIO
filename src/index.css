@@ -187,9 +187,20 @@ button {
 
 .hoja-prose {
     color: #0e1745;
+    transition: color 0.3s ease;
 }
 .dark .hoja-prose {
     color: rgba(255, 255, 255, 0.92);
+}
+
+/* Smooth theme-switch crossfade for the most-visible prose elements.
+   Targets the children that change color when toggling dark mode. */
+.hoja-prose h3,
+.hoja-prose code,
+.hoja-prose blockquote,
+.hoja-prose pre,
+.hoja-prose hr {
+    transition: color 0.3s ease, background-color 0.3s ease, border-color 0.3s ease;
 }
 
 /* Headings */
@@ -257,18 +268,27 @@ button {
     padding: 0 0.1em;
 }
 
-/* Links — Studio blue */
+/* Links — Studio blue / dark variant raises legibility on near-black bg */
 .hoja-prose a {
     color: #1534dc;
     text-decoration: underline;
     text-underline-offset: 2px;
     text-decoration-thickness: 1px;
+    transition: text-decoration-thickness 0.15s ease, color 0.2s ease;
 }
 .dark .hoja-prose a {
     color: #8ea4ff;
 }
 .hoja-prose a:hover {
     text-decoration-thickness: 2px;
+}
+.hoja-prose a:focus-visible {
+    outline: 2px solid rgba(21, 52, 220, 0.45);
+    outline-offset: 2px;
+    border-radius: 2px;
+}
+.dark .hoja-prose a:focus-visible {
+    outline-color: rgba(139, 92, 246, 0.55);
 }
 
 /* Lists */

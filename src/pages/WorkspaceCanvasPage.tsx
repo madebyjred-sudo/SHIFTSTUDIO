@@ -33,7 +33,7 @@ import {
 import '@xyflow/react/dist/style.css';
 import {
   ArrowLeft, Plus, Layers, Sparkles, Upload, ZoomIn, Presentation,
-  FileDown, FileText, Download, Loader2,
+  FileDown, FileText, Download, Loader2, MessageSquareText, X,
 } from 'lucide-react';
 import { TopDock } from '@/components/top-dock';
 import { ChatPanel } from '@/components/workspace/ChatPanel';
@@ -132,6 +132,10 @@ function CanvasInner({
   const [pptxOptionsOpen, setPptxOptionsOpen] = useState(false);
   const [pptxOptionsCache, setPptxOptionsCache] = useState<PptxOptions | undefined>(undefined);
   const [pptxResult, setPptxResult] = useState<PptxExportResult | null>(null);
+
+  // T10 — mobile chat drawer (shown on screens below lg breakpoint).
+  // Desktop keeps the persistent 360px sidebar.
+  const [mobileChatOpen, setMobileChatOpen] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   // Use a Map so we can iterate it cleanly on unmount.
@@ -423,7 +427,10 @@ function CanvasInner({
 
   return (
     <div className="flex h-full">
-      {/* ── Chat Panel (workspace-scoped /turn streaming) ───────────── */}
+      {/* ── Chat Panel (workspace-scoped /turn streaming) ─────────────
+           Desktop: persistent 360px column.
+           Mobile  (<lg): hidden by default, opened as drawer via the
+           "Chat" floating button on the canvas. */}
       <div className="hidden lg:flex flex-col min-h-0 w-[360px] shrink-0 border-r border-white/50 dark:border-white/10">
         <section className="h-full min-h-0 bg-white/70 dark:bg-white/5 backdrop-blur-2xl overflow-hidden shadow-[0_8px_35px_rgba(0,0,0,0.06)]">
           <ChatPanel
@@ -436,11 +443,52 @@ function CanvasInner({
         </section>
       </div>
 
+      {/* Mobile chat drawer */}
+      {mobileChatOpen && (
+        <div
+          className="lg:hidden fixed inset-0 z-[180] flex"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Chat del workspace"
+        >
+          <div
+            className="absolute inset-0 bg-black/55 backdrop-blur-sm animate-in fade-in duration-200"
+            onClick={() => setMobileChatOpen(false)}
+            aria-hidden
+          />
+          <div className="relative ml-auto w-[min(420px,90vw)] h-full bg-[#f8f9fc] dark:bg-mesh shadow-2xl border-l border-black/10 dark:border-white/10 animate-in slide-in-from-right duration-250">
+            <button
+              type="button"
+              onClick={() => setMobileChatOpen(false)}
+              aria-label="Cerrar chat"
+              className="absolute top-3 right-3 z-10 p-2 rounded-lg bg-white/80 dark:bg-white/10 backdrop-blur-xl border border-black/8 dark:border-white/10 text-[#0e1745]/65 dark:text-white/70 hover:text-[#0e1745] dark:hover:text-white transition-colors"
+            >
+              <X className="w-4 h-4" aria-hidden />
+            </button>
+            <ChatPanel
+              workspaceId={workspaceId}
+              workspaceTitle={title}
+              selectedNodeId={selectedNodeId}
+              hojaTitles={hojaTitles}
+              onWorkspaceAction={handleWorkspaceAction}
+            />
+          </div>
+        </div>
+      )}
+
       {/* ── Canvas ────────────────────────────────────────────────── */}
       <div className="flex-1 relative h-full">
         {loading && (
-          <div className="absolute inset-0 z-30 flex items-center justify-center bg-[#f8f9fc]/80 dark:bg-mesh/80 backdrop-blur-sm">
-            <div className="h-10 w-10 rounded-full border-2 border-[#1534dc]/20 border-t-[#1534dc] animate-spin" />
+          <div
+            className="absolute inset-0 z-30 flex items-center justify-center bg-[#f8f9fc]/85 dark:bg-[#080d1a]/85 backdrop-blur-sm animate-in fade-in duration-200"
+            role="status"
+            aria-busy="true"
+            aria-label="Cargando canvas"
+          >
+            <div className="flex flex-col items-center gap-3">
+              <div className="h-10 w-10 rounded-full border-2 border-[#1534dc]/20 border-t-[#1534dc] dark:border-[#8b5cf6]/20 dark:border-t-[#8b5cf6] animate-spin" aria-hidden />
+              <p className="text-[12px] font-medium text-[#0e1745]/60 dark:text-white/55">Abriendo workspace…</p>
+            </div>
           </div>
         )}
 
@@ -488,10 +536,11 @@ function CanvasInner({
             <div className="flex items-center gap-2">
               <button
                 onClick={() => navigate('/workspaces')}
-                className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-white/80 dark:bg-[#0b1120]/80 backdrop-blur-xl border border-white/60 dark:border-white/10 shadow-sm text-[13px] font-medium text-[#0e1745]/70 dark:text-white/70 hover:text-[#0e1745] dark:hover:text-white transition-colors"
+                aria-label="Volver a la lista de workspaces"
+                className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-white/80 dark:bg-[#0c1230]/85 backdrop-blur-xl border border-white/60 dark:border-white/10 shadow-sm text-[13px] font-medium text-[#0e1745]/70 dark:text-white/70 hover:text-[#0e1745] dark:hover:text-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1534dc]/45 dark:focus-visible:ring-[#8b5cf6]/45"
                 title="Volver a workspaces"
               >
-                <ArrowLeft className="w-4 h-4" />
+                <ArrowLeft className="w-4 h-4" aria-hidden />
               </button>
 
               {editingTitle ? (
@@ -501,14 +550,16 @@ function CanvasInner({
                   onChange={(e) => setDraftTitle(e.target.value)}
                   onBlur={commitTitle}
                   onKeyDown={(e) => { if (e.key === 'Enter') commitTitle(); if (e.key === 'Escape') setEditingTitle(false); }}
-                  className="px-3 py-2 rounded-xl bg-white dark:bg-[#0b1120] border border-[#1534dc]/40 shadow-sm text-[14px] font-semibold text-[#0e1745] dark:text-white focus:outline-none w-56"
+                  aria-label="Editar título del workspace"
+                  className="px-3 py-2 rounded-xl bg-white dark:bg-[#0c1230] border border-[#1534dc]/40 dark:border-[#8b5cf6]/40 shadow-sm text-[14px] font-semibold text-[#0e1745] dark:text-white focus:outline-none focus:ring-2 focus:ring-[#1534dc]/15 dark:focus:ring-[#8b5cf6]/20 w-56"
                 />
               ) : (
                 <button
                   onClick={() => { setEditingTitle(true); setDraftTitle(title); }}
-                  className="flex items-center gap-2 px-3 py-2 rounded-xl bg-white/80 dark:bg-[#0b1120]/80 backdrop-blur-xl border border-white/60 dark:border-white/10 shadow-sm"
+                  aria-label={`Editar título: ${title}`}
+                  className="flex items-center gap-2 px-3 py-2 rounded-xl bg-white/80 dark:bg-[#0c1230]/85 backdrop-blur-xl border border-white/60 dark:border-white/10 shadow-sm hover:bg-white dark:hover:bg-[#0c1230] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1534dc]/45 dark:focus-visible:ring-[#8b5cf6]/45"
                 >
-                  <Layers className="w-4 h-4 text-[#7A3B47]" />
+                  <Layers className="w-4 h-4 text-[#7A3B47]" aria-hidden />
                   <span className="text-[14px] font-semibold text-[#0e1745] dark:text-white max-w-[200px] truncate">{title}</span>
                 </button>
               )}
@@ -518,14 +569,24 @@ function CanvasInner({
           {/* Top-right: action toolbar */}
           <Panel position="top-right" className="m-3">
             <div className="flex items-center gap-2">
+              {/* Mobile-only chat drawer trigger */}
+              <button
+                onClick={() => setMobileChatOpen(true)}
+                title="Abrir chat del workspace"
+                aria-label="Abrir chat del workspace"
+                className="lg:hidden flex items-center gap-2 px-3 py-2.5 rounded-xl bg-white/80 dark:bg-[#0c1230]/85 backdrop-blur-xl border border-white/60 dark:border-white/10 shadow-sm text-[13px] font-medium text-[#0e1745] dark:text-white hover:bg-white dark:hover:bg-[#0c1230] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1534dc]/45 dark:focus-visible:ring-[#8b5cf6]/45"
+              >
+                <MessageSquareText className="w-4 h-4" aria-hidden />
+              </button>
+
               {/* Quick hoja (Lexa) / Arquitecta (Atlas) — opens QuickHojaModal */}
               <button
                 onClick={() => setQuickHojaOpen(true)}
                 title="Crear una hoja rápida o un set con la arquitecta"
                 aria-label="Abrir modal de nueva hoja con IA"
-                className="flex items-center gap-2 px-3 py-2.5 rounded-xl bg-white/80 dark:bg-[#0b1120]/80 backdrop-blur-xl border border-white/60 dark:border-white/10 shadow-sm text-[13px] font-medium text-[#1534dc] dark:text-[#8b5cf6] hover:bg-white dark:hover:bg-[#0b1120] transition-colors"
+                className="flex items-center gap-2 px-3 py-2.5 rounded-xl bg-white/80 dark:bg-[#0c1230]/85 backdrop-blur-xl border border-white/60 dark:border-white/10 shadow-sm text-[13px] font-medium text-[#1534dc] dark:text-[#8b5cf6] hover:bg-white dark:hover:bg-[#0c1230] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1534dc]/45 dark:focus-visible:ring-[#8b5cf6]/45"
               >
-                <Sparkles className="w-4 h-4" />
+                <Sparkles className="w-4 h-4" aria-hidden />
                 <span className="hidden md:inline">Arquitecta</span>
               </button>
 
@@ -533,9 +594,10 @@ function CanvasInner({
               <button
                 onClick={() => fileInputRef.current?.click()}
                 title="Subir archivo (imagen, audio, documento)"
-                className="flex items-center gap-2 px-3 py-2.5 rounded-xl bg-white/80 dark:bg-[#0b1120]/80 backdrop-blur-xl border border-white/60 dark:border-white/10 shadow-sm text-[13px] font-medium text-[#0e1745] dark:text-white hover:bg-white dark:hover:bg-[#0b1120] transition-colors"
+                aria-label="Subir archivo al workspace"
+                className="flex items-center gap-2 px-3 py-2.5 rounded-xl bg-white/80 dark:bg-[#0c1230]/85 backdrop-blur-xl border border-white/60 dark:border-white/10 shadow-sm text-[13px] font-medium text-[#0e1745] dark:text-white hover:bg-white dark:hover:bg-[#0c1230] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1534dc]/45 dark:focus-visible:ring-[#8b5cf6]/45"
               >
-                <Upload className="w-4 h-4" />
+                <Upload className="w-4 h-4" aria-hidden />
                 <span className="hidden md:inline">Subir</span>
               </button>
 
@@ -545,14 +607,19 @@ function CanvasInner({
                   onClick={() => setExportMenuOpen((v) => !v)}
                   disabled={exporting !== null}
                   title="Exportar (md, docx, pptx)"
-                  className="flex items-center gap-2 px-3 py-2.5 rounded-xl bg-white/80 dark:bg-[#0b1120]/80 backdrop-blur-xl border border-white/60 dark:border-white/10 shadow-sm text-[13px] font-medium text-[#7A3B47] hover:bg-white dark:hover:bg-[#0b1120] transition-colors disabled:opacity-60"
+                  aria-label="Exportar workspace"
+                  aria-haspopup="menu"
+                  aria-expanded={exportMenuOpen}
+                  aria-busy={exporting !== null}
+                  className="flex items-center gap-2 px-3 py-2.5 rounded-xl bg-white/80 dark:bg-[#0c1230]/85 backdrop-blur-xl border border-white/60 dark:border-white/10 shadow-sm text-[13px] font-medium text-[#7A3B47] hover:bg-white dark:hover:bg-[#0c1230] transition-colors disabled:opacity-60 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1534dc]/45 dark:focus-visible:ring-[#8b5cf6]/45"
                 >
-                  {exporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+                  {exporting ? <Loader2 className="w-4 h-4 animate-spin" aria-hidden /> : <Download className="w-4 h-4" aria-hidden />}
                   <span className="hidden md:inline">{exporting ? 'Exportando…' : 'Exportar'}</span>
                 </button>
                 {exportMenuOpen && (
                   <div
-                    className="absolute right-0 top-full mt-1.5 w-48 rounded-xl bg-white dark:bg-[#0b1120] border border-black/8 dark:border-white/10 shadow-xl py-1 z-50"
+                    role="menu"
+                    className="absolute right-0 top-full mt-1.5 w-48 rounded-xl bg-white dark:bg-[#0c1230] border border-black/8 dark:border-white/10 shadow-xl py-1 z-50 animate-in fade-in zoom-in-95 duration-150"
                     onClick={(e) => e.stopPropagation()}
                   >
                     <button
@@ -583,9 +650,10 @@ function CanvasInner({
               {/* Add hoja */}
               <button
                 onClick={() => void handleAddHoja()}
-                className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-[#1534dc] text-white text-[13px] font-semibold hover:bg-[#1230c0] transition-colors shadow-sm shadow-[#1534dc]/25"
+                aria-label="Agregar nueva hoja al canvas"
+                className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-[#1534dc] dark:bg-[#8b5cf6] text-white text-[13px] font-semibold hover:bg-[#1230c0] dark:hover:bg-[#7a4cf2] transition-colors shadow-sm shadow-[#1534dc]/25 dark:shadow-[#8b5cf6]/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/60 focus-visible:ring-offset-2 focus-visible:ring-offset-[#f8f9fc] dark:focus-visible:ring-offset-[#080d1a]"
               >
-                <Plus className="w-4 h-4" />
+                <Plus className="w-4 h-4" aria-hidden />
                 <span className="hidden md:inline">Nueva hoja</span>
               </button>
             </div>
@@ -594,20 +662,37 @@ function CanvasInner({
           {/* Empty state */}
           {nodes.length === 0 && !loading && (
             <Panel position="bottom-center" className="mb-10">
-              <div className="flex flex-col items-center gap-3 px-6 py-5 rounded-2xl bg-white/80 dark:bg-[#0b1120]/80 backdrop-blur-xl border border-white/60 dark:border-white/10 shadow-sm">
-                <div className="w-12 h-12 rounded-2xl bg-[#7A3B47]/10 flex items-center justify-center">
-                  <ZoomIn className="w-5 h-5 text-[#7A3B47]/70" />
+              <div className="flex flex-col items-center gap-3 px-6 py-5 rounded-2xl bg-white/85 dark:bg-[#0c1230]/85 backdrop-blur-xl border border-white/60 dark:border-white/10 shadow-[0_12px_40px_rgba(14,23,69,0.10)] dark:shadow-[0_12px_40px_rgba(0,0,0,0.40)] animate-in fade-in slide-in-from-bottom-2 duration-300">
+                <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-[#7A3B47]/15 to-[#1534dc]/10 dark:from-[#7A3B47]/30 dark:to-[#8b5cf6]/15 flex items-center justify-center shadow-inner">
+                  <ZoomIn className="w-5 h-5 text-[#7A3B47]/80 dark:text-[#7A3B47]" aria-hidden />
                 </div>
                 <p className="text-[13px] font-semibold text-[#0e1745] dark:text-white">Tu canvas está vacío</p>
-                <p className="text-[12px] text-[#0e1745]/55 dark:text-white/50 text-center max-w-xs">
-                  Doble clic en el lienzo para crear hoja, o usá los botones para subir un archivo o pedirle a la arquitecta.
+                <p className="text-[12px] text-[#0e1745]/55 dark:text-white/50 text-center max-w-xs leading-relaxed">
+                  Doble clic en el lienzo para crear una hoja, o usá los botones para subir un archivo o pedirle a la arquitecta.
                 </p>
-                <button
-                  onClick={() => void handleAddHoja()}
-                  className="mt-1 flex items-center gap-2 px-4 py-2 rounded-xl bg-[#1534dc] text-white text-[12.5px] font-semibold hover:bg-[#1230c0] transition-colors"
-                >
-                  <Plus className="w-3.5 h-3.5" /> Crea tu primera hoja
-                </button>
+                <div className="mt-1 flex items-center gap-2 flex-wrap justify-center">
+                  <button
+                    onClick={() => void handleAddHoja()}
+                    aria-label="Crear primera hoja"
+                    className="flex items-center gap-2 px-4 py-2 rounded-xl bg-[#1534dc] dark:bg-[#8b5cf6] text-white text-[12.5px] font-semibold hover:bg-[#1230c0] dark:hover:bg-[#7a4cf2] transition-colors shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1534dc]/45 dark:focus-visible:ring-[#8b5cf6]/45"
+                  >
+                    <Plus className="w-3.5 h-3.5" aria-hidden /> Crea tu primera hoja
+                  </button>
+                  <button
+                    onClick={() => fileInputRef.current?.click()}
+                    aria-label="Importar archivo"
+                    className="flex items-center gap-2 px-3.5 py-2 rounded-xl bg-black/5 dark:bg-white/5 hover:bg-black/8 dark:hover:bg-white/10 text-[#0e1745] dark:text-white text-[12.5px] font-medium transition-colors"
+                  >
+                    <Upload className="w-3.5 h-3.5" aria-hidden /> Importar archivo
+                  </button>
+                  <button
+                    onClick={() => setQuickHojaOpen(true)}
+                    aria-label="Pedirle a la arquitecta"
+                    className="flex items-center gap-2 px-3.5 py-2 rounded-xl bg-[#7A3B47]/8 dark:bg-[#7A3B47]/15 hover:bg-[#7A3B47]/12 dark:hover:bg-[#7A3B47]/25 text-[#7A3B47] dark:text-[#a8525f] text-[12.5px] font-medium transition-colors"
+                  >
+                    <Sparkles className="w-3.5 h-3.5" aria-hidden /> Genera con Atlas
+                  </button>
+                </div>
               </div>
             </Panel>
           )}

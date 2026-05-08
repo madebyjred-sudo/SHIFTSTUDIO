@@ -33,7 +33,7 @@
  *   stops mousedown propagation so clicks land on TipTap, not the canvas.
  */
 import {
-  useCallback, useEffect, useMemo, useRef, useState,
+  memo, useCallback, useEffect, useMemo, useRef, useState,
 } from 'react';
 import { NodeResizer } from '@xyflow/react';
 import { useEditor, EditorContent } from '@tiptap/react';
@@ -61,12 +61,14 @@ import { createSlashExtension } from './HojaSlashExtension';
 
 // ─── Color accents (left-edge bar) ────────────────────────────────────
 // Mirrors the T6 token set so AssetNode + HojaNode read consistently.
+// Dark mode variants brighten cool tones so the accent stays legible
+// against the near-black surface.
 const COLOR_ACCENTS: Record<NodeColor, string> = {
-  default:  'bg-[#1534dc]/30',
-  burgundy: 'bg-[#7A3B47]',
-  ink:      'bg-[#0e1745]',
-  sage:     'bg-emerald-500',
-  amber:    'bg-amber-500',
+  default:  'bg-[#1534dc]/30 dark:bg-[#8b5cf6]/55',
+  burgundy: 'bg-[#7A3B47] dark:bg-[#a8525f]',
+  ink:      'bg-[#0e1745] dark:bg-[#5b6890]',
+  sage:     'bg-emerald-500 dark:bg-emerald-400',
+  amber:    'bg-amber-500 dark:bg-amber-400',
 };
 
 // ─── Markdown ↔ HTML bridge ───────────────────────────────────────────
@@ -274,7 +276,7 @@ interface HojaNodeData extends Partial<WorkspaceNode> {
 }
 
 // ─── Component ────────────────────────────────────────────────────────
-export function HojaNode({
+function HojaNodeImpl({
   id,
   data,
   selected,
@@ -455,8 +457,8 @@ export function HojaNode({
     >
       <NodeResizer minWidth={320} minHeight={220} isVisible={!!selected} />
 
-      {/* Color accent bar (left edge) */}
-      <div className={cn('absolute left-0 top-0 bottom-0 w-1', accent)} aria-hidden />
+      {/* Color accent bar (left edge) — smooth color crossfade on theme change */}
+      <div className={cn('absolute left-0 top-0 bottom-0 w-1 transition-colors duration-300', accent)} aria-hidden />
 
       {/* ── Header (drag handle, title/subtitle, save state, delete) ── */}
       <div
@@ -496,7 +498,7 @@ export function HojaNode({
             onClick={handleDelete}
             aria-label="Eliminar hoja"
             title="Eliminar hoja"
-            className="p-1 rounded-md hover:bg-black/8 dark:hover:bg-white/10 text-black/30 dark:text-white/30 hover:text-red-500 transition-colors"
+            className="p-1 rounded-md hover:bg-rose-100 dark:hover:bg-rose-900/30 text-black/30 dark:text-white/30 hover:text-rose-600 dark:hover:text-rose-400 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500/40"
           >
             <Trash2 className="w-3.5 h-3.5" aria-hidden />
           </button>
@@ -519,6 +521,26 @@ export function HojaNode({
     </div>
   );
 }
+
+// Memoize so HojaNode doesn't re-render every time ReactFlow rebuilds
+// the data reference for unrelated nodes. Custom comparator: re-render
+// only when the props that actually drive the visible UI change. The
+// callback identities (onDelete/onSelect/onUpdate) live on data and are
+// kept fresh by the parent's sync effect — they are stable once mounted.
+export const HojaNode = memo(HojaNodeImpl, (prev, next) => {
+  if (prev.id !== next.id) return false;
+  if (prev.selected !== next.selected) return false;
+  const a = prev.data;
+  const b = next.data;
+  if (a === b) return true;
+  if (a.title !== b.title) return false;
+  if (a.subtitle !== b.subtitle) return false;
+  if (a.color !== b.color) return false;
+  const am = (a.content as { md?: string } | undefined)?.md ?? '';
+  const bm = (b.content as { md?: string } | undefined)?.md ?? '';
+  if (am !== bm) return false;
+  return true;
+});
 
 // ─── Save indicator ──────────────────────────────────────────────────
 // Renders the auto-save status in the header. Separated so the parent's

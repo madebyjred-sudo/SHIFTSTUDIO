@@ -165,7 +165,7 @@ export function PptxResultModal({ open, onClose, result, onRegenerate, workspace
               target="_blank"
               rel="noopener noreferrer"
               aria-label="Abrir presentación en Gamma en una pestaña nueva"
-              className="block group rounded-2xl border border-black/8 dark:border-white/10 hover:border-[#1534dc]/40 dark:hover:border-[#8b5cf6]/40 bg-gradient-to-br from-[#1534dc]/5 to-transparent dark:from-[#8b5cf6]/12 dark:to-transparent p-4 transition-all"
+              className="block group rounded-2xl border border-black/8 dark:border-white/10 hover:border-[#1534dc]/40 dark:hover:border-[#8b5cf6]/40 hover:shadow-[0_8px_25px_rgba(21,52,220,0.10)] dark:hover:shadow-[0_8px_25px_rgba(139,92,246,0.18)] bg-gradient-to-br from-[#1534dc]/5 to-transparent dark:from-[#8b5cf6]/12 dark:to-transparent p-4 transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1534dc]/45 dark:focus-visible:ring-[#8b5cf6]/45"
             >
               <div className="flex items-center justify-between gap-3">
                 <div className="min-w-0">

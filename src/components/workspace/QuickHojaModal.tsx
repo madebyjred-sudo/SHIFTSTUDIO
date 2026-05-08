@@ -178,6 +178,7 @@ export function QuickHojaModal({ open, onClose, workspaceId, onCreated }: Props)
             'rounded-3xl shadow-2xl',
             'border border-black/5 dark:border-white/10',
             'overflow-hidden',
+            'max-h-[calc(100vh-2rem)] flex flex-col',
           )}
         >
           {/* ── Header ───────────────────────────────────────────── */}
@@ -207,7 +208,7 @@ export function QuickHojaModal({ open, onClose, workspaceId, onCreated }: Props)
           </div>
 
           {/* ── Body ─────────────────────────────────────────────── */}
-          <div className="px-5 py-4 space-y-4">
+          <div className="px-5 py-4 space-y-4 overflow-y-auto">
             {/* Agent picker — segmented control */}
             <div
               role="radiogroup"
