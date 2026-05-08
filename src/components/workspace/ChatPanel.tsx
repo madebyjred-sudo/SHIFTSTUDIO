@@ -162,7 +162,10 @@ export function ChatPanel({
     streamingTextRef.current = '';
 
     let actionConsumed = false;
+    let messageEmitted = false;
+    let lastError: string | null = null;
 
+    try {
     await streamWorkspaceTurn({
       workspaceId,
       query: trimmed,
@@ -202,11 +205,13 @@ export function ChatPanel({
             },
           ]);
         } else if (chunk.type === 'error') {
+          lastError = chunk.payload;
           setError(chunk.payload);
         } else if (chunk.type === 'done') {
           // Flush any streamed text into a message.
           if (!actionConsumed && streamingTextRef.current.trim()) {
             const text = streamingTextRef.current;
+            messageEmitted = true;
             setMessages((prev) => [
               ...prev,
               {
@@ -220,6 +225,39 @@ export function ChatPanel({
         }
       },
     });
+    } catch (err) {
+      // Hard failure: network unreachable, fetch threw, etc. Surface and
+      // exit gracefully — finalization runs after the catch.
+      const msg = err instanceof Error ? err.message : 'Error desconocido al hablar con el servidor';
+      lastError = msg;
+      setError(msg);
+      console.error('[ChatPanel] streamWorkspaceTurn threw:', err);
+    }
+
+    // Defensive fallback: if the stream ended without a 'done' chunk
+    // (Vercel timeout, server crash, or aborted upstream) but we did
+    // accumulate some text, surface it anyway. Don't lose tokens.
+    if (!actionConsumed && !messageEmitted && streamingTextRef.current.trim()) {
+      const text = streamingTextRef.current;
+      messageEmitted = true;
+      setMessages((prev) => [
+        ...prev,
+        { id: `a-${Date.now()}`, role: 'assistant', content: text, createdAt: Date.now() },
+      ]);
+    }
+
+    // If nothing came back AT ALL (no tokens, no action, no message, no error),
+    // emit a visible diagnostic so the user isn't staring at silence. This is
+    // the "chat le pedi que resumiera la hoja y no hizo nada" symptom.
+    if (!actionConsumed && !messageEmitted && !lastError) {
+      const fallback =
+        '_No se recibió respuesta del modelo. Posibles causas: créditos de OpenRouter agotados, timeout del servidor (>60s), o error en el clasificador. Revisa /api/workspace/.../turn en DevTools → Network para ver el status real._';
+      setMessages((prev) => [
+        ...prev,
+        { id: `a-${Date.now()}`, role: 'assistant', content: fallback, createdAt: Date.now() },
+      ]);
+      setError('No response from /turn — see message below for diagnostics.');
+    }
 
     // Whatever happened, finalize the streaming UI state.
     streamingTextRef.current = '';

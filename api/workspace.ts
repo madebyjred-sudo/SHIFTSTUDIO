@@ -112,4 +112,8 @@ export const config = {
   api: {
     bodyParser: false,
   },
+  // Allow long-running AI calls. Hobby tier max=10s (this gets clamped),
+  // Pro=60s, Enterprise=900s. /turn chat path waits on OpenRouter
+  // streaming + classifier round-trip; 10s isn't enough.
+  maxDuration: 60,
 };
