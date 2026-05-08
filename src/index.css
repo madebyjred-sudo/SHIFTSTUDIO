@@ -416,3 +416,26 @@ button {
 .dark .hoja-prose p.is-editor-empty:first-child::before {
     color: rgba(255, 255, 255, 0.30);
 }
+
+/* ═══════════════════════════════════════════════════════════════════
+   Chat bubble markdown overrides (.chat-md, used inside .hoja-prose
+   on workspace ChatPanel assistant bubbles). Tightens spacing for the
+   narrower 360px sidebar and shrinks heading scale so a streamed
+   answer doesn't dominate the panel.
+   ═══════════════════════════════════════════════════════════════════ */
+.hoja-prose.chat-md {
+    font-size: 13px;
+    line-height: 1.55;
+}
+.hoja-prose.chat-md h1 { font-size: 15px; margin: 0.4em 0 0.2em; }
+.hoja-prose.chat-md h2 { font-size: 14px; margin: 0.4em 0 0.2em; }
+.hoja-prose.chat-md h3 { font-size: 12px; margin: 0.35em 0 0.15em; }
+.hoja-prose.chat-md p { margin: 0.3em 0; }
+.hoja-prose.chat-md ul,
+.hoja-prose.chat-md ol { margin: 0.3em 0; padding-left: 1.2em; }
+.hoja-prose.chat-md li { margin: 0.1em 0; }
+.hoja-prose.chat-md pre { font-size: 11.5px; padding: 0.5em 0.65em; }
+.hoja-prose.chat-md code { font-size: 0.85em; }
+.hoja-prose.chat-md blockquote { padding-left: 0.7em; margin: 0.4em 0; }
+.hoja-prose.chat-md > *:first-child { margin-top: 0; }
+.hoja-prose.chat-md > *:last-child { margin-bottom: 0; }
