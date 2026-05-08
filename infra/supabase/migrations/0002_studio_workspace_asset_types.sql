@@ -38,10 +38,10 @@ values (
     'text/plain','text/markdown'
   ]
 )
-on conflict (id) do update set
-  public = excluded.public,
-  file_size_limit = excluded.file_size_limit,
-  allowed_mime_types = excluded.allowed_mime_types;
+-- ON CONFLICT DO NOTHING preserves any operator-side bucket config changes
+-- (e.g. someone raised the size cap via Supabase dashboard). The first apply
+-- creates with these defaults; subsequent applies leave the bucket alone.
+on conflict (id) do nothing;
 
 -- RLS on storage.objects: a user can read anything in studio-workspace-assets
 -- (bucket is public for browser <img>/<audio> tags), but can only INSERT
@@ -71,6 +71,27 @@ begin
       );
   end if;
 
+  -- Update policy: same path-prefix gate. Required for metadata changes,
+  -- signed-url issuance flows that update objects, and upsert overwrites —
+  -- without it those operations silently fail under RLS.
+  if not exists (
+    select 1 from pg_policies
+    where schemaname = 'storage' and tablename = 'objects'
+      and policyname = 'studio_wsa_owner_update'
+  ) then
+    create policy "studio_wsa_owner_update" on storage.objects
+      for update
+      to authenticated
+      using (
+        bucket_id = 'studio-workspace-assets'
+        and split_part(name, '/', 1) = auth.uid()::text
+      )
+      with check (
+        bucket_id = 'studio-workspace-assets'
+        and split_part(name, '/', 1) = auth.uid()::text
+      );
+  end if;
+
   -- Delete policy: same path-prefix gate
   if not exists (
     select 1 from pg_policies
@@ -92,6 +113,7 @@ end $$;
 -- `supabase storage rm` before running the bucket DELETE.
 --
 -- drop policy if exists "studio_wsa_owner_delete" on storage.objects;
+-- drop policy if exists "studio_wsa_owner_update" on storage.objects;
 -- drop policy if exists "studio_wsa_owner_write"  on storage.objects;
 -- drop policy if exists "studio_wsa_public_read"  on storage.objects;
 --
