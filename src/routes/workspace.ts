@@ -969,6 +969,11 @@ async function runArchitect(workspaceId: string, prompt: string): Promise<Archit
   if (!Array.isArray(parsed.hojas) || parsed.hojas.length === 0) {
     throw new Error('architect_empty_response');
   }
+  // Spec floor: at least 3 hojas. Pad by re-prompting? No — surface as
+  // upstream error so caller can retry. Cheaper than a second LLM round.
+  if (parsed.hojas.length < 3) {
+    throw new Error('architect_below_minimum');
+  }
 
   // Diagnostic logging — same heuristic as CL2 (avg <200 chars/hoja
   // is a smell that the model returned skeletons).
