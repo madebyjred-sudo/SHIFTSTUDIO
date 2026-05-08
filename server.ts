@@ -4,6 +4,7 @@ import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
 import { AGENT_MAP, MODEL_MAP, isDebateRequest } from "./src/shared/constants.js";
+import { workspaceRouter } from "./src/routes/index.js";
 
 dotenv.config();
 
@@ -306,6 +307,11 @@ async function startServer() {
       res.status(500).json({ error: "Internal gateway error", details: String(error) });
     }
   });
+
+  // Workspace BFF — CRUD for studio_workspaces + nodes + citations.
+  // Service-role Supabase client; manually filters by user_id from
+  // jwt / x-user-id / anon fallback (see src/services/auth.ts).
+  app.use("/api/workspace", workspaceRouter);
 
   // List available agents endpoint (Proxy to Swarm)
   app.get("/api/agents", async (req, res) => {
