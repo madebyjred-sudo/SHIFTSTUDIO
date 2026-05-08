@@ -763,8 +763,12 @@ workspaceRouter.post('/:id/transform', async (req: Request, res: Response) => {
   }
   if (!(await ownedWorkspace(userId, id, res))) return;
 
-  const selection = String(req.body?.selection ?? '').trim();
-  const action = String(req.body?.action ?? 'rewrite') as TransformAction;
+  // Accept both shapes for back-compat:
+  //   - CL2 / canonical: { selection, action, instruction?, tone? }
+  //   - Studio frontend (T7 HojaSelectionMenu/HojaFormatMenu): { text, mode, instruction? }
+  // Normalize at handler boundary so callers don't have to converge.
+  const selection = String(req.body?.selection ?? req.body?.text ?? '').trim();
+  const action = String(req.body?.action ?? req.body?.mode ?? 'rewrite') as TransformAction;
   const instruction = String(req.body?.instruction ?? '').trim();
   const tone = String(req.body?.tone ?? '').trim();
 
