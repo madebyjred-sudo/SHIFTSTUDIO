@@ -299,6 +299,11 @@ export function HojaNode({
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fadeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const tickInterval = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Tracks the last incoming md we applied from props so we can short-
+  // circuit when ReactFlow churns the data object identity but the md
+  // bytes haven't changed (cheap ref compare avoids the htmlToMarkdown
+  // walk on every store tick).
+  const lastIncomingMdRef = useRef<string>(initialMd);
 
   // ── Auto-save helper ─────────────────────────────────────────────
   // Debounced 800ms — fast enough that the user sees "guardado" within
@@ -373,6 +378,12 @@ export function HojaNode({
   // ── Sync incoming data changes (e.g. chat-driven refresh) ────────
   // Only push when the prop value differs AND the editor is not focused —
   // an in-flight edit shouldn't get clobbered mid-typing.
+  //
+  // Hot-path guard: ReactFlow rebuilds `data` references on every store
+  // tick, so this effect re-runs constantly. The expensive bit is
+  // `htmlToMarkdown(editor.getHTML())` — a full DOM walk. We track the
+  // last-applied incoming md in a ref and short-circuit on byte equality
+  // before touching the editor at all.
   useEffect(() => {
     if (data.title !== undefined && data.title !== title) {
       setTitle(data.title);
@@ -380,14 +391,17 @@ export function HojaNode({
     if (data.subtitle !== undefined && data.subtitle !== subtitle) {
       setSubtitle(data.subtitle);
     }
+    if (!editor) return;
     const incomingMd = (data.content as { md?: string } | undefined)?.md ?? '';
-    const currentMd = editor ? htmlToMarkdown(editor.getHTML()) : '';
-    if (editor && !editor.isFocused && incomingMd && incomingMd !== currentMd) {
-      // setContent without triggering onUpdate (last arg = false on emitUpdate)
-      editor.commands.setContent(mdToHtml(incomingMd), { emitUpdate: false });
-    }
+    if (incomingMd === lastIncomingMdRef.current) return; // cheap ref compare, common case
+    lastIncomingMdRef.current = incomingMd;
+    if (editor.isFocused || !incomingMd) return; // preserve original gates
+    const currentMd = htmlToMarkdown(editor.getHTML());
+    if (currentMd === incomingMd) return;
+    // setContent without triggering onUpdate (last arg = false on emitUpdate)
+    editor.commands.setContent(mdToHtml(incomingMd), { emitUpdate: false });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [data.title, data.subtitle, data.content]);
+  }, [editor, data.title, data.subtitle, data.content]);
 
   // ── Sync title/subtitle edits ────────────────────────────────────
   const handleTitleChange = useCallback((val: string) => {
