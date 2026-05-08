@@ -85,6 +85,11 @@ create index if not exists studio_workspace_citations_user_idx
   on studio_workspace_citations (user_id, created_at desc);
 create unique index if not exists studio_workspace_citations_dedup
   on studio_workspace_citations (user_id, chunk_id);
+-- Supports the FK ON DELETE SET NULL on node_id: without this, deleting a
+-- node forces a seq scan over studio_workspace_citations to null out the FK.
+create index if not exists studio_workspace_citations_node_idx
+  on studio_workspace_citations (node_id)
+  where node_id is not null;
 
 -- ─── RLS ─────────────────────────────────────────────────────────────
 alter table studio_workspaces enable row level security;
@@ -136,6 +141,7 @@ create trigger studio_wsn_touch before update on studio_workspace_nodes
 -- drop policy if exists "studio_wsn_owner" on studio_workspace_nodes;
 -- drop policy if exists "studio_ws_owner" on studio_workspaces;
 --
+-- drop index if exists studio_workspace_citations_node_idx;
 -- drop index if exists studio_workspace_citations_dedup;
 -- drop index if exists studio_workspace_citations_user_idx;
 -- drop index if exists studio_workspace_nodes_ws_idx;
