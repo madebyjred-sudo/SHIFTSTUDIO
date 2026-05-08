@@ -123,6 +123,11 @@ export class GammaApiError extends Error {
     public readonly code: GammaErrorCode,
     public readonly httpStatus?: number,
     public readonly cause?: unknown,
+    /** When the upstream returned a Retry-After header (typically on 429),
+     *  this holds the parsed delay in ms. Consumed by `withRetry` to time
+     *  the next attempt — we honor the server's pacing before falling back
+     *  to exponential backoff. */
+    public readonly retryAfterMs?: number,
   ) {
     super(message);
     this.name = 'GammaApiError';
@@ -178,9 +183,15 @@ async function withRetry<T>(fn: () => Promise<T>, opts: RetryOpts): Promise<T> {
     } catch (err) {
       lastErr = err;
       if (attempt === opts.attempts || !should(err, attempt)) break;
-      const delay = opts.baseDelayMs * 2 ** (attempt - 1);
+      // If the upstream surfaced a Retry-After hint (429), honor it instead
+      // of the exponential schedule — we'd just hammer them otherwise.
+      const hintedDelay =
+        err instanceof GammaApiError && typeof err.retryAfterMs === 'number'
+          ? err.retryAfterMs
+          : undefined;
+      const delay = hintedDelay ?? opts.baseDelayMs * 2 ** (attempt - 1);
       console.warn(
-        `[retry] ${opts.label} attempt ${attempt} failed (${(err as Error).message}); retrying in ${delay}ms`,
+        `[retry] ${opts.label} attempt ${attempt} failed (${(err as Error).message}); retrying in ${delay}ms${hintedDelay ? ' [retry-after]' : ''}`,
       );
       await new Promise((r) => setTimeout(r, delay));
     }
@@ -245,8 +256,28 @@ async function gammaFetch<T>(
               'forbidden',
               403,
             );
-          if (res.status === 429)
-            throw new GammaApiError(`${label}: rate limited`, 'rate_limited', 429);
+          if (res.status === 429) {
+            // Honor Retry-After when present and reasonable (1-300s).
+            // Per RFC 7231, the value is either a delta-seconds integer or
+            // an HTTP-date; Gamma documents the integer form, so we only
+            // parse that. Anything outside [1s, 300s] falls back to our
+            // exponential backoff.
+            const raw = res.headers.get('retry-after');
+            let retryAfterMs: number | undefined;
+            if (raw) {
+              const secs = Number.parseInt(raw, 10);
+              if (Number.isFinite(secs) && secs >= 1 && secs <= 300) {
+                retryAfterMs = secs * 1000;
+              }
+            }
+            throw new GammaApiError(
+              `${label}: rate limited${retryAfterMs ? ` (retry-after ${retryAfterMs / 1000}s)` : ''}`,
+              'rate_limited',
+              429,
+              undefined,
+              retryAfterMs,
+            );
+          }
           if (res.status === 400) {
             const body = await res.text().catch(() => '');
             throw new GammaApiError(
