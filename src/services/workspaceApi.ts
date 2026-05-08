@@ -141,6 +141,12 @@ async function handleJson<T>(res: Response): Promise<T> {
     // non-JSON; fall through
   }
   if (!res.ok) {
+    // 401 → broadcast so App.tsx can clear the auth session and force a
+    // re-auth via AuthView. Fixes the "silent 401" failure mode where a
+    // stale JWT keeps the UI mounted while every save quietly fails.
+    if (res.status === 401 && typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('workspace:unauthorized'));
+    }
     const b = (body ?? {}) as { error?: string; detail?: string; code?: string; message?: string };
     const msg = b.detail ?? b.error ?? b.message ?? `HTTP ${res.status}`;
     throw new ApiError(String(msg), res.status, b.code ?? b.error);
@@ -366,6 +372,9 @@ export async function exportWorkspace(
 
   // md / docx — binary blob download
   if (!res.ok) {
+    if (res.status === 401 && typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('workspace:unauthorized'));
+    }
     // Try parsing JSON error envelope first; fall back to text.
     let msg = `HTTP ${res.status}`;
     try {

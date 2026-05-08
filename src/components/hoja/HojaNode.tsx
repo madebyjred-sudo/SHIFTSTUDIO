@@ -220,6 +220,13 @@ export function HojaNode({
     }
   }, [isEditing]);
 
+  // Clear pending debounced save on unmount so a stale timer can't fire
+  // an update against a node that's gone (or worse, hit a 401 after the
+  // user logged out). Important #1 from the T6 quality review.
+  useEffect(() => () => {
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+  }, []);
+
   const renderedHtml = useMemo(() => renderMarkdown(md), [md]);
 
   const handleDelete = useCallback(
