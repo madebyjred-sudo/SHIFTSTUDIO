@@ -1,30 +1,66 @@
 /**
- * HojaNode — T6 SHELL placeholder.
+ * HojaNode — custom ReactFlow node for the Workspace canvas (T7).
  *
- * IMPORTANT: This is a thin placeholder, NOT the rich-text node. T7 will
- * replace the body with TipTap (the full 562-line CL2 version is the
- * eventual target). For T6 the contract is intentionally narrow:
+ * Replaces T6's textarea shell with a full TipTap v3 rich-text editor.
+ * Each node is a "page" (hoja) with:
+ *   - Draggable header bar (ReactFlow handles drag via the .drag-handle).
+ *   - Editable title + subtitle (debounced auto-save).
+ *   - TipTap rich-text body (StarterKit + format extensions + custom
+ *     slash command).
+ *   - Color theme accent on left edge.
+ *   - Auto-save (debounced 800ms) — patches via workspaceApi.updateNode
+ *     AND notifies the parent via onUpdate so ReactFlow's mirror state
+ *     stays consistent.
+ *   - Live save indicator with relative timestamp.
  *
- *   data: { id, title, subtitle, content.md, color }
+ * External contract (preserved from T6):
+ *   data: { id, title, subtitle, content.md, color, workspaceId }
  *   callbacks: onDelete(id), onSelect(id), onUpdate(id, patch)
  *
- * Rendering modes:
- *   - preview (default) — markdown rendered to HTML via a tiny inline
- *     formatter (headings/bold/italic/lists). No new dep.
- *   - editing — toggle on click; <textarea> with the raw markdown,
- *     auto-saves 800ms after last keystroke and on blur.
+ * Storage shape:
+ *   - On the wire we keep `content.md` per the workspace API contract.
+ *   - TipTap stores HTML internally. On load we convert `content.md` →
+ *     HTML via `marked` (preserves headings, lists, links, code blocks,
+ *     blockquotes, hr). On save we serialize HTML → markdown via a
+ *     small custom converter (htmlToMarkdown below), so the column
+ *     stays portable / diff-friendly and a future plain-text-only
+ *     consumer (export, embedding) doesn't have to parse HTML.
  *
- * Selected state comes through ReactFlow's `selected` prop; the ring
- * mirrors AssetNode for visual consistency. Color accent on the left
- * edge (4px) per data.color, mapped to the Studio palette.
+ * Drag pass-through (CRITICAL):
+ *   ReactFlow distinguishes "draggable" vs "interactive" surfaces by the
+ *   `nodrag` class + by stopPropagation on mousedown. The header keeps
+ *   `drag-handle` for the canvas drag; the editor body has `nodrag` and
+ *   stops mousedown propagation so clicks land on TipTap, not the canvas.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  useCallback, useEffect, useMemo, useRef, useState,
+} from 'react';
 import { NodeResizer } from '@xyflow/react';
-import { GripVertical, Trash2 } from 'lucide-react';
+import { useEditor, EditorContent } from '@tiptap/react';
+import StarterKit from '@tiptap/starter-kit';
+// Format extensions — see comments in CL2's port for the rationale of
+// each. Studio inherits the same set; the slash menu replaces CL2's
+// legislative-specific commands with generic content blocks.
+import Underline from '@tiptap/extension-underline';
+import Highlight from '@tiptap/extension-highlight';
+import Link from '@tiptap/extension-link';
+import TaskList from '@tiptap/extension-task-list';
+import TaskItem from '@tiptap/extension-task-item';
+import TextAlign from '@tiptap/extension-text-align';
+import Typography from '@tiptap/extension-typography';
+import CharacterCount from '@tiptap/extension-character-count';
+import { marked } from 'marked';
+import {
+  GripHorizontal, Trash2, Check, Loader2, AlertCircle,
+} from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { updateNode, type NodeColor, type UpdateNodePatch, type WorkspaceNode } from '@/services/workspaceApi';
+import {
+  updateNode, type NodeColor, type UpdateNodePatch, type WorkspaceNode,
+} from '@/services/workspaceApi';
+import { createSlashExtension } from './HojaSlashExtension';
 
 // ─── Color accents (left-edge bar) ────────────────────────────────────
+// Mirrors the T6 token set so AssetNode + HojaNode read consistently.
 const COLOR_ACCENTS: Record<NodeColor, string> = {
   default:  'bg-[#1534dc]/30',
   burgundy: 'bg-[#7A3B47]',
@@ -33,71 +69,200 @@ const COLOR_ACCENTS: Record<NodeColor, string> = {
   amber:    'bg-amber-500',
 };
 
-// ─── Tiny markdown → HTML renderer ────────────────────────────────────
-// Intentionally minimal. T7's TipTap node will own real rendering; this
-// just gives reviewers something legible while editing the textarea.
-//
-// Supports:
-//   # / ## / ### headings, **bold**, *italic*, `code`, - / * lists,
-//   blank-line paragraph splitting.
-// Anything else falls through as plain text. We escape HTML up front so
-// user input can't inject markup.
-function renderMarkdown(md: string): string {
+// ─── Markdown ↔ HTML bridge ───────────────────────────────────────────
+// TipTap operates in HTML. The wire contract is markdown. We need a
+// round-trippable conversion for the feature set we expose:
+//   headings (h1-h3), bold/italic/strike/code/underline,
+//   bullet/ordered/task lists, links, blockquote, code blocks, hr,
+//   highlight (mark), text-align (data attr only, no md analog → kept
+//   as raw HTML when present)
+
+function mdToHtml(md: string): string {
   if (!md.trim()) return '';
-  const escape = (s: string): string =>
-    s
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;');
-
-  const blocks = md.split(/\n{2,}/);
-  const out: string[] = [];
-
-  for (const raw of blocks) {
-    const block = raw.trimEnd();
-    if (!block.trim()) continue;
-
-    // Headings
-    const h = block.match(/^(#{1,3})\s+(.+)$/);
-    if (h) {
-      const level = h[1].length;
-      const cls =
-        level === 1
-          ? 'text-[15px] font-semibold mb-1.5'
-          : level === 2
-          ? 'text-[13.5px] font-semibold mb-1.5'
-          : 'text-[12.5px] font-semibold uppercase tracking-wide mb-1';
-      out.push(`<h${level} class="${cls}">${inline(escape(h[2]))}</h${level}>`);
-      continue;
-    }
-
-    // List block (single-level, - or *)
-    if (/^[-*]\s+/.test(block)) {
-      const items = block
-        .split(/\n/)
-        .filter((l) => /^[-*]\s+/.test(l))
-        .map((l) => `<li class="ml-4 list-disc">${inline(escape(l.replace(/^[-*]\s+/, '')))}</li>`)
-        .join('');
-      out.push(`<ul class="my-1 space-y-0.5">${items}</ul>`);
-      continue;
-    }
-
-    // Paragraph (single-line breaks → <br/>)
-    const para = block
-      .split(/\n/)
-      .map((l) => inline(escape(l)))
-      .join('<br/>');
-    out.push(`<p class="my-1 leading-relaxed">${para}</p>`);
+  // Already HTML? (round-trip from a previous save). Detect by leading
+  // tag — heuristic but cheap. Marked is tolerant either way.
+  if (/^\s*<(h[1-6]|p|ul|ol|blockquote|pre|hr|div|figure|table)\b/i.test(md)) {
+    return md;
   }
-
-  return out.join('');
+  try {
+    const out = marked.parse(md, { async: false, breaks: true, gfm: true });
+    return typeof out === 'string' ? out : '';
+  } catch {
+    // Fall back to plain paragraph if parsing trips on weird input.
+    return `<p>${escapeHtml(md)}</p>`;
+  }
 }
 
-function inline(s: string): string {
-  return s
-    .replace(/\*\*([^*]+)\*\*/g, '<strong class="font-semibold">$1</strong>')
-    .replace(/\*([^*]+)\*/g, '<em class="italic">$1</em>')
-    .replace(/`([^`]+)`/g, '<code class="px-1 rounded bg-black/8 dark:bg-white/8 font-mono text-[0.85em]">$1</code>');
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/**
+ * HTML → Markdown serializer for the editor's supported tag set.
+ *
+ * Intentionally minimal — we own the HTML shape (we set it via TipTap),
+ * so we don't need a generic HTML parser. We walk a temporary DOM,
+ * emit markdown for known tags, and fall back to text for anything
+ * weird. Output is normalized (single trailing newline, no leading
+ * blank lines, code fences guarded with backticks count).
+ *
+ * Round-trips:
+ *   md → mdToHtml → htmlToMarkdown should produce the same md (modulo
+ *   whitespace) for the documented feature set.
+ */
+function htmlToMarkdown(html: string): string {
+  if (!html.trim()) return '';
+  const doc = new DOMParser().parseFromString(`<div>${html}</div>`, 'text/html');
+  const root = doc.querySelector('div');
+  if (!root) return '';
+
+  const out = serializeBlock(root).replace(/\n{3,}/g, '\n\n').trim();
+  return out;
+}
+
+function serializeBlock(el: Element): string {
+  const parts: string[] = [];
+  for (const child of Array.from(el.childNodes)) {
+    if (child.nodeType === Node.TEXT_NODE) {
+      const t = child.textContent ?? '';
+      if (t.trim()) parts.push(t);
+      continue;
+    }
+    if (child.nodeType !== Node.ELEMENT_NODE) continue;
+    const e = child as Element;
+    const tag = e.tagName.toLowerCase();
+
+    switch (tag) {
+      case 'h1': parts.push(`# ${serializeInline(e)}\n\n`); break;
+      case 'h2': parts.push(`## ${serializeInline(e)}\n\n`); break;
+      case 'h3': parts.push(`### ${serializeInline(e)}\n\n`); break;
+      case 'h4': parts.push(`#### ${serializeInline(e)}\n\n`); break;
+      case 'h5': parts.push(`##### ${serializeInline(e)}\n\n`); break;
+      case 'h6': parts.push(`###### ${serializeInline(e)}\n\n`); break;
+      case 'p': {
+        const inner = serializeInline(e);
+        if (inner.trim()) parts.push(`${inner}\n\n`);
+        break;
+      }
+      case 'ul': {
+        // TaskList lives under <ul data-type="taskList"> with nested
+        // <li data-type="taskItem" data-checked>; we emit GFM-style
+        // - [ ] / - [x] for those. Plain UL is hyphen-bulleted.
+        const isTask = e.getAttribute('data-type') === 'taskList';
+        for (const li of Array.from(e.querySelectorAll(':scope > li'))) {
+          if (isTask) {
+            const checked = li.getAttribute('data-checked') === 'true';
+            const inner = serializeInline(li.querySelector(':scope > div') ?? li);
+            parts.push(`- [${checked ? 'x' : ' '}] ${inner}\n`);
+          } else {
+            parts.push(`- ${serializeInline(li)}\n`);
+          }
+        }
+        parts.push('\n');
+        break;
+      }
+      case 'ol': {
+        let i = 1;
+        for (const li of Array.from(e.querySelectorAll(':scope > li'))) {
+          parts.push(`${i}. ${serializeInline(li)}\n`);
+          i += 1;
+        }
+        parts.push('\n');
+        break;
+      }
+      case 'blockquote': {
+        const inner = serializeBlock(e).trim().split('\n').map((l) => `> ${l}`).join('\n');
+        parts.push(`${inner}\n\n`);
+        break;
+      }
+      case 'pre': {
+        // Code block. TipTap emits <pre><code class="language-foo">…
+        const code = e.querySelector('code');
+        const lang = code?.className.match(/language-(\S+)/)?.[1] ?? '';
+        const text = (code?.textContent ?? e.textContent ?? '').replace(/\n+$/, '');
+        // Use enough backticks to avoid collision with content fences.
+        const matches: string[] = text.match(/`+/g) ?? [];
+        let longest = 0;
+        for (const m of matches) longest = Math.max(longest, m.length);
+        const fence = '`'.repeat(Math.max(3, longest + 1));
+        parts.push(`${fence}${lang}\n${text}\n${fence}\n\n`);
+        break;
+      }
+      case 'hr':
+        parts.push('---\n\n');
+        break;
+      case 'br':
+        parts.push('\n');
+        break;
+      case 'div':
+        // Pass-through container (e.g. TipTap's TaskItem inner div).
+        parts.push(serializeBlock(e));
+        break;
+      default:
+        // Unknown block → fall through as inline.
+        parts.push(serializeInline(e));
+    }
+  }
+  return parts.join('');
+}
+
+function serializeInline(el: Element | null): string {
+  if (!el) return '';
+  let out = '';
+  for (const child of Array.from(el.childNodes)) {
+    if (child.nodeType === Node.TEXT_NODE) {
+      out += (child.textContent ?? '');
+      continue;
+    }
+    if (child.nodeType !== Node.ELEMENT_NODE) continue;
+    const e = child as Element;
+    const tag = e.tagName.toLowerCase();
+    const inner = serializeInline(e);
+    switch (tag) {
+      case 'strong':
+      case 'b':
+        out += `**${inner}**`;
+        break;
+      case 'em':
+      case 'i':
+        out += `*${inner}*`;
+        break;
+      case 'u':
+        // No native md for underline; HTML passthrough is the cleanest
+        // round-trip (mdToHtml/marked passes raw HTML through).
+        out += `<u>${inner}</u>`;
+        break;
+      case 's':
+      case 'del':
+      case 'strike':
+        out += `~~${inner}~~`;
+        break;
+      case 'code':
+        out += `\`${inner}\``;
+        break;
+      case 'mark':
+        // No native md for highlight; preserve as raw HTML so the
+        // server-side md parser keeps the styling intact on next load.
+        out += `<mark>${inner}</mark>`;
+        break;
+      case 'a': {
+        const href = (e as HTMLAnchorElement).getAttribute('href') ?? '';
+        out += `[${inner}](${href})`;
+        break;
+      }
+      case 'br':
+        out += '\n';
+        break;
+      case 'p':
+      case 'div':
+      case 'span':
+        out += inner;
+        break;
+      default:
+        out += inner;
+    }
+  }
+  return out;
 }
 
 // ─── Props ────────────────────────────────────────────────────────────
@@ -126,120 +291,142 @@ export function HojaNode({
   // ── Local state ────────────────────────────────────────────────────
   const [title, setTitle] = useState(data.title ?? 'Sin título');
   const [subtitle, setSubtitle] = useState(data.subtitle ?? '');
-  const [md, setMd] = useState(initialMd);
-  const [isEditing, setIsEditing] = useState(false);
-  const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved'>('idle');
+  const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  const [lastSavedAt, setLastSavedAt] = useState<number | null>(null);
+  // Tick state lifts a 1-Hz refresh on the relative-time label.
+  const [, setTick] = useState(0);
 
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const fadeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const tickInterval = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Sync local state when ReactFlow data changes (e.g. lexa-driven
-  // refresh). We only push when the prop value differs from local — the
-  // user's in-flight edit shouldn't get clobbered mid-typing.
+  // ── Auto-save helper ─────────────────────────────────────────────
+  // Debounced 800ms — fast enough that the user sees "guardado" within
+  // a second of pausing, slow enough to coalesce a rapid burst of
+  // keystrokes into one PATCH. On success we record `lastSavedAt`
+  // so the header chrome can render "guardado hace N s" continuously.
+  // Also fires `onUpdate` so the parent's ReactFlow mirror picks up the
+  // patch (so chat / export consumers see the latest content without a
+  // refetch).
+  const scheduleSave = useCallback((patch: UpdateNodePatch) => {
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    setSaveState('saving');
+    saveTimer.current = setTimeout(async () => {
+      try {
+        await updateNode(workspaceId, id, patch);
+        setSaveState('saved');
+        setLastSavedAt(Date.now());
+        onUpdate?.(id, patch as Partial<WorkspaceNode>);
+      } catch {
+        setSaveState('error');
+      }
+    }, 800);
+  }, [workspaceId, id, onUpdate]);
+
+  // ── Slash extension ──────────────────────────────────────────────
+  // Memoized so we don't re-instantiate the suggestion plugin on every
+  // render (would tear down/rebuild the ProseMirror plugin chain).
+  const slashExtension = useMemo(() => createSlashExtension(), []);
+
+  // ── TipTap editor ────────────────────────────────────────────────
+  const editor = useEditor({
+    extensions: [
+      StarterKit,
+      slashExtension,
+      Underline,
+      // multicolor=true so each highlight click can set a different
+      // color via setHighlight({color}).
+      Highlight.configure({ multicolor: true }),
+      // Link: open in new tab + auto-link pasted URLs. We disable
+      // openOnClick because clicking-to-navigate while editing steals
+      // the click from caret placement.
+      Link.configure({
+        openOnClick: false,
+        autolink: true,
+        linkOnPaste: true,
+        HTMLAttributes: { target: '_blank', rel: 'noopener noreferrer nofollow' },
+      }),
+      // TextAlign applies textAlign attr to heading/paragraph nodes.
+      TextAlign.configure({ types: ['heading', 'paragraph'] }),
+      // Task list: interactive checkboxes inside hojas.
+      TaskList,
+      TaskItem.configure({ nested: true }),
+      // Typography: smart-quote and arrow auto-replacements.
+      Typography,
+      // CharacterCount: exposed via storage; future word-count UI.
+      CharacterCount,
+    ],
+    content: mdToHtml(initialMd),
+    editorProps: {
+      attributes: {
+        class: 'hoja-prose ProseMirror focus:outline-none min-h-[120px] px-4 py-3 text-[13.5px] leading-relaxed',
+      },
+    },
+    onUpdate: ({ editor }) => {
+      // Serialize HTML → md so the wire contract stays markdown.
+      // Whitespace is normalized inside htmlToMarkdown.
+      const md = htmlToMarkdown(editor.getHTML());
+      scheduleSave({ content: { md } });
+    },
+  });
+
+  // ── Sync incoming data changes (e.g. chat-driven refresh) ────────
+  // Only push when the prop value differs AND the editor is not focused —
+  // an in-flight edit shouldn't get clobbered mid-typing.
   useEffect(() => {
-    if (data.title !== undefined && data.title !== title && !isEditing) {
+    if (data.title !== undefined && data.title !== title) {
       setTitle(data.title);
     }
-    if (data.subtitle !== undefined && data.subtitle !== subtitle && !isEditing) {
+    if (data.subtitle !== undefined && data.subtitle !== subtitle) {
       setSubtitle(data.subtitle);
     }
     const incomingMd = (data.content as { md?: string } | undefined)?.md ?? '';
-    if (incomingMd !== md && !isEditing) {
-      setMd(incomingMd);
+    const currentMd = editor ? htmlToMarkdown(editor.getHTML()) : '';
+    if (editor && !editor.isFocused && incomingMd && incomingMd !== currentMd) {
+      // setContent without triggering onUpdate (last arg = false on emitUpdate)
+      editor.commands.setContent(mdToHtml(incomingMd), { emitUpdate: false });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data.title, data.subtitle, data.content]);
 
-  // ── Save (debounced 800ms) ─────────────────────────────────────────
-  const scheduleSave = useCallback(
-    (patch: UpdateNodePatch) => {
-      if (saveTimer.current) clearTimeout(saveTimer.current);
-      setSaveState('saving');
-      saveTimer.current = setTimeout(async () => {
-        try {
-          await updateNode(workspaceId, id, patch);
-          setSaveState('saved');
-          onUpdate?.(id, patch as Partial<WorkspaceNode>);
-          setTimeout(() => setSaveState('idle'), 1200);
-        } catch {
-          setSaveState('idle');
-        }
-      }, 800);
-    },
-    [workspaceId, id, onUpdate],
-  );
+  // ── Sync title/subtitle edits ────────────────────────────────────
+  const handleTitleChange = useCallback((val: string) => {
+    setTitle(val);
+    scheduleSave({ title: val });
+  }, [scheduleSave]);
 
-  const handleTitleChange = useCallback(
-    (next: string) => {
-      setTitle(next);
-      scheduleSave({ title: next });
-    },
-    [scheduleSave],
-  );
+  const handleSubtitleChange = useCallback((val: string) => {
+    setSubtitle(val);
+    scheduleSave({ subtitle: val });
+  }, [scheduleSave]);
 
-  const handleSubtitleChange = useCallback(
-    (next: string) => {
-      setSubtitle(next);
-      scheduleSave({ subtitle: next });
-    },
-    [scheduleSave],
-  );
-
-  const handleMdChange = useCallback(
-    (next: string) => {
-      setMd(next);
-      scheduleSave({ content: { md: next } });
-    },
-    [scheduleSave],
-  );
-
-  const flushSaveOnBlur = useCallback(() => {
-    if (saveTimer.current) {
-      clearTimeout(saveTimer.current);
-      saveTimer.current = null;
-      setSaveState('saving');
-      const patch: UpdateNodePatch = { content: { md } };
-      updateNode(workspaceId, id, patch)
-        .then(() => {
-          setSaveState('saved');
-          onUpdate?.(id, patch as Partial<WorkspaceNode>);
-          setTimeout(() => setSaveState('idle'), 1200);
-        })
-        .catch(() => setSaveState('idle'));
-    }
-    setIsEditing(false);
-  }, [workspaceId, id, md, onUpdate]);
-
-  // Focus the textarea when entering edit mode
+  // ── 1-Hz tick for the relative-time label ────────────────────────
+  // Only runs while we have a saved timestamp to display.
   useEffect(() => {
-    if (isEditing && textareaRef.current) {
-      textareaRef.current.focus();
-      // Place caret at end on first focus
-      const len = textareaRef.current.value.length;
-      textareaRef.current.setSelectionRange(len, len);
-    }
-  }, [isEditing]);
+    if (lastSavedAt === null) return;
+    tickInterval.current = setInterval(() => setTick((n) => n + 1), 1000);
+    return () => {
+      if (tickInterval.current) clearInterval(tickInterval.current);
+      tickInterval.current = null;
+    };
+  }, [lastSavedAt]);
 
-  // Clear pending debounced save on unmount so a stale timer can't fire
-  // an update against a node that's gone (or worse, hit a 401 after the
-  // user logged out). Important #1 from the T6 quality review.
+  // ── Cleanup all timers on unmount (T6 quality patterns reapplied) ─
   useEffect(() => () => {
     if (saveTimer.current) clearTimeout(saveTimer.current);
+    if (fadeTimer.current) clearTimeout(fadeTimer.current);
+    if (tickInterval.current) clearInterval(tickInterval.current);
   }, []);
 
-  const renderedHtml = useMemo(() => renderMarkdown(md), [md]);
-
-  const handleDelete = useCallback(
-    (e: React.MouseEvent) => {
-      e.stopPropagation();
-      onDelete?.(id);
-    },
-    [id, onDelete],
-  );
-
+  // ── Click / select handlers ──────────────────────────────────────
   const handleClick = useCallback(() => {
     onSelect?.(id);
   }, [id, onSelect]);
+
+  const handleDelete = useCallback((e: React.MouseEvent) => {
+    e.stopPropagation();
+    onDelete?.(id);
+  }, [id, onDelete]);
 
   return (
     <div
@@ -252,95 +439,135 @@ export function HojaNode({
       )}
       style={{ width: '100%', height: '100%' }}
     >
-      <NodeResizer minWidth={280} minHeight={200} isVisible={selected} />
+      <NodeResizer minWidth={320} minHeight={220} isVisible={!!selected} />
 
       {/* Color accent bar (left edge) */}
       <div className={cn('absolute left-0 top-0 bottom-0 w-1', accent)} aria-hidden />
 
-      {/* ── Header (drag handle, title, delete) ────────────────────── */}
+      {/* ── Header (drag handle, title/subtitle, save state, delete) ── */}
       <div
-        className="drag-handle flex items-center justify-between gap-2 px-3 pt-2 pb-1.5 border-b border-black/5 dark:border-white/5 cursor-grab active:cursor-grabbing"
+        className="drag-handle flex items-start gap-2 px-3 pt-2.5 pb-2 border-b border-black/5 dark:border-white/5 cursor-grab active:cursor-grabbing"
         data-drag-handle
       >
-        <div className="flex items-center gap-1.5 min-w-0 flex-1">
-          <GripVertical className="w-3.5 h-3.5 text-black/20 dark:text-white/20 shrink-0" />
+        <div className="mt-0.5 text-black/25 dark:text-white/25 shrink-0" aria-hidden>
+          <GripHorizontal className="w-4 h-4" />
+        </div>
+
+        <div className="flex-1 min-w-0">
           <input
             value={title}
             onChange={(e) => handleTitleChange(e.target.value)}
             onMouseDown={(e) => e.stopPropagation()}
             onClick={(e) => e.stopPropagation()}
             placeholder="Sin título"
-            className="flex-1 min-w-0 bg-transparent text-[13px] font-semibold text-[#0e1745] dark:text-white focus:outline-none placeholder:text-[#0e1745]/30 dark:placeholder:text-white/30"
+            aria-label="Título de la hoja"
+            className="w-full bg-transparent text-[15px] font-semibold text-[#0e1745] dark:text-white placeholder:text-black/25 dark:placeholder:text-white/25 focus:outline-none leading-snug"
+          />
+          <input
+            value={subtitle}
+            onChange={(e) => handleSubtitleChange(e.target.value)}
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
+            placeholder="Subtítulo opcional…"
+            aria-label="Subtítulo de la hoja"
+            className="w-full bg-transparent text-[11.5px] text-[#0e1745]/55 dark:text-white/55 placeholder:text-black/20 dark:placeholder:text-white/20 focus:outline-none mt-0.5 font-medium"
           />
         </div>
-        <div className="flex items-center gap-2 shrink-0">
-          {saveState !== 'idle' && (
-            <span className="text-[10px] uppercase tracking-wider text-[#0e1745]/40 dark:text-white/40 font-medium">
-              {saveState === 'saving' ? 'guardando…' : 'guardado'}
-            </span>
-          )}
+
+        <div className="flex items-center gap-1 shrink-0">
+          <SaveIndicator state={saveState} lastSavedAt={lastSavedAt} />
           <button
+            type="button"
             onMouseDown={(e) => e.stopPropagation()}
             onClick={handleDelete}
-            className="p-1 rounded-md hover:bg-black/8 dark:hover:bg-white/10 text-black/30 dark:text-white/30 hover:text-red-500 transition-colors"
+            aria-label="Eliminar hoja"
             title="Eliminar hoja"
+            className="p-1 rounded-md hover:bg-black/8 dark:hover:bg-white/10 text-black/30 dark:text-white/30 hover:text-red-500 transition-colors"
           >
-            <Trash2 className="w-3.5 h-3.5" />
+            <Trash2 className="w-3.5 h-3.5" aria-hidden />
           </button>
         </div>
       </div>
 
-      {/* ── Subtitle ───────────────────────────────────────────────── */}
-      {(subtitle || isEditing) && (
-        <input
-          value={subtitle}
-          onChange={(e) => handleSubtitleChange(e.target.value)}
-          onMouseDown={(e) => e.stopPropagation()}
-          onClick={(e) => e.stopPropagation()}
-          placeholder="Subtítulo (opcional)"
-          className="nodrag px-4 pt-2 pb-1 bg-transparent text-[11.5px] text-[#0e1745]/55 dark:text-white/55 focus:outline-none placeholder:text-[#0e1745]/25 dark:placeholder:text-white/25"
-        />
-      )}
-
-      {/* ── Body ───────────────────────────────────────────────────── */}
+      {/* ── TipTap body ─────────────────────────────────────────── */}
+      {/*
+        nodrag: stops ReactFlow from initiating a drag on mousedown
+                inside the editor (would fight TipTap's caret placement).
+        onMouseDown stopPropagation: belt-and-suspenders for browsers
+                                     that don't honor .nodrag uniformly.
+      */}
       <div
-        className="nodrag flex-1 min-h-0 overflow-auto px-4 py-3 text-[13px] text-[#0e1745]/85 dark:text-white/85"
+        className="nodrag flex-1 min-h-0 overflow-y-auto"
         onMouseDown={(e) => e.stopPropagation()}
-        onDoubleClick={(e) => {
-          e.stopPropagation();
-          if (!isEditing) setIsEditing(true);
-        }}
       >
-        {isEditing ? (
-          <textarea
-            ref={textareaRef}
-            value={md}
-            onChange={(e) => handleMdChange(e.target.value)}
-            onBlur={flushSaveOnBlur}
-            onMouseDown={(e) => e.stopPropagation()}
-            placeholder="Escribí en markdown… **negrita**, *cursiva*, # encabezados, - listas."
-            className="w-full h-full min-h-[140px] bg-transparent resize-none focus:outline-none font-mono text-[12.5px] leading-relaxed text-[#0e1745]/85 dark:text-white/85 placeholder:text-[#0e1745]/25 dark:placeholder:text-white/25"
-          />
-        ) : md.trim() ? (
-          // Rendered preview. The renderer escapes user input first; the
-          // resulting HTML uses an allowlisted token set defined above.
-          <div
-            // eslint-disable-next-line react/no-danger
-            dangerouslySetInnerHTML={{ __html: renderedHtml }}
-            className="prose-sm max-w-none [&>*+*]:mt-1.5"
-          />
-        ) : (
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              setIsEditing(true);
-            }}
-            className="w-full text-left text-[12.5px] text-[#0e1745]/35 dark:text-white/30 italic hover:text-[#0e1745]/60 dark:hover:text-white/55 transition-colors"
-          >
-            Hacé clic para empezar a escribir…
-          </button>
-        )}
+        <EditorContent editor={editor} />
       </div>
     </div>
   );
+}
+
+// ─── Save indicator ──────────────────────────────────────────────────
+// Renders the auto-save status in the header. Separated so the parent's
+// render isn't a giant ternary and the timestamp formatter is colocated
+// with the consumer.
+function SaveIndicator({
+  state,
+  lastSavedAt,
+}: {
+  state: 'idle' | 'saving' | 'saved' | 'error';
+  lastSavedAt: number | null;
+}) {
+  if (state === 'saving') {
+    return (
+      <span
+        className="inline-flex items-center gap-1 text-[10.5px] font-medium text-[#1534dc]/80 dark:text-[#8b5cf6]/85 px-1.5 py-0.5 rounded-md bg-[#1534dc]/[0.06] dark:bg-[#8b5cf6]/[0.10]"
+        role="status"
+        aria-live="polite"
+      >
+        <Loader2 className="w-3 h-3 animate-spin" aria-hidden />
+        Guardando…
+      </span>
+    );
+  }
+  if (state === 'error') {
+    return (
+      <span
+        className="inline-flex items-center gap-1 text-[10.5px] font-semibold text-rose-700 dark:text-rose-400 px-1.5 py-0.5 rounded-md bg-rose-50 dark:bg-rose-900/20"
+        title="No se pudo guardar — reintentá editando o revisá tu conexión"
+        role="alert"
+      >
+        <AlertCircle className="w-3 h-3" aria-hidden />
+        No guardó
+      </span>
+    );
+  }
+  if (state === 'saved' && lastSavedAt !== null) {
+    return (
+      <span
+        className="inline-flex items-center gap-1 text-[10.5px] font-medium text-emerald-700/85 dark:text-emerald-400/85"
+        title={`Última escritura: ${new Date(lastSavedAt).toLocaleString('es-CR')}`}
+        role="status"
+      >
+        <Check className="w-3 h-3" aria-hidden />
+        Guardado · {formatRelativeAgo(lastSavedAt)}
+      </span>
+    );
+  }
+  // idle without a prior save — render nothing
+  return null;
+}
+
+/**
+ * "hace 5 s" / "hace 2 m" / "hace 1 h" — short relative format. We
+ * cap the granularity at hours; anything older just shows the date.
+ */
+function formatRelativeAgo(ts: number): string {
+  const sec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (sec < 5)   return 'recién';
+  if (sec < 60)  return `hace ${sec} s`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `hace ${min} min`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24)  return `hace ${hr} h`;
+  return new Date(ts).toLocaleDateString('es-CR');
 }
