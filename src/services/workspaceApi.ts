@@ -277,24 +277,117 @@ export async function deleteNode(workspaceId: string, nodeId: string): Promise<v
   await handleJson<{ ok: boolean }>(res);
 }
 
-// ─── Asset import (multipart) ─────────────────────────────────────────
+// ─── Asset import (direct-to-storage) ─────────────────────────────────
+//
+// Why not multipart-to-BFF?
+//   Vercel serverless functions reject request bodies > 4.5MB. The previous
+//   POST /:id/nodes/import flow worked locally but silently failed on real
+//   user uploads (PDFs, audio, hi-res images routinely exceed that cap).
+//
+// Direct-to-storage flow:
+//   1. Upload file straight to Supabase Storage with the user's session JWT.
+//      RLS policy on `studio-workspace-assets` allows owner_write on paths
+//      prefixed `${auth.uid()}/...`. The bytes never traverse Vercel.
+//   2. POST /:id/nodes/finalize-asset with metadata only ({path, mime, ...}).
+//      Server-side, the BFF downloads the object service-to-service from
+//      Supabase, extracts text, and inserts the node row.
+//
+// MIME allowlist mirrors the server's ASSET_TYPE_ALLOWLIST in
+// src/routes/workspace.ts — keep both in sync.
+const ASSET_MIME_ALLOWLIST: ReadonlyArray<string> = [
+  'image/png',
+  'image/jpeg',
+  'image/gif',
+  'image/webp',
+  'image/svg+xml',
+  'audio/mpeg',
+  'audio/mp4',
+  'audio/wav',
+  'audio/x-wav',
+  'audio/ogg',
+  'audio/webm',
+  'application/pdf',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'text/plain',
+  'text/markdown',
+];
+
+const STUDIO_ASSETS_BUCKET = 'studio-workspace-assets';
 
 export async function importAsset(
   workspaceId: string,
   file: File,
-  opts: { x?: number; y?: number } = {},
+  opts: { x?: number; y?: number; width?: number; height?: number } = {},
 ): Promise<WorkspaceNode> {
-  const fd = new FormData();
-  fd.append('file', file);
-  if (typeof opts.x === 'number') fd.append('x', String(opts.x));
-  if (typeof opts.y === 'number') fd.append('y', String(opts.y));
+  if (!supabase) {
+    throw new ApiError('supabase_unavailable', 503);
+  }
 
-  // Don't set Content-Type — the browser must populate the multipart boundary.
-  const res = await fetch(`/api/workspace/${workspaceId}/nodes/import`, {
+  // Identify the user — the storage path must be `${userId}/${workspaceId}/...`
+  // to satisfy the bucket's RLS policy. supabase-js attaches the session JWT
+  // automatically on the upload, so the storage server can verify ownership.
+  const { data: sessionData } = await supabase.auth.getSession();
+  const userId = sessionData?.session?.user?.id;
+  if (!userId) {
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('workspace:unauthorized'));
+    }
+    throw new ApiError('not_authenticated', 401);
+  }
+
+  // Cheap client-side mime validation — fail fast before paying for the upload.
+  if (!ASSET_MIME_ALLOWLIST.includes(file.type)) {
+    throw new ApiError(
+      `Tipo de archivo no soportado: ${file.type || 'unknown'}`,
+      415,
+    );
+  }
+
+  // Stable object path. UUID prefix prevents collisions on identical
+  // filenames; the safe-name pass strips characters that confuse Supabase
+  // Storage's URL signing.
+  const objectId =
+    typeof crypto !== 'undefined' && 'randomUUID' in crypto
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const safeName = (file.name || 'file').replace(/[^\w.\-]/g, '_').slice(0, 200);
+  const path = `${userId}/${workspaceId}/${objectId}-${safeName}`;
+
+  // Direct upload — bypasses Vercel entirely. The 4.5MB body limit only
+  // applies to Vercel function invocations; supabase-js posts straight to
+  // the Storage REST API.
+  const { error: upErr } = await supabase.storage
+    .from(STUDIO_ASSETS_BUCKET)
+    .upload(path, file, {
+      contentType: file.type,
+      upsert: false,
+    });
+  if (upErr) {
+    throw new ApiError(`Falla al subir: ${upErr.message}`, 500);
+  }
+
+  // Tell the BFF to finalize: download server-side, extract text, insert row.
+  const res = await fetch(`/api/workspace/${workspaceId}/nodes/finalize-asset`, {
     method: 'POST',
-    headers: await authedHeaders(),
-    body: fd,
+    headers: await authedHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({
+      path,
+      mime: file.type,
+      filename: file.name,
+      size: file.size,
+      ...(typeof opts.x === 'number' ? { x: opts.x } : {}),
+      ...(typeof opts.y === 'number' ? { y: opts.y } : {}),
+      ...(typeof opts.width === 'number' ? { width: opts.width } : {}),
+      ...(typeof opts.height === 'number' ? { height: opts.height } : {}),
+    }),
   });
+
+  // If finalize fails, the orphan blob will sit in Storage until manual
+  // cleanup. We could best-effort delete here, but the server already
+  // does that on insert failure for the common case (it has service-role
+  // write access; the browser only has the user's JWT). Leaving the
+  // browser-side cleanup off for now keeps the failure path simple.
   const json = await handleJson<{ ok: boolean; node: WorkspaceNode }>(res);
   return json.node;
 }

@@ -2853,6 +2853,194 @@ workspaceRouter.post(
 );
 
 // ═══════════════════════════════════════════════════════════════════════
+// FINALIZE-ASSET — direct-to-storage upload bypass for Vercel 4.5MB limit
+// ═══════════════════════════════════════════════════════════════════════
+//
+// POST /api/workspace/:id/nodes/finalize-asset (application/json)
+//   { path, mime, filename, size, x?, y?, width?, height? }
+//
+// Why this exists:
+//   Vercel serverless functions reject request bodies > 4.5MB. The legacy
+//   /:id/nodes/import multipart route works for small files but silently
+//   fails on anything bigger — that's the bulk of real workspace assets
+//   (PDFs, audio, hi-res images).
+//
+// Flow:
+//   1. Browser uploads the file directly to Supabase Storage via supabase-js
+//      SDK using the user's session JWT. RLS policy gates writes by path
+//      prefix `${auth.uid()}/...` so the user can only write to their own
+//      tree. Bucket cap is 100MB.
+//   2. Browser POSTs this endpoint with `{ path, mime, filename, size, ... }`
+//      — pure JSON metadata, way under the 4.5MB threshold.
+//   3. We re-validate ownership (path prefix), download the object
+//      server-to-server with the service-role client (no Vercel body
+//      inbound), run extractAssetText, and insert the studio_workspace_nodes
+//      row. Same node shape as /:id/nodes/import.
+//
+// The /:id/nodes/import handler stays in place for backwards compat; this
+// is the new preferred path. Frontend importAsset() now uses this flow.
+workspaceRouter.post(
+  '/:id/nodes/finalize-asset',
+  async (req: Request, res: Response) => {
+    if (!dbReady(res)) return;
+    const userId = await requireUser(req, res);
+    if (!userId) return;
+    const id = String(req.params.id);
+    if (!isValidUuid(id)) {
+      res.status(400).json({ ok: false, error: 'invalid_uuid' });
+      return;
+    }
+    if (!(await ownedWorkspace(userId, id, res))) return;
+
+    const body = (req.body ?? {}) as {
+      path?: unknown;
+      mime?: unknown;
+      filename?: unknown;
+      size?: unknown;
+      x?: unknown;
+      y?: unknown;
+      width?: unknown;
+      height?: unknown;
+    };
+
+    const path = typeof body.path === 'string' ? body.path : '';
+    const mime = typeof body.mime === 'string' ? body.mime : '';
+    const filename = typeof body.filename === 'string' ? body.filename : '';
+    const size = typeof body.size === 'number' ? body.size : Number(body.size);
+
+    if (!path || !mime || !filename || !Number.isFinite(size)) {
+      res.status(400).json({
+        ok: false,
+        error: 'missing_required_fields',
+        detail: 'path, mime, filename, size are required.',
+      });
+      return;
+    }
+
+    // Security gate: the storage path must be inside the user's own tree
+    // for this workspace. Stops a malicious caller from finalizing an
+    // object owned by someone else.
+    const expectedPrefix = `${userId}/${id}/`;
+    if (!path.startsWith(expectedPrefix)) {
+      res.status(403).json({
+        ok: false,
+        error: 'path_outside_user_tree',
+        detail: `path must start with "${expectedPrefix}"`,
+      });
+      return;
+    }
+
+    const assetType = ASSET_TYPE_ALLOWLIST[mime];
+    if (!assetType) {
+      res.status(415).json({
+        ok: false,
+        error: 'unsupported_media_type',
+        detail: `MIME "${mime}" no permitido. Soportados: png/jpg/gif/webp/svg, mp3/m4a/wav/ogg/webm, pdf/docx/md/txt.`,
+      });
+      return;
+    }
+
+    try {
+      // Download the file server-to-server. Service role bypasses RLS, so
+      // even private buckets work. No Vercel body limit on the inbound
+      // side — the bytes flow Supabase → Node, never through the
+      // Vercel edge.
+      const { data: blob, error: dlErr } = await supabaseAdmin!.storage
+        .from(STUDIO_ASSETS_BUCKET)
+        .download(path);
+      if (dlErr || !blob) {
+        res.status(404).json({
+          ok: false,
+          error: 'asset_not_in_storage',
+          detail: dlErr?.message ?? 'object not found',
+        });
+        return;
+      }
+      const arrayBuf = await blob.arrayBuffer();
+      let fileBuffer: Buffer | null = Buffer.from(arrayBuf);
+
+      // Public URL for the canvas to render.
+      const { data: urlData } = supabaseAdmin!.storage
+        .from(STUDIO_ASSETS_BUCKET)
+        .getPublicUrl(path);
+      const publicUrl = urlData.publicUrl;
+
+      // Position + size (type-aware defaults — same as /:id/nodes/import).
+      const x = Number(body.x ?? 80);
+      const y = Number(body.y ?? 80);
+      const defaultDims = {
+        image: { width: 480, height: 360 },
+        audio: { width: 420, height: 140 },
+        document: { width: 380, height: 280 },
+      }[assetType];
+      const width = Number(body.width ?? defaultDims.width);
+      const height = Number(body.height ?? defaultDims.height);
+
+      // Best-effort text extraction. Failure is non-fatal.
+      let extractedText: string | null = null;
+      try {
+        extractedText = await extractAssetText(fileBuffer, mime);
+      } catch (extractErr) {
+        console.warn(
+          `[workspace] asset_extract_failed mime=${mime} bytes=${size} error=${(extractErr as Error).message}`,
+        );
+      }
+
+      // Release the buffer reference now that upload + extraction are done.
+      // GC can reclaim before we serialize the response.
+      fileBuffer = null;
+
+      const safeName = filename.replace(/[^\w.\-]/g, '_').slice(0, 200);
+
+      const { data: node, error: nErr } = await supabaseAdmin!
+        .from('studio_workspace_nodes')
+        .insert({
+          workspace_id: id,
+          type: assetType,
+          x,
+          y,
+          width,
+          height,
+          title: filename || safeName,
+          subtitle: `${assetType} · ${(size / 1024).toFixed(0)} KB`,
+          content: {
+            url: publicUrl,
+            path,
+            filename: filename || safeName,
+            size,
+            mime,
+            ...(extractedText && extractedText.length > 0
+              ? { extracted_text: extractedText }
+              : {}),
+          },
+          color: 'default',
+        })
+        .select('*')
+        .single();
+      if (nErr) {
+        // Clean up the orphan storage object on insert failure — best-effort.
+        await supabaseAdmin!.storage
+          .from(STUDIO_ASSETS_BUCKET)
+          .remove([path])
+          .catch(() => null);
+        throw new Error(`insert: ${nErr.message}`);
+      }
+
+      console.log(
+        `[workspace] finalize-asset ok workspaceId=${id} nodeId=${node.id} mime=${mime} bytes=${size} type=${assetType}`,
+      );
+
+      res.status(201).json({ ok: true, node });
+    } catch (err) {
+      console.warn(
+        `[workspace] finalize-asset failed workspaceId=${id} mime=${mime} error=${(err as Error).message}`,
+      );
+      res.status(500).json({ ok: false, error: (err as Error).message });
+    }
+  },
+);
+
+// ═══════════════════════════════════════════════════════════════════════
 // REEXTRACT — re-run text extraction for an already-uploaded asset
 // ═══════════════════════════════════════════════════════════════════════
 //
