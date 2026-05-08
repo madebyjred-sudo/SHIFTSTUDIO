@@ -3,10 +3,6 @@
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "rewrites": [
-    { "source": "/api/workspace/:a/:b/:c/:d", "destination": "/api/workspace" },
-    { "source": "/api/workspace/:a/:b/:c", "destination": "/api/workspace" },
-    { "source": "/api/workspace/:a/:b", "destination": "/api/workspace" },
-    { "source": "/api/workspace/:a", "destination": "/api/workspace" },
     { "source": "/((?!api|assets|.*\\..*).*)", "destination": "/index.html" }
   ]
 }
