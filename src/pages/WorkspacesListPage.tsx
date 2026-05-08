@@ -23,9 +23,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Plus, BookOpen, Archive, Trash2, MoreHorizontal,
   LayoutGrid, Clock, CheckSquare, FileDown, FileText, Upload, Presentation,
-  Search, ArrowUpDown,
+  Search, ArrowUpDown, AlertTriangle, Loader2,
 } from 'lucide-react';
 import { TopDock } from '@/components/top-dock';
+import { PptxResultModal } from '@/components/workspace/PptxResultModal';
 import { navigate } from '@/lib/router';
 import { cn } from '@/lib/utils';
 import {
@@ -145,7 +146,16 @@ function WorkspaceCard({
     <>
       <div
         onClick={() => !menuOpen && !renaming && onOpen()}
-        className="group relative flex flex-col gap-3 p-5 rounded-2xl bg-white/70 dark:bg-white/[0.04] backdrop-blur-xl border border-white/60 dark:border-white/8 hover:border-[#1534dc]/30 hover:shadow-[0_8px_35px_rgba(21,52,220,0.10)] dark:hover:shadow-[0_8px_35px_rgba(139,92,246,0.18)] transition-all cursor-pointer"
+        onKeyDown={(e) => {
+          if ((e.key === 'Enter' || e.key === ' ') && !menuOpen && !renaming) {
+            e.preventDefault();
+            onOpen();
+          }
+        }}
+        role="button"
+        tabIndex={0}
+        aria-label={`Abrir workspace ${ws.title}`}
+        className="group relative flex flex-col gap-3 p-5 rounded-2xl bg-white/70 dark:bg-white/[0.04] backdrop-blur-xl border border-white/60 dark:border-white/10 hover:border-[#1534dc]/30 dark:hover:border-[#8b5cf6]/30 hover:-translate-y-0.5 hover:shadow-[0_12px_40px_rgba(21,52,220,0.12)] dark:hover:shadow-[0_12px_40px_rgba(139,92,246,0.20)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1534dc]/45 dark:focus-visible:ring-[#8b5cf6]/45 transition-all duration-200 cursor-pointer"
       >
         {/* Hidden file input */}
         <input
@@ -159,8 +169,12 @@ function WorkspaceCard({
 
         {/* Inline import error toast */}
         {importError && (
-          <div className="absolute -top-1 left-2 right-2 z-10 px-3 py-1.5 rounded-md bg-red-500 text-white text-[11px] font-medium shadow-lg">
-            {importError}
+          <div
+            role="alert"
+            className="absolute -top-1 left-2 right-2 z-10 px-3 py-1.5 rounded-md bg-red-500 text-white text-[11px] font-medium shadow-lg flex items-center gap-1.5"
+          >
+            <AlertTriangle className="w-3 h-3 shrink-0" aria-hidden />
+            <span className="truncate">{importError}</span>
           </div>
         )}
 
@@ -176,13 +190,17 @@ function WorkspaceCard({
           <div className="relative">
             <button
               onClick={(e) => { e.stopPropagation(); setMenuOpen((v) => !v); }}
-              className="opacity-0 group-hover:opacity-100 p-1.5 rounded-lg hover:bg-black/8 dark:hover:bg-white/10 transition-all text-[#0e1745]/50 dark:text-white/50"
+              aria-label="Más opciones del workspace"
+              aria-haspopup="menu"
+              aria-expanded={menuOpen}
+              className="opacity-0 group-hover:opacity-100 focus-visible:opacity-100 p-1.5 rounded-lg hover:bg-black/8 dark:hover:bg-white/10 transition-all text-[#0e1745]/50 dark:text-white/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1534dc]/45 dark:focus-visible:ring-[#8b5cf6]/45"
             >
-              <MoreHorizontal className="w-4 h-4" />
+              <MoreHorizontal className="w-4 h-4" aria-hidden />
             </button>
             {menuOpen && (
               <div
-                className="absolute right-0 top-8 z-50 w-44 rounded-xl bg-white dark:bg-[#0b1120] shadow-xl border border-black/8 dark:border-white/10 py-1"
+                role="menu"
+                className="absolute right-0 top-8 z-50 w-44 rounded-xl bg-white dark:bg-[#0c1230] shadow-xl border border-black/8 dark:border-white/10 py-1 animate-in fade-in zoom-in-95 duration-150"
                 onClick={(e) => e.stopPropagation()}
               >
                 <button onClick={() => { setRenaming(true); setMenuOpen(false); }} className="w-full text-left px-3 py-2 text-[13px] hover:bg-black/5 dark:hover:bg-white/8 transition-colors">Renombrar</button>
@@ -277,52 +295,62 @@ function WorkspaceCard({
         </div>
       </div>
 
-      {/* Inline pptx result/error placeholder modal — T9/T10 will polish */}
-      {(pptxResult || pptxError) && (
+      {/* Pptx result — uses the polished shared PptxResultModal (T9). */}
+      <PptxResultModal
+        open={Boolean(pptxResult)}
+        onClose={() => setPptxResult(null)}
+        result={pptxResult}
+        onRegenerate={() => {
+          // From the list view we don't pre-fill — just trigger a fresh
+          // export. Keeps behavior identical to before T10.
+          setPptxResult(null);
+          void handleExport('pptx');
+        }}
+        workspaceTitle={ws.title}
+      />
+
+      {/* Pptx error — small accessible dialog (no full-screen takeover). */}
+      {pptxError && (
         <div
-          className="fixed inset-0 z-[200] bg-black/60 backdrop-blur-sm flex items-center justify-center p-6"
-          onClick={() => { setPptxResult(null); setPptxError(null); }}
+          className="fixed inset-0 z-[200] bg-black/55 backdrop-blur-sm flex items-center justify-center p-6 animate-in fade-in duration-150"
+          onClick={() => setPptxError(null)}
+          role="presentation"
         >
           <div
-            className="max-w-md w-full p-6 rounded-2xl bg-white dark:bg-[#0b1120] border border-black/8 dark:border-white/10 shadow-2xl"
+            className="max-w-md w-full p-6 rounded-2xl bg-white dark:bg-[#0c1230] border border-black/8 dark:border-white/10 shadow-2xl"
             onClick={(e) => e.stopPropagation()}
+            role="alertdialog"
+            aria-labelledby="pptx-error-title"
+            aria-describedby="pptx-error-desc"
           >
-            {pptxResult && (
-              <>
-                <h3 className="text-[16px] font-semibold mb-1 text-[#0e1745] dark:text-white">Presentación lista</h3>
-                <p className="text-[13px] text-[#0e1745]/60 dark:text-white/55 mb-4">{pptxResult.filename}</p>
-                <div className="flex gap-2">
-                  <a
-                    href={pptxResult.gammaUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="flex-1 px-3 py-2 rounded-lg bg-[#1534dc] text-white text-[13px] font-semibold text-center hover:bg-[#1230c0] transition-colors"
-                  >
-                    Abrir en Gamma
-                  </a>
-                  <a
-                    href={pptxResult.exportUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="flex-1 px-3 py-2 rounded-lg bg-[#7A3B47]/10 text-[#7A3B47] text-[13px] font-semibold text-center hover:bg-[#7A3B47]/15 transition-colors"
-                  >
-                    Descargar .pptx
-                  </a>
-                </div>
-              </>
-            )}
-            {pptxError && (
-              <>
-                <h3 className="text-[16px] font-semibold mb-1 text-red-600">Error generando presentación</h3>
-                <p className="text-[13px] text-[#0e1745]/60 dark:text-white/55 mb-4 break-words">{pptxError}</p>
-                <button
-                  onClick={() => setPptxError(null)}
-                  className="px-3 py-2 rounded-lg bg-[#0e1745]/8 dark:bg-white/8 text-[13px] font-semibold"
-                >
-                  Cerrar
-                </button>
-              </>
-            )}
+            <div className="flex items-start gap-3">
+              <div className="w-9 h-9 rounded-xl bg-rose-100 dark:bg-rose-900/30 flex items-center justify-center shrink-0">
+                <AlertTriangle className="w-4 h-4 text-rose-600 dark:text-rose-400" aria-hidden />
+              </div>
+              <div className="min-w-0 flex-1">
+                <h3 id="pptx-error-title" className="text-[14px] font-semibold text-[#0e1745] dark:text-white">
+                  No pudimos generar la presentación
+                </h3>
+                <p id="pptx-error-desc" className="mt-1 text-[12.5px] text-[#0e1745]/60 dark:text-white/55 break-words">
+                  {pptxError}
+                </p>
+              </div>
+            </div>
+            <div className="mt-4 flex items-center justify-end gap-2">
+              <button
+                onClick={() => setPptxError(null)}
+                className="px-3 py-2 rounded-xl text-[12.5px] font-medium text-[#0e1745]/65 dark:text-white/55 hover:bg-black/5 dark:hover:bg-white/8 transition-colors"
+              >
+                Cerrar
+              </button>
+              <button
+                onClick={() => { setPptxError(null); void handleExport('pptx'); }}
+                className="px-3 py-2 rounded-xl text-[12.5px] font-semibold bg-[#1534dc] hover:bg-[#1230c0] dark:bg-[#8b5cf6] dark:hover:bg-[#7a4cf2] text-white shadow-sm transition-colors inline-flex items-center gap-1.5"
+              >
+                <Loader2 className={cn('w-3.5 h-3.5', exporting === 'pptx' ? 'animate-spin' : 'hidden')} aria-hidden />
+                Reintentar
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -391,7 +419,7 @@ export function WorkspacesListPage() {
   const archived = workspaces.filter((w) => w.archived);
 
   return (
-    <div className="min-h-screen flex flex-col bg-[#f8f9fc] dark:bg-mesh text-[#0e1745] dark:text-white font-sans transition-colors duration-500">
+    <div className="min-h-screen flex flex-col bg-[#f8f9fc] dark:bg-mesh text-[#0e1745] dark:text-white font-sans selection:bg-[#1534dc]/20 dark:selection:bg-[#8b5cf6]/25 transition-colors duration-500">
       {/* Subtle grid background — mirrors App.tsx chat surface */}
       <div
         className="absolute inset-0 z-0 pointer-events-none opacity-10 dark:opacity-[0.06]"
@@ -440,22 +468,28 @@ export function WorkspacesListPage() {
           <div className="flex items-center gap-2 flex-wrap">
             {/* Search */}
             <div className="relative">
-              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-[#0e1745]/35 dark:text-white/35 pointer-events-none" />
+              <label htmlFor="ws-search" className="sr-only">Buscar workspace</label>
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-[#0e1745]/35 dark:text-white/35 pointer-events-none" aria-hidden />
               <input
+                id="ws-search"
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
                 placeholder="Buscar…"
-                className="pl-9 pr-3 py-2 rounded-xl bg-white/70 dark:bg-white/[0.05] backdrop-blur-xl border border-white/60 dark:border-white/8 text-[12.5px] text-[#0e1745] dark:text-white placeholder:text-[#0e1745]/35 dark:placeholder:text-white/30 focus:outline-none focus:border-[#1534dc]/40 w-48"
+                aria-label="Buscar workspace por título"
+                className="pl-9 pr-3 py-2 rounded-xl bg-white/70 dark:bg-white/[0.05] backdrop-blur-xl border border-white/60 dark:border-white/10 text-[12.5px] text-[#0e1745] dark:text-white placeholder:text-[#0e1745]/35 dark:placeholder:text-white/30 focus:outline-none focus:border-[#1534dc]/40 dark:focus:border-[#8b5cf6]/45 focus-visible:ring-2 focus-visible:ring-[#1534dc]/15 dark:focus-visible:ring-[#8b5cf6]/20 w-48 transition-colors"
               />
             </div>
 
             {/* Sort */}
             <div className="relative">
-              <ArrowUpDown className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-[#0e1745]/35 dark:text-white/35 pointer-events-none" />
+              <label htmlFor="ws-sort" className="sr-only">Ordenar workspaces</label>
+              <ArrowUpDown className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-[#0e1745]/35 dark:text-white/35 pointer-events-none" aria-hidden />
               <select
+                id="ws-sort"
                 value={sortKey}
                 onChange={(e) => setSortKey(e.target.value as SortKey)}
-                className="pl-9 pr-3 py-2 rounded-xl bg-white/70 dark:bg-white/[0.05] backdrop-blur-xl border border-white/60 dark:border-white/8 text-[12.5px] text-[#0e1745] dark:text-white focus:outline-none focus:border-[#1534dc]/40 appearance-none"
+                aria-label="Ordenar workspaces"
+                className="pl-9 pr-3 py-2 rounded-xl bg-white/70 dark:bg-white/[0.05] backdrop-blur-xl border border-white/60 dark:border-white/10 text-[12.5px] text-[#0e1745] dark:text-white focus:outline-none focus:border-[#1534dc]/40 dark:focus:border-[#8b5cf6]/45 focus-visible:ring-2 focus-visible:ring-[#1534dc]/15 dark:focus-visible:ring-[#8b5cf6]/20 appearance-none transition-colors"
               >
                 <option value="updated">Recientes</option>
                 <option value="created">Creación</option>
@@ -467,14 +501,16 @@ export function WorkspacesListPage() {
             {/* Archived toggle */}
             <button
               onClick={() => setShowArchived((v) => !v)}
+              aria-pressed={showArchived}
+              aria-label={showArchived ? 'Ocultar workspaces archivados' : 'Ver workspaces archivados'}
               className={cn(
-                'flex items-center gap-1.5 px-3 py-2 rounded-xl text-[12.5px] font-medium transition-colors',
+                'flex items-center gap-1.5 px-3 py-2 rounded-xl text-[12.5px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1534dc]/45 dark:focus-visible:ring-[#8b5cf6]/45',
                 showArchived
                   ? 'bg-[#0e1745]/10 dark:bg-white/10 text-[#0e1745] dark:text-white'
-                  : 'text-[#0e1745]/55 dark:text-white/55 hover:text-[#0e1745] dark:hover:text-white',
+                  : 'text-[#0e1745]/55 dark:text-white/55 hover:text-[#0e1745] dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/5',
               )}
             >
-              <Archive className="w-3.5 h-3.5" />
+              <Archive className="w-3.5 h-3.5" aria-hidden />
               {showArchived ? 'Ocultar archivados' : 'Ver archivados'}
             </button>
           </div>
@@ -482,56 +518,106 @@ export function WorkspacesListPage() {
           <button
             onClick={handleCreate}
             disabled={creating}
-            className="flex items-center gap-2 px-4 py-2 rounded-xl bg-[#1534dc] text-white text-[13px] font-semibold hover:bg-[#1230c0] transition-colors disabled:opacity-60 shadow-sm shadow-[#1534dc]/25"
+            aria-label={creating ? 'Creando nuevo workspace' : 'Crear nuevo workspace'}
+            aria-busy={creating}
+            className="flex items-center gap-2 px-4 py-2 rounded-xl bg-[#1534dc] text-white text-[13px] font-semibold hover:bg-[#1230c0] dark:bg-[#8b5cf6] dark:hover:bg-[#7a4cf2] transition-colors disabled:opacity-60 disabled:cursor-not-allowed shadow-sm shadow-[#1534dc]/25 dark:shadow-[#8b5cf6]/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1534dc]/45 dark:focus-visible:ring-[#8b5cf6]/45"
           >
-            <Plus className="w-4 h-4" />
+            {creating ? <Loader2 className="w-4 h-4 animate-spin" aria-hidden /> : <Plus className="w-4 h-4" aria-hidden />}
             {creating ? 'Creando…' : 'Nuevo workspace'}
           </button>
         </div>
 
         {/* ── Error ──────────────────────────────────────────────── */}
         {error && (
-          <div className="mb-4 px-4 py-3 rounded-xl bg-red-50 dark:bg-red-900/20 text-red-600 text-[13px]">{error}</div>
+          <div
+            role="alert"
+            className="mb-4 px-4 py-3 rounded-xl bg-rose-50 dark:bg-rose-900/20 border border-rose-200/60 dark:border-rose-500/30 text-rose-700 dark:text-rose-300 text-[13px] flex items-start gap-2"
+          >
+            <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" aria-hidden />
+            <div className="flex-1 min-w-0">
+              <p className="font-medium">No pudimos cargar tus workspaces.</p>
+              <p className="text-[12px] opacity-80 mt-0.5 break-words">{error}</p>
+            </div>
+            <button
+              onClick={() => { setError(null); void load(); }}
+              className="text-[12px] font-semibold px-2.5 py-1 rounded-lg bg-rose-100 dark:bg-rose-500/20 hover:bg-rose-200 dark:hover:bg-rose-500/30 transition-colors shrink-0"
+            >
+              Reintentar
+            </button>
+          </div>
         )}
 
         {/* ── Grid ───────────────────────────────────────────────── */}
         {loading ? (
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-            {[...Array(3)].map((_, i) => (
-              <div key={i} className="h-44 rounded-2xl bg-white/40 dark:bg-white/[0.04] border border-white/60 dark:border-white/8 animate-pulse" />
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4" aria-busy="true" aria-label="Cargando workspaces">
+            {[...Array(6)].map((_, i) => (
+              <div
+                key={i}
+                className="relative h-44 rounded-2xl bg-white/50 dark:bg-white/[0.03] border border-white/60 dark:border-white/8 overflow-hidden"
+                style={{ animationDelay: `${i * 60}ms` }}
+              >
+                <div className="absolute inset-0 animate-pulse">
+                  <div className="absolute top-5 left-5 w-10 h-10 rounded-xl bg-[#7A3B47]/10 dark:bg-white/5" />
+                  <div className="absolute top-7 left-20 right-20 h-3 rounded-md bg-[#0e1745]/8 dark:bg-white/5" />
+                  <div className="absolute top-12 left-20 right-32 h-2 rounded-md bg-[#0e1745]/5 dark:bg-white/[0.04]" />
+                  <div className="absolute bottom-5 left-5 w-20 h-5 rounded-full bg-[#1534dc]/10 dark:bg-white/5" />
+                  <div className="absolute bottom-5 right-5 w-16 h-3 rounded-md bg-[#0e1745]/5 dark:bg-white/[0.04]" />
+                </div>
+              </div>
             ))}
           </div>
         ) : filtered.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-24 gap-4">
-            <div className="w-16 h-16 rounded-2xl bg-[#7A3B47]/10 flex items-center justify-center">
-              <BookOpen className="w-8 h-8 text-[#7A3B47]/60" />
+          <div className="flex flex-col items-center justify-center py-24 gap-3 text-center px-4 animate-in fade-in slide-in-from-bottom-2 duration-300">
+            <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-[#7A3B47]/15 to-[#1534dc]/10 dark:from-[#7A3B47]/25 dark:to-[#8b5cf6]/15 flex items-center justify-center shadow-sm">
+              <BookOpen className="w-8 h-8 text-[#7A3B47]/70 dark:text-[#7A3B47]" aria-hidden />
             </div>
             {workspaces.length === 0 ? (
               <>
-                <p className="text-[16px] font-semibold text-[#0e1745]/60 dark:text-white/50">Aún no tenés workspaces</p>
-                <p className="text-[13px] text-[#0e1745]/40 dark:text-white/35">Cada workspace es un canvas; cada hoja, una página de análisis.</p>
-                <button onClick={handleCreate} disabled={creating} className="mt-2 flex items-center gap-2 px-5 py-2.5 rounded-xl bg-[#1534dc] text-white text-[13px] font-semibold hover:bg-[#1230c0] transition-colors">
-                  <Plus className="w-4 h-4" /> Crea tu primera hoja
+                <p className="text-[17px] font-semibold text-[#0e1745]/80 dark:text-white/80">Aún no tenés workspaces</p>
+                <p className="text-[13px] text-[#0e1745]/50 dark:text-white/40 max-w-sm">
+                  Cada workspace es un canvas; cada hoja, una página de análisis. Tu chat las reescribe en su lugar.
+                </p>
+                <button
+                  onClick={handleCreate}
+                  disabled={creating}
+                  aria-busy={creating}
+                  className="mt-3 flex items-center gap-2 px-5 py-2.5 rounded-xl bg-[#1534dc] dark:bg-[#8b5cf6] text-white text-[13px] font-semibold hover:bg-[#1230c0] dark:hover:bg-[#7a4cf2] transition-colors disabled:opacity-60 shadow-sm shadow-[#1534dc]/25 dark:shadow-[#8b5cf6]/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1534dc]/45 dark:focus-visible:ring-[#8b5cf6]/45"
+                >
+                  {creating ? <Loader2 className="w-4 h-4 animate-spin" aria-hidden /> : <Plus className="w-4 h-4" aria-hidden />}
+                  Crear mi primer workspace
                 </button>
               </>
             ) : (
               <>
-                <p className="text-[16px] font-semibold text-[#0e1745]/60 dark:text-white/50">Nada coincide con tu búsqueda</p>
-                <p className="text-[13px] text-[#0e1745]/40 dark:text-white/35">Probá con otro término o limpiá el filtro.</p>
+                <p className="text-[16px] font-semibold text-[#0e1745]/70 dark:text-white/60">Nada coincide con tu búsqueda</p>
+                <p className="text-[13px] text-[#0e1745]/45 dark:text-white/35">Probá con otro término o limpiá el filtro.</p>
+                {search && (
+                  <button
+                    onClick={() => setSearch('')}
+                    className="mt-1 text-[12px] font-medium text-[#1534dc] dark:text-[#8b5cf6] hover:underline"
+                  >
+                    Limpiar búsqueda
+                  </button>
+                )}
               </>
             )}
           </div>
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 pb-12">
-            {filtered.map((ws) => (
-              <WorkspaceCard
+            {filtered.map((ws, i) => (
+              <div
                 key={ws.id}
-                ws={ws}
-                onOpen={() => navigate(`/workspaces/${ws.id}`)}
-                onRename={(title) => handleRename(ws.id, title)}
-                onArchive={() => handleArchive(ws.id, !ws.archived)}
-                onDelete={() => handleDelete(ws.id)}
-              />
+                className="animate-in fade-in slide-in-from-bottom-2 fill-mode-both duration-300"
+                style={{ animationDelay: `${Math.min(i * 35, 280)}ms` }}
+              >
+                <WorkspaceCard
+                  ws={ws}
+                  onOpen={() => navigate(`/workspaces/${ws.id}`)}
+                  onRename={(title) => handleRename(ws.id, title)}
+                  onArchive={() => handleArchive(ws.id, !ws.archived)}
+                  onDelete={() => handleDelete(ws.id)}
+                />
+              </div>
             ))}
           </div>
         )}

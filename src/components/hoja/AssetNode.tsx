@@ -16,7 +16,7 @@
  *   - cl2-burgundy → Studio's #7A3B47 burgundy literal (no token alias)
  *   - cl2-accent ring → Studio's #1534dc / dark #8b5cf6
  */
-import { useCallback, useState } from 'react';
+import { memo, useCallback, useState } from 'react';
 import { NodeResizer } from '@xyflow/react';
 import {
   GripVertical, Trash2, FileText, FileType, Music,
@@ -26,11 +26,11 @@ import { cn } from '@/lib/utils';
 import type { AssetContent, NodeColor, WorkspaceNode } from '@/services/workspaceApi';
 
 const COLOR_ACCENTS: Record<NodeColor, string> = {
-  default:  'border-[#1534dc]/15',
-  burgundy: 'border-[#7A3B47]/30',
-  ink:      'border-[#0e1745]/30',
-  sage:     'border-emerald-500/30',
-  amber:    'border-amber-500/30',
+  default:  'border-[#1534dc]/15 dark:border-[#8b5cf6]/30',
+  burgundy: 'border-[#7A3B47]/30 dark:border-[#a8525f]/40',
+  ink:      'border-[#0e1745]/30 dark:border-white/30',
+  sage:     'border-emerald-500/30 dark:border-emerald-400/40',
+  amber:    'border-amber-500/30 dark:border-amber-400/40',
 };
 
 interface AssetNodeData extends WorkspaceNode {
@@ -39,7 +39,7 @@ interface AssetNodeData extends WorkspaceNode {
   onSelect: (id: string) => void;
 }
 
-export function AssetNode({
+function AssetNodeImpl({
   id, data, selected,
 }: { id: string; data: AssetNodeData; selected?: boolean }) {
   const content = data.content as AssetContent | null;
@@ -85,10 +85,11 @@ export function AssetNode({
           <button
             onMouseDown={(e) => e.stopPropagation()}
             onClick={handleDelete}
-            className="p-1 rounded-md hover:bg-black/8 dark:hover:bg-white/10 text-black/30 dark:text-white/30 hover:text-red-500 transition-colors shrink-0"
+            className="p-1 rounded-md hover:bg-rose-100 dark:hover:bg-rose-900/30 text-black/30 dark:text-white/30 hover:text-rose-600 dark:hover:text-rose-400 transition-colors shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500/40"
             title="Eliminar"
+            aria-label={`Eliminar ${filename}`}
           >
-            <Trash2 className="w-3 h-3" />
+            <Trash2 className="w-3 h-3" aria-hidden />
           </button>
         </div>
 
@@ -146,9 +147,10 @@ export function AssetNode({
                 target="_blank"
                 rel="noopener noreferrer"
                 onClick={(e) => e.stopPropagation()}
-                className="mt-1 inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-[#7A3B47]/10 hover:bg-[#7A3B47]/20 text-[#7A3B47] text-[11px] font-semibold transition-colors"
+                aria-label={`Abrir ${filename} en una nueva pestaña`}
+                className="mt-1 inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-[#7A3B47]/10 hover:bg-[#7A3B47]/20 dark:bg-[#7A3B47]/20 dark:hover:bg-[#7A3B47]/30 text-[#7A3B47] dark:text-[#c5828d] text-[11px] font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7A3B47]/50"
               >
-                Abrir <ExternalLink className="w-3 h-3" />
+                Abrir <ExternalLink className="w-3 h-3" aria-hidden />
               </a>
             </div>
           )}
@@ -164,19 +166,47 @@ export function AssetNode({
       {/* ── Lightbox for images ────────────────────────────────── */}
       {showLightbox && url && (
         <div
-          className="fixed inset-0 z-[300] bg-black/85 flex items-center justify-center p-8"
+          className="fixed inset-0 z-[300] bg-black/85 flex items-center justify-center p-8 animate-in fade-in duration-200"
           onClick={() => setShowLightbox(false)}
           onMouseDown={(e) => e.stopPropagation()}
+          onKeyDown={(e) => { if (e.key === 'Escape') setShowLightbox(false); }}
+          role="dialog"
+          aria-modal="true"
+          aria-label={`Vista ampliada de ${filename}`}
         >
-          <img src={url} alt={filename} className="max-w-full max-h-full object-contain" />
+          <img
+            src={url}
+            alt={filename}
+            className="max-w-full max-h-full object-contain animate-in fade-in zoom-in-95 duration-200"
+          />
           <button
             onClick={(e) => { e.stopPropagation(); setShowLightbox(false); }}
-            className="absolute top-4 right-4 p-2 rounded-full bg-white/10 hover:bg-white/20 text-white transition-colors"
+            aria-label="Cerrar vista ampliada"
+            className="absolute top-4 right-4 p-2 rounded-full bg-white/10 hover:bg-white/20 text-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/60"
           >
-            <X className="w-5 h-5" />
+            <X className="w-5 h-5" aria-hidden />
           </button>
         </div>
       )}
     </>
   );
 }
+
+// Memoize to skip re-renders when ReactFlow churns the data identity
+// without actually changing visible asset fields.
+export const AssetNode = memo(AssetNodeImpl, (prev, next) => {
+  if (prev.id !== next.id) return false;
+  if (prev.selected !== next.selected) return false;
+  const a = prev.data;
+  const b = next.data;
+  if (a === b) return true;
+  if (a.title !== b.title) return false;
+  if (a.color !== b.color) return false;
+  if (a.type !== b.type) return false;
+  const ac = a.content as AssetContent | null;
+  const bc = b.content as AssetContent | null;
+  if (ac?.url !== bc?.url) return false;
+  if (ac?.filename !== bc?.filename) return false;
+  if (ac?.size !== bc?.size) return false;
+  return true;
+});

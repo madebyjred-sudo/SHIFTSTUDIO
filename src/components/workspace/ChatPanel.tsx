@@ -333,9 +333,9 @@ export function ChatPanel({
 
         {/* ── Selected hoja chip ──────────────────────────────── */}
         {selectedHoja ? (
-          <div className="mt-3 flex items-center gap-2 px-3 py-2 rounded-xl bg-[#1534dc]/8 border border-[#1534dc]/15">
-            <BookOpen className="w-3 h-3 text-[#1534dc] shrink-0" />
-            <p className="text-[11px] font-medium text-[#1534dc] truncate">
+          <div className="mt-3 flex items-center gap-2 px-3 py-2 rounded-xl bg-[#1534dc]/8 dark:bg-[#8b5cf6]/15 border border-[#1534dc]/15 dark:border-[#8b5cf6]/25 animate-in fade-in slide-in-from-top-1 duration-200">
+            <BookOpen className="w-3 h-3 text-[#1534dc] dark:text-[#8b5cf6] shrink-0" aria-hidden />
+            <p className="text-[11px] font-medium text-[#1534dc] dark:text-[#a892ee] truncate">
               Hoja seleccionada: "{selectedHoja.title || 'Sin título'}"
             </p>
           </div>
@@ -368,9 +368,17 @@ export function ChatPanel({
         {error && (
           <div
             role="alert"
-            className="rounded-xl border border-red-300/40 dark:border-red-500/30 bg-red-50/80 dark:bg-red-950/30 px-3 py-2"
+            className="rounded-xl border border-red-300/40 dark:border-red-500/30 bg-red-50/80 dark:bg-red-950/30 px-3 py-2.5 animate-in fade-in slide-in-from-bottom-1 duration-200 flex items-start justify-between gap-2"
           >
-            <p className="text-[12px] text-red-600 dark:text-red-300">{error}</p>
+            <p className="text-[12px] text-red-600 dark:text-red-300 leading-snug">{error}</p>
+            <button
+              type="button"
+              onClick={() => setError(null)}
+              aria-label="Descartar error"
+              className="text-red-600 dark:text-red-300 hover:text-red-700 dark:hover:text-red-200 shrink-0"
+            >
+              <span className="text-[14px] leading-none" aria-hidden>×</span>
+            </button>
           </div>
         )}
 
@@ -383,7 +391,7 @@ export function ChatPanel({
           className={cn(
             'rounded-2xl border bg-white/85 dark:bg-white/[0.04] backdrop-blur-xl transition-colors',
             'border-black/10 dark:border-white/10',
-            'focus-within:border-[#1534dc]/45 focus-within:ring-2 focus-within:ring-[#1534dc]/15',
+            'focus-within:border-[#1534dc]/45 focus-within:ring-2 focus-within:ring-[#1534dc]/15 dark:focus-within:border-[#8b5cf6]/45 dark:focus-within:ring-[#8b5cf6]/20',
           )}
         >
           <textarea
@@ -445,11 +453,11 @@ export function ChatPanel({
 
 function EmptyState() {
   return (
-    <div className="flex flex-col items-center justify-center py-10 px-4 text-center">
-      <div className="w-10 h-10 rounded-2xl bg-[#1534dc]/8 flex items-center justify-center mb-3">
-        <Sparkles className="w-5 h-5 text-[#1534dc]/70" />
+    <div className="flex flex-col items-center justify-center py-10 px-4 text-center animate-in fade-in slide-in-from-bottom-2 duration-300">
+      <div className="w-10 h-10 rounded-2xl bg-gradient-to-br from-[#1534dc]/12 to-[#8b5cf6]/10 dark:from-[#1534dc]/25 dark:to-[#8b5cf6]/20 flex items-center justify-center mb-3">
+        <Sparkles className="w-5 h-5 text-[#1534dc]/70 dark:text-[#8b5cf6]/85" aria-hidden />
       </div>
-      <p className="text-[12px] text-[#0e1745]/55 dark:text-white/45 leading-relaxed max-w-[260px]">
+      <p className="text-[12px] text-[#0e1745]/60 dark:text-white/55 leading-relaxed max-w-[260px]">
         Pedile a Lexa que analice la hoja seleccionada, o a Atlas que arme un análisis nuevo.
       </p>
     </div>
@@ -462,22 +470,22 @@ function MessageBubble({ message }: { message: ChatMessage }) {
 
   if (isAction) {
     return (
-      <div className="flex justify-center">
-        <div className="rounded-full bg-[#7A3B47]/10 border border-[#7A3B47]/20 px-3 py-1">
-          <p className="text-[11px] font-medium text-[#7A3B47]">{message.content}</p>
+      <div className="flex justify-center animate-in fade-in slide-in-from-bottom-1 duration-200">
+        <div className="rounded-full bg-[#7A3B47]/10 dark:bg-[#7A3B47]/25 border border-[#7A3B47]/20 dark:border-[#7A3B47]/35 px-3 py-1">
+          <p className="text-[11px] font-medium text-[#7A3B47] dark:text-[#c5828d]">{message.content}</p>
         </div>
       </div>
     );
   }
 
   return (
-    <div className={cn('flex', isUser ? 'justify-end' : 'justify-start')}>
+    <div className={cn('flex animate-in fade-in slide-in-from-bottom-1 duration-200', isUser ? 'justify-end' : 'justify-start')}>
       <div
         className={cn(
           'rounded-2xl px-4 py-3 max-w-[88%] text-[13px] leading-relaxed',
           isUser
-            ? 'bg-[#1534dc] text-white ml-auto'
-            : 'bg-white/85 dark:bg-white/[0.06] text-[#0e1745] dark:text-white border border-black/5 dark:border-white/8',
+            ? 'bg-[#1534dc] dark:bg-[#8b5cf6] text-white ml-auto shadow-sm shadow-[#1534dc]/20 dark:shadow-[#8b5cf6]/20'
+            : 'bg-white/85 dark:bg-white/[0.06] text-[#0e1745] dark:text-white border border-black/5 dark:border-white/10',
         )}
       >
         {isUser ? (
@@ -506,11 +514,11 @@ function StreamingBubble({
   // (the server returns a single JSON envelope, not tokens).
   if (isAtlasBuilding) {
     return (
-      <div className="flex justify-start">
-        <div className="rounded-2xl px-4 py-3 max-w-[88%] bg-white/85 dark:bg-white/[0.06] border border-black/5 dark:border-white/8">
+      <div className="flex justify-start animate-in fade-in slide-in-from-bottom-1 duration-200">
+        <div className="rounded-2xl px-4 py-3 max-w-[88%] bg-white/85 dark:bg-white/[0.06] border border-black/5 dark:border-white/10">
           <div className="flex items-center gap-2">
-            <Loader2 className="w-3.5 h-3.5 text-[#7A3B47] animate-spin" />
-            <p className="text-[12px] font-medium text-[#7A3B47]">Atlas está armando…</p>
+            <Loader2 className="w-3.5 h-3.5 text-[#7A3B47] dark:text-[#c5828d] animate-spin" aria-hidden />
+            <p className="text-[12px] font-medium text-[#7A3B47] dark:text-[#c5828d]">Atlas está armando…</p>
           </div>
         </div>
       </div>
@@ -518,11 +526,11 @@ function StreamingBubble({
   }
 
   return (
-    <div className="flex justify-start">
+    <div className="flex justify-start animate-in fade-in slide-in-from-bottom-1 duration-200">
       <div
         className={cn(
           'rounded-2xl px-4 py-3 max-w-[88%] text-[13px] leading-relaxed',
-          'bg-white/85 dark:bg-white/[0.06] text-[#0e1745] dark:text-white border border-black/5 dark:border-white/8',
+          'bg-white/85 dark:bg-white/[0.06] text-[#0e1745] dark:text-white border border-black/5 dark:border-white/10',
           !text && 'animate-pulse',
         )}
       >
@@ -536,8 +544,9 @@ function StreamingBubble({
             {[0, 1, 2].map((i) => (
               <span
                 key={i}
-                className="w-1.5 h-1.5 rounded-full bg-[#1534dc] animate-bounce"
+                className="w-1.5 h-1.5 rounded-full bg-[#1534dc] dark:bg-[#8b5cf6] animate-bounce"
                 style={{ animationDelay: `${i * 0.15}s` }}
+                aria-hidden
               />
             ))}
             <span className="ml-2 text-[11px] text-[#0e1745]/55 dark:text-white/55">

@@ -519,8 +519,8 @@ export function HojaFormatMenu({ onCreateHojaFromSelection, workspaceId }: Props
           )}
 
           {mode === 'transforming' && (
-            <div className="flex items-center gap-2.5 px-3 py-2.5">
-              <Loader2 size={14} className="animate-spin text-[#1534dc]" aria-hidden />
+            <div className="flex items-center gap-2.5 px-3 py-2.5" role="status" aria-live="polite">
+              <Loader2 size={14} className="animate-spin text-[#1534dc] dark:text-[#8b5cf6]" aria-hidden />
               <span className="text-[12.5px] font-semibold text-[#1534dc] dark:text-[#8b5cf6]">
                 Pensando…
               </span>

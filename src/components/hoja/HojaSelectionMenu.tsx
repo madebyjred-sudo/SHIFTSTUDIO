@@ -400,9 +400,9 @@ function ActionChip({
       onClick={onClick}
       aria-label={ariaLabel ?? label}
       className={cn(
-        'px-2 py-1.5 rounded-lg flex items-center gap-1.5 text-[11px] font-medium transition-colors whitespace-nowrap',
+        'px-2 py-1.5 rounded-lg flex items-center gap-1.5 text-[11px] font-medium transition-colors whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1534dc]/45 dark:focus-visible:ring-[#8b5cf6]/45',
         premium
-          ? 'text-[#1534dc] hover:bg-[#1534dc]/10'
+          ? 'text-[#1534dc] dark:text-[#8b5cf6] hover:bg-[#1534dc]/10 dark:hover:bg-[#8b5cf6]/15'
           : 'text-[#0e1745]/70 dark:text-white/70 hover:bg-black/5 dark:hover:bg-white/5 hover:text-[#0e1745] dark:hover:text-white',
       )}
     >

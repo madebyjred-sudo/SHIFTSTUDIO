@@ -12,7 +12,7 @@ import { ThemeProvider } from "./lib/theme-context";
 import { ErrorBoundary } from "./components/error-boundary";
 import { AuthView } from "./components/AuthView";
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, lazy, Suspense } from "react";
 import { cn } from "@/lib/utils";
 import { ShiftAIEmbed } from "./components/ShiftAIEmbed";
 import AdminDashboard from "./components/admin/AdminDashboard";
@@ -21,9 +21,33 @@ import { useActiveGraphStore } from "./store";
 import { useAuthStore } from "./store/useAuthStore";
 import { supabase } from "./services/supabaseClient";
 import { useRoute, isWorkspacesList, matchWorkspaceId, navigate } from "./lib/router";
-import { WorkspacesListPage } from "./pages/WorkspacesListPage";
-import { WorkspaceCanvasPage } from "./pages/WorkspaceCanvasPage";
 import { LayoutGrid } from "lucide-react";
+
+// T10 — Workspace routes lazy-loaded so the chat-only entry payload
+// doesn't pay for TipTap (~150 kB gz) + ReactFlow + the workspace
+// modals on the initial bundle. Vite SPA → dynamic import works without
+// any SSR concerns.
+const WorkspacesListPage = lazy(() =>
+  import("./pages/WorkspacesListPage").then((m) => ({ default: m.WorkspacesListPage })),
+);
+const WorkspaceCanvasPage = lazy(() =>
+  import("./pages/WorkspaceCanvasPage").then((m) => ({ default: m.WorkspaceCanvasPage })),
+);
+
+// Shared route-level fallback — matches Studio's auth-loading spinner.
+function WorkspaceRouteFallback() {
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-[#f8f9fc] dark:bg-[#080d1a]">
+      <div className="flex flex-col items-center gap-3">
+        <svg className="animate-spin w-7 h-7 text-[#1534dc]/45 dark:text-[#8b5cf6]/55" fill="none" viewBox="0 0 24 24" aria-hidden>
+          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+        </svg>
+        <p className="text-[12px] font-medium text-[#0e1745]/55 dark:text-white/50">Cargando workspace…</p>
+      </div>
+    </div>
+  );
+}
 
 export default function App() {
   const activeMode = useActiveGraphStore((state) => state.activeMode);
@@ -140,7 +164,9 @@ export default function App() {
     return (
       <ErrorBoundary>
         <ThemeProvider>
-          <WorkspacesListPage />
+          <Suspense fallback={<WorkspaceRouteFallback />}>
+            <WorkspacesListPage />
+          </Suspense>
         </ThemeProvider>
       </ErrorBoundary>
     );
@@ -151,7 +177,9 @@ export default function App() {
       <ErrorBoundary>
         <ThemeProvider>
           <ChatProvider>
-            <WorkspaceCanvasPage workspaceId={workspaceIdFromPath} />
+            <Suspense fallback={<WorkspaceRouteFallback />}>
+              <WorkspaceCanvasPage workspaceId={workspaceIdFromPath} />
+            </Suspense>
           </ChatProvider>
         </ThemeProvider>
       </ErrorBoundary>
