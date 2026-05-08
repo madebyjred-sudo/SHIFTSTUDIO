@@ -62,3 +62,18 @@ export async function getUserIdFromRequest(req: Request): Promise<string | null>
 }
 
 export { ANON_USER_ID };
+
+/**
+ * Cheap, regex-only UUID v1–v5 validator. Used by route handlers to
+ * 400 on malformed `:id` / `:nodeId` params before they reach Postgres
+ * (avoids a 500 + noisy log on `invalid input syntax for type uuid`).
+ *
+ * Does NOT verify the UUID exists or belongs to anyone — that's the
+ * handler's job. Format check only.
+ */
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+export function isValidUuid(s: unknown): boolean {
+  return typeof s === 'string' && UUID_RE.test(s);
+}

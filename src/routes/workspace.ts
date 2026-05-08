@@ -36,7 +36,7 @@
  */
 import { Router, type Request, type Response } from 'express';
 import { supabaseAdmin } from '../services/supabaseAdminClient.js';
-import { getUserIdFromRequest } from '../services/auth.js';
+import { getUserIdFromRequest, isValidUuid } from '../services/auth.js';
 
 export const workspaceRouter = Router();
 
@@ -187,6 +187,10 @@ workspaceRouter.get('/:id', async (req: Request, res: Response) => {
   const userId = await requireUser(req, res);
   if (!userId) return;
   const { id } = req.params;
+  if (!isValidUuid(id)) {
+    res.status(400).json({ ok: false, error: 'invalid_uuid' });
+    return;
+  }
 
   try {
     const { data: ws, error: wsErr } = await supabaseAdmin!
@@ -221,6 +225,10 @@ workspaceRouter.patch('/:id', async (req: Request, res: Response) => {
   const userId = await requireUser(req, res);
   if (!userId) return;
   const { id } = req.params;
+  if (!isValidUuid(id)) {
+    res.status(400).json({ ok: false, error: 'invalid_uuid' });
+    return;
+  }
 
   const allowed: Record<string, unknown> = {};
   if (typeof req.body?.title === 'string') allowed.title = req.body.title.slice(0, 200);
@@ -259,6 +267,10 @@ workspaceRouter.delete('/:id', async (req: Request, res: Response) => {
   const userId = await requireUser(req, res);
   if (!userId) return;
   const { id } = req.params;
+  if (!isValidUuid(id)) {
+    res.status(400).json({ ok: false, error: 'invalid_uuid' });
+    return;
+  }
 
   try {
     const { error, count } = await supabaseAdmin!
@@ -289,6 +301,10 @@ workspaceRouter.get('/:id/nodes', async (req: Request, res: Response) => {
   const userId = await requireUser(req, res);
   if (!userId) return;
   const { id } = req.params;
+  if (!isValidUuid(id)) {
+    res.status(400).json({ ok: false, error: 'invalid_uuid' });
+    return;
+  }
   if (!(await ownedWorkspace(userId, id, res))) return;
 
   const withContent = req.query.withContent === '1';
@@ -316,6 +332,10 @@ workspaceRouter.get('/:id/nodes/:nodeId', async (req: Request, res: Response) =>
   const userId = await requireUser(req, res);
   if (!userId) return;
   const { id, nodeId } = req.params;
+  if (!isValidUuid(id) || !isValidUuid(nodeId)) {
+    res.status(400).json({ ok: false, error: 'invalid_uuid' });
+    return;
+  }
   if (!(await ownedWorkspace(userId, id, res))) return;
 
   try {
@@ -347,6 +367,10 @@ workspaceRouter.post('/:id/nodes', async (req: Request, res: Response) => {
   const userId = await requireUser(req, res);
   if (!userId) return;
   const { id } = req.params;
+  if (!isValidUuid(id)) {
+    res.status(400).json({ ok: false, error: 'invalid_uuid' });
+    return;
+  }
   if (!(await ownedWorkspace(userId, id, res))) return;
 
   const body = req.body ?? {};
@@ -401,6 +425,10 @@ workspaceRouter.patch('/:id/nodes/:nodeId', async (req: Request, res: Response) 
   const userId = await requireUser(req, res);
   if (!userId) return;
   const { id, nodeId } = req.params;
+  if (!isValidUuid(id) || !isValidUuid(nodeId)) {
+    res.status(400).json({ ok: false, error: 'invalid_uuid' });
+    return;
+  }
   if (!(await ownedWorkspace(userId, id, res))) return;
 
   const body = req.body ?? {};
@@ -465,6 +493,10 @@ workspaceRouter.delete('/:id/nodes/:nodeId', async (req: Request, res: Response)
   const userId = await requireUser(req, res);
   if (!userId) return;
   const { id, nodeId } = req.params;
+  if (!isValidUuid(id) || !isValidUuid(nodeId)) {
+    res.status(400).json({ ok: false, error: 'invalid_uuid' });
+    return;
+  }
   if (!(await ownedWorkspace(userId, id, res))) return;
 
   try {
@@ -500,6 +532,10 @@ workspaceRouter.get('/:id/attach-context', async (req: Request, res: Response) =
   const userId = await requireUser(req, res);
   if (!userId) return;
   const { id } = req.params;
+  if (!isValidUuid(id)) {
+    res.status(400).json({ ok: false, error: 'invalid_uuid' });
+    return;
+  }
 
   try {
     const [{ data: ws, error: wsErr }, { data: nodes, error: nErr }] = await Promise.all([
@@ -594,6 +630,60 @@ workspaceRouter.post('/citations', async (req: Request, res: Response) => {
     return;
   }
 
+  // Normalize node_id: accept string only; treat null/undefined as "no pin".
+  const pinNodeId: string | null =
+    node_id === null || node_id === undefined
+      ? null
+      : typeof node_id === 'string'
+        ? node_id
+        : null;
+
+  // CRITICAL: when pinning to a node, verify the node belongs to the calling
+  // user (via its parent workspace). The DB FK only checks the node EXISTS,
+  // not that its workspace.user_id matches — without this check, user A
+  // could pin a citation to user B's node UUID (cross-tenant pollution).
+  // Return 400 (NOT 404) on failure so we don't leak whether the UUID
+  // exists for another user.
+  if (pinNodeId !== null) {
+    if (!isValidUuid(pinNodeId)) {
+      res.status(400).json({ ok: false, error: 'invalid_node_id' });
+      return;
+    }
+    try {
+      // Two-step lookup: fetch the node's workspace_id, then verify that
+      // workspace belongs to the caller. Equivalent to a JOIN but uses
+      // only existing supabase-js patterns already in this file.
+      const { data: nodeRow, error: nodeErr } = await supabaseAdmin!
+        .from('studio_workspace_nodes')
+        .select('id, workspace_id')
+        .eq('id', pinNodeId)
+        .maybeSingle();
+      if (nodeErr) throw new Error(nodeErr.message);
+      if (!nodeRow) {
+        res.status(400).json({ ok: false, error: 'invalid_node_id' });
+        return;
+      }
+      const { data: wsRow, error: wsErr } = await supabaseAdmin!
+        .from('studio_workspaces')
+        .select('id')
+        .eq('id', nodeRow.workspace_id as string)
+        .eq('user_id', userId)
+        .maybeSingle();
+      if (wsErr) throw new Error(wsErr.message);
+      if (!wsRow) {
+        res.status(400).json({ ok: false, error: 'invalid_node_id' });
+        return;
+      }
+    } catch (err) {
+      console.error(
+        '[workspace] citation node ownership check failed:',
+        (err as Error).message
+      );
+      res.status(500).json({ ok: false, error: 'citation_save_failed' });
+      return;
+    }
+  }
+
   try {
     const { data, error } = await supabaseAdmin!
       .from('studio_workspace_citations')
@@ -604,7 +694,7 @@ workspaceRouter.post('/citations', async (req: Request, res: Response) => {
           source_label: typeof source_label === 'string' ? source_label : null,
           excerpt: typeof excerpt === 'string' ? excerpt : null,
           note: typeof note === 'string' ? note : '',
-          node_id: typeof node_id === 'string' ? node_id : null,
+          node_id: pinNodeId,
         },
         { onConflict: 'user_id,chunk_id', ignoreDuplicates: false }
       )
