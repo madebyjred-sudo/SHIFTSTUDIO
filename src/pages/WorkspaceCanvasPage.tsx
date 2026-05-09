@@ -38,7 +38,7 @@ import {
 import { TopDock } from '@/components/top-dock';
 import { ChatPanel } from '@/components/workspace/ChatPanel';
 import { QuickHojaModal } from '@/components/workspace/QuickHojaModal';
-import { PptxOptionsModal } from '@/components/workspace/PptxOptionsModal';
+import { PptxOptionsModal, type PptxOptionsSubmit } from '@/components/workspace/PptxOptionsModal';
 import { PptxResultModal } from '@/components/workspace/PptxResultModal';
 import { HojaNode } from '@/components/hoja/HojaNode';
 import { AssetNode } from '@/components/hoja/AssetNode';
@@ -135,7 +135,14 @@ function CanvasInner({
   const [exportMenuOpen, setExportMenuOpen] = useState(false);
   const [pptxOptionsOpen, setPptxOptionsOpen] = useState(false);
   const [pptxOptionsCache, setPptxOptionsCache] = useState<PptxOptions | undefined>(undefined);
+  // Phase 3.F split: result modal can render in two modes — cache-hit
+  // (`pptxResult` filled) or polling (`pptxPending` filled). At most
+  // one of these is non-null at a time. Both null = result modal closed.
   const [pptxResult, setPptxResult] = useState<PptxExportResult | null>(null);
+  const [pptxPending, setPptxPending] = useState<{
+    generationId: string;
+    filename: string;
+  } | null>(null);
 
   // T10 — mobile chat drawer (shown on screens below lg breakpoint).
   // Desktop keeps the persistent 360px sidebar.
@@ -226,6 +233,7 @@ function CanvasInner({
     setQuickHojaOpen(false);
     setPptxOptionsOpen(false);
     setPptxResult(null);
+    setPptxPending(null);
   }, []);
 
   // ── Persist position on drag end (debounced 300ms) ───────────────
@@ -443,18 +451,33 @@ function CanvasInner({
     }
   }, [workspaceId, title, exporting, showActionError]);
 
-  // Options modal → fired when generation succeeds. Cache opts (so a
-  // future "generar de nuevo" pre-fills the form) and pop the result.
-  const handlePptxOptionsSubmit = useCallback((opts: PptxOptions, result: PptxExportResult) => {
+  // Options modal → fired when the request to start generation succeeds.
+  // Phase 3.F: the modal returns either a `pending` generationId (Gamma
+  // is working, frontend polls) or a cache-hit `complete` result. Cache
+  // opts so future "Generar de nuevo" pre-fills the form.
+  const handlePptxOptionsSubmit = useCallback((opts: PptxOptions, submit: PptxOptionsSubmit) => {
     setPptxOptionsCache(opts);
     setPptxOptionsOpen(false);
-    setPptxResult(result);
+    if (submit.status === 'complete') {
+      setPptxPending(null);
+      setPptxResult(submit.result);
+    } else {
+      setPptxResult(null);
+      setPptxPending({ generationId: submit.generationId, filename: submit.filename });
+    }
   }, []);
 
   // Result modal → "Generar de nuevo" closes result and reopens options.
   const handlePptxRegenerate = useCallback(() => {
     setPptxResult(null);
+    setPptxPending(null);
     setPptxOptionsOpen(true);
+  }, []);
+
+  // Result modal close — clear both shapes regardless of which one was active.
+  const handlePptxResultClose = useCallback(() => {
+    setPptxResult(null);
+    setPptxPending(null);
   }, []);
 
   // ── Title commit ─────────────────────────────────────────────────
@@ -817,11 +840,16 @@ function CanvasInner({
         onSubmit={handlePptxOptionsSubmit}
       />
 
-      {/* T9 — pptx result with explicit user-clicked CTAs */}
+      {/* T9 — pptx result with explicit user-clicked CTAs.
+           Phase 3.F: also handles the polling state when the server
+           kicked off a fresh generation rather than returning a cache hit. */}
       <PptxResultModal
-        open={Boolean(pptxResult)}
-        onClose={() => setPptxResult(null)}
+        open={Boolean(pptxResult) || Boolean(pptxPending)}
+        onClose={handlePptxResultClose}
         result={pptxResult}
+        generationId={pptxPending?.generationId ?? null}
+        workspaceId={workspaceId}
+        filename={pptxPending?.filename}
         onRegenerate={handlePptxRegenerate}
         workspaceTitle={title}
       />

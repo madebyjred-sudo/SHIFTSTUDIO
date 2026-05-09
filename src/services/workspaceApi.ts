@@ -95,6 +95,46 @@ export interface PptxExportResult {
   generatedAt: string;
 }
 
+/**
+ * Phase 3.F split-flow result of `exportWorkspace(id, 'pptx', …)`.
+ *
+ * The server kicks off the Gamma generation and returns immediately; the
+ * caller then polls via `pollPptxStatus`. The cache short-circuit is
+ * preserved — when the workspace's last_pptx is fresh enough to reuse,
+ * the response comes back already-complete with the deck URLs filled in.
+ */
+export type PptxStartResult =
+  | {
+      status: 'complete';
+      result: PptxExportResult;
+    }
+  | {
+      status: 'pending';
+      generationId: string;
+      filename: string;
+      pollingUrl: string;
+    };
+
+/**
+ * One status check on a pending pptx generation. Mirrors the server
+ * shape of GET /:id/export/pptx-status.
+ */
+export type PptxStatusResult =
+  | {
+      status: 'pending';
+      generationId: string;
+    }
+  | {
+      status: 'complete';
+      generationId: string;
+      result: PptxExportResult;
+    }
+  | {
+      status: 'failed';
+      generationId: string;
+      error: string;
+    };
+
 // ─── Internal helpers ─────────────────────────────────────────────────
 
 /** Read a fresh JWT every call; tokens may rotate during a long session. */
@@ -440,9 +480,11 @@ export async function attachContext(workspaceId: string): Promise<{
  * - md/docx → server returns a binary blob; we trigger a download and
  *   resolve to `{ format }`. The caller doesn't need a return value but
  *   we return one for telemetry hooks.
- * - pptx → server returns a JSON envelope with the Gamma generation
- *   metadata. The caller is expected to open `gammaUrl`/`exportUrl` in a
- *   new tab (or render a result modal). Fully typed via PptxExportResult.
+ * - pptx → server kicks off the Gamma generation and returns immediately.
+ *   See `PptxStartResult` — caller either gets a cached `complete` deck
+ *   right away, or a `pending` generationId to poll via `pollPptxStatus`.
+ *   Phase 3.F split: the previous "block until done" shape always 504'd
+ *   on Vercel because Gamma takes longer than the function maxDuration.
  */
 export async function exportWorkspace(
   workspaceId: string,
@@ -458,12 +500,12 @@ export async function exportWorkspace(
   workspaceId: string,
   format: 'pptx',
   opts?: { workspaceTitle?: string; force?: boolean; options?: PptxOptions },
-): Promise<PptxExportResult>;
+): Promise<PptxStartResult>;
 export async function exportWorkspace(
   workspaceId: string,
   format: 'md' | 'docx' | 'pptx',
   opts: { workspaceTitle?: string; force?: boolean; options?: PptxOptions } = {},
-): Promise<PptxExportResult | { format: 'md' | 'docx' }> {
+): Promise<PptxStartResult | { format: 'md' | 'docx' }> {
   const body: Record<string, unknown> = { format };
   if (format === 'pptx') {
     if (opts.force) body.force = true;
@@ -477,15 +519,44 @@ export async function exportWorkspace(
   });
 
   if (format === 'pptx') {
-    const json = await handleJson<{ ok: boolean } & PptxExportResult>(res);
+    const json = await handleJson<
+      | {
+          ok: boolean;
+          status: 'complete';
+          generationId: string;
+          gammaUrl: string;
+          exportUrl: string;
+          filename: string;
+          cached: boolean;
+          generatedAt: string;
+        }
+      | {
+          ok: boolean;
+          status: 'pending';
+          generationId: string;
+          filename: string;
+          pollingUrl: string;
+        }
+    >(res);
+    if (json.status === 'complete') {
+      return {
+        status: 'complete',
+        result: {
+          format: 'pptx',
+          generationId: json.generationId,
+          gammaUrl: json.gammaUrl,
+          exportUrl: json.exportUrl,
+          filename: json.filename,
+          cached: json.cached,
+          generatedAt: json.generatedAt,
+        },
+      };
+    }
     return {
-      format: 'pptx',
+      status: 'pending',
       generationId: json.generationId,
-      gammaUrl: json.gammaUrl,
-      exportUrl: json.exportUrl,
       filename: json.filename,
-      cached: json.cached,
-      generatedAt: json.generatedAt,
+      pollingUrl: json.pollingUrl,
     };
   }
 
@@ -513,6 +584,151 @@ export async function exportWorkspace(
   const filename = m?.[1] ?? `${safeTitle}.${fallbackExt}`;
   triggerBlobDownload(blob, filename);
   return { format };
+}
+
+/**
+ * Single status hit on a pending pptx generation.
+ *
+ * Lower-level than `pollPptxStatus` — exposed for callers that want their
+ * own polling loop (tests, debugging tools, future server-sent events
+ * variant). UI code should use `pollPptxStatus`.
+ */
+export async function getPptxStatus(
+  workspaceId: string,
+  generationId: string,
+  signal?: AbortSignal,
+): Promise<PptxStatusResult> {
+  const url = `/api/workspace/${workspaceId}/export/pptx-status?generation_id=${encodeURIComponent(generationId)}`;
+  const res = await fetch(url, {
+    method: 'GET',
+    headers: await authedHeaders(),
+    signal,
+  });
+  const json = await handleJson<
+    | { ok: boolean; status: 'pending'; generationId: string }
+    | {
+        ok: boolean;
+        status: 'complete';
+        generationId: string;
+        gammaUrl: string;
+        exportUrl: string;
+        filename: string;
+        cached: boolean;
+        generatedAt: string;
+      }
+    | { ok: boolean; status: 'failed'; generationId: string; error: string }
+  >(res);
+
+  if (json.status === 'complete') {
+    return {
+      status: 'complete',
+      generationId: json.generationId,
+      result: {
+        format: 'pptx',
+        generationId: json.generationId,
+        gammaUrl: json.gammaUrl,
+        exportUrl: json.exportUrl,
+        filename: json.filename,
+        cached: json.cached,
+        generatedAt: json.generatedAt,
+      },
+    };
+  }
+  if (json.status === 'failed') {
+    return {
+      status: 'failed',
+      generationId: json.generationId,
+      error: json.error,
+    };
+  }
+  return {
+    status: 'pending',
+    generationId: json.generationId,
+  };
+}
+
+/**
+ * Poll the pptx status endpoint until the deck completes, fails, or
+ * the timeout fires.
+ *
+ * Defaults match Gamma's recommended cadence: 5s between hits, 5min cap
+ * (the same ceiling the legacy server-side `pollUntilComplete` used).
+ *
+ * onProgress fires once per tick with the elapsed milliseconds since
+ * the call started — wire it to a "Generando deck… 23s" indicator.
+ *
+ * The signal is honored: aborting it rejects the returned promise with
+ * a DOMException('AbortError') and stops further polling. Modal cancel
+ * buttons should pass their AbortController.signal here.
+ *
+ * Resolves with the completed PptxExportResult.
+ * Rejects on:
+ *   - status: 'failed' from the server (Error message = upstream error)
+ *   - timeout (Error('pptx_poll_timeout'))
+ *   - abort (DOMException('AbortError'))
+ *   - any HTTP error from getPptxStatus (re-thrown)
+ */
+export async function pollPptxStatus(
+  workspaceId: string,
+  generationId: string,
+  opts: {
+    intervalMs?: number;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+    onProgress?: (elapsedMs: number) => void;
+  } = {},
+): Promise<PptxExportResult> {
+  const intervalMs = opts.intervalMs ?? 5_000;
+  const timeoutMs = opts.timeoutMs ?? 5 * 60 * 1000;
+  const startedAt = Date.now();
+
+  // Tiny initial delay — give Gamma a beat to commit the row before the
+  // first GET. Mirrors the 1s sleep the legacy server-side poll used.
+  await sleepWithAbort(1_000, opts.signal);
+
+  while (true) {
+    const elapsed = Date.now() - startedAt;
+    opts.onProgress?.(elapsed);
+
+    if (opts.signal?.aborted) {
+      throw new DOMException('pollPptxStatus aborted', 'AbortError');
+    }
+    if (elapsed > timeoutMs) {
+      throw new Error('pptx_poll_timeout');
+    }
+
+    const tick = await getPptxStatus(workspaceId, generationId, opts.signal);
+    if (tick.status === 'complete') {
+      return tick.result;
+    }
+    if (tick.status === 'failed') {
+      throw new Error(tick.error || 'pptx_failed');
+    }
+
+    await sleepWithAbort(intervalMs, opts.signal);
+  }
+}
+
+function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException('aborted', 'AbortError'));
+      return;
+    }
+    const t = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      cleanup();
+      reject(new DOMException('aborted', 'AbortError'));
+    };
+    function cleanup() {
+      clearTimeout(t);
+      signal?.removeEventListener('abort', onAbort);
+    }
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 function triggerBlobDownload(blob: Blob, filename: string): void {

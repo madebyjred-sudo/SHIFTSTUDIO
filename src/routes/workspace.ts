@@ -2038,14 +2038,19 @@ workspaceRouter.post('/:id/export', async (req: Request, res: Response) => {
       return;
     }
 
-    // ── PPTX via Gamma API ───────────────────────────────────────────
-    // Strategy: build the SAME markdown the md format produces, but use
-    // explicit "\n---\n" slide breaks (already present between hojas) so
-    // Gamma respects the canvas structure 1:1.
+    // ── PPTX via Gamma API (Phase 3.F split flow) ───────────────────
+    // Vercel functions cap at 60s (Pro) / 10s (Hobby). Gamma deck
+    // generation routinely takes 1-3min, with a 5min ceiling. The
+    // single-endpoint "block until done" flow ALWAYS 504s in production.
     //
-    // We block until completion (max ~5min) and return a JSON envelope
-    // with the signed download URL. The client opens it in a new tab;
-    // the URL is valid for ~1 week per Gamma's CDN policy.
+    // Two-stage flow:
+    //   1. POST /:id/export {format: 'pptx'}        → kick off, return id
+    //   2. GET  /:id/export/pptx-status?generation_id=…
+    //                                                → single status hit
+    //
+    // Frontend polls (2). The startGeneration call still honors the 1h
+    // cache: a fresh cached deck short-circuits to {status:'complete'}
+    // here so the user gets it without polling.
     if (format === 'pptx') {
       const force = Boolean(req.body?.force);
       const options = (req.body?.options ?? undefined) as
@@ -2057,21 +2062,42 @@ workspaceRouter.post('/:id/export', async (req: Request, res: Response) => {
             marca?: string;
             emojis?: boolean;
           };
-      const { runWorkspacePptxExport: runPptx } = await import('../services/workspacePptxExport.js');
+      const { startGeneration } = await import('../services/workspacePptxExport.js');
       try {
-        const result = await runPptx({ workspaceId: id, userId, force, options });
+        const start = await startGeneration({ workspaceId: id, userId, force, options });
+        if (start.status === 'complete') {
+          // Cache hit — same shape the legacy "wait for it" flow returned.
+          const result = start.result;
+          console.log(
+            `[workspace] export pptx cache hit workspaceId=${id} generationId=${result.generationId}`,
+          );
+          res.json({
+            ok: true,
+            format: 'pptx',
+            status: 'complete',
+            cached: true,
+            generatedAt: result.generatedAt,
+            filename: result.filename,
+            url: result.exportUrl,
+            exportUrl: result.exportUrl,
+            gammaUrl: result.gammaUrl,
+            generationId: result.generationId,
+          });
+          return;
+        }
+        // Pending — return the generationId so the client can poll.
         console.log(
-          `[workspace] export pptx ok workspaceId=${id} hojas=${ordered.length} generationId=${result.generationId} cached=${result.cached}`,
+          `[workspace] export pptx kicked off workspaceId=${id} hojas=${ordered.length} generationId=${start.generationId}`,
         );
         res.json({
           ok: true,
           format: 'pptx',
-          cached: result.cached,
-          generatedAt: result.generatedAt,
-          filename: result.filename,
-          url: result.exportUrl,
-          gammaUrl: result.gammaUrl,
-          generationId: result.generationId,
+          status: 'pending',
+          generationId: start.generationId,
+          filename: start.filename,
+          // Convenience: the client knows this from the workspaceId, but
+          // surface it explicitly so the API is self-describing.
+          pollingUrl: `/api/workspace/${id}/export/pptx-status?generation_id=${encodeURIComponent(start.generationId)}`,
         });
         return;
       } catch (err) {
@@ -2741,6 +2767,120 @@ workspaceRouter.post('/:id/export', async (req: Request, res: Response) => {
     res.send(buffer);
   } catch (err) {
     console.warn('[workspace] export failed:', (err as Error).message);
+    res.status(500).json({ ok: false, error: (err as Error).message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// PPTX STATUS — single-shot check for an in-flight Gamma generation
+// ═══════════════════════════════════════════════════════════════════════
+//
+// GET /api/workspace/:id/export/pptx-status?generation_id=...
+//
+// Companion to POST /:id/export {format:'pptx'} — that endpoint kicks
+// off the deck and returns immediately; this endpoint reports whether
+// the deck is done. Frontend polls every 5s with abort + elapsed timer.
+//
+// Response shapes:
+//   { ok:true, status:'pending',  generationId }
+//   { ok:true, status:'complete', generationId, exportUrl, gammaUrl,
+//             filename, generatedAt, cached:false }
+//   { ok:true, status:'failed',   generationId, error }
+//
+// One Gamma round-trip + one Supabase row update on completion. Comfortably
+// under Vercel's 10s Hobby cap.
+workspaceRouter.get('/:id/export/pptx-status', async (req: Request, res: Response) => {
+  if (!dbReady(res)) return;
+  const userId = await requireUser(req, res);
+  if (!userId) return;
+  const { id } = req.params;
+  if (!isValidUuid(id)) {
+    res.status(400).json({ ok: false, error: 'invalid_uuid' });
+    return;
+  }
+
+  const generationId = String(req.query.generation_id ?? '').trim();
+  if (!generationId) {
+    res
+      .status(400)
+      .json({ ok: false, error: 'missing_generation_id', hint: 'pass ?generation_id=…' });
+    return;
+  }
+
+  // Ownership gate — same pattern as POST /:id/export. Reject before
+  // hitting Gamma so a leaked generationId from another tenant can't be
+  // used to read someone else's deck via this status endpoint.
+  if (!(await ownedWorkspace(userId, id, res))) return;
+
+  try {
+    const { checkGeneration } = await import('../services/workspacePptxExport.js');
+    const out = await checkGeneration(generationId, id, userId);
+
+    if (out.status === 'pending') {
+      res.json({
+        ok: true,
+        status: 'pending',
+        generationId: out.generationId,
+      });
+      return;
+    }
+
+    if (out.status === 'failed') {
+      console.warn(
+        `[workspace] pptx-status failed workspaceId=${id} generationId=${generationId} error=${out.error}`,
+      );
+      res.json({
+        ok: true,
+        status: 'failed',
+        generationId: out.generationId,
+        error: out.error,
+      });
+      return;
+    }
+
+    // Complete.
+    const result = out.result;
+    console.log(
+      `[workspace] pptx-status complete workspaceId=${id} generationId=${result.generationId}`,
+    );
+    res.json({
+      ok: true,
+      status: 'complete',
+      generationId: result.generationId,
+      filename: result.filename,
+      // Both keys for back-compat with anything that read `url` from the
+      // legacy single-endpoint response.
+      url: result.exportUrl,
+      exportUrl: result.exportUrl,
+      gammaUrl: result.gammaUrl,
+      cached: false,
+      generatedAt: result.generatedAt,
+    });
+  } catch (err) {
+    if (err instanceof GammaApiError) {
+      console.warn(
+        `[workspace] pptx-status gamma error workspaceId=${id} code=${err.code} error=${err.message}`,
+      );
+      const statusMap: Record<string, number> = {
+        auth: 503,
+        insufficient_credits: 402,
+        forbidden: 403,
+        bad_request: 400,
+        rate_limited: 429,
+        timeout: 504,
+        failed: 502,
+        no_export_url: 502,
+        upstream: 502,
+        network: 502,
+      };
+      res.status(statusMap[err.code] ?? 500).json({
+        ok: false,
+        error: err.code,
+        detail: err.message,
+      });
+      return;
+    }
+    console.warn('[workspace] pptx-status failed:', (err as Error).message);
     res.status(500).json({ ok: false, error: (err as Error).message });
   }
 });
