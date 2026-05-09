@@ -49,6 +49,9 @@ import {
   type ChatMessageRow,
   type ChatMessageVariant,
 } from '@/services/workspaceApi';
+import {
+  emitWorkspaceEvent, listenWorkspaceEvents,
+} from '@/lib/workspace-broadcast';
 
 // ─── Types ────────────────────────────────────────────────────────────
 
@@ -343,6 +346,32 @@ export function ChatPanel({
     saveMessages(workspaceId, messages);
   }, [workspaceId, messages]);
 
+  // ── Multi-tab sync listener (T-MTAB) ─────────────────────────────
+  // chat_cleared    → wipe local messages + storage (mirror what the
+  //                   sibling tab just did, with no server roundtrip).
+  // chat_message_added → refetch the history so we pick up whatever the
+  //                   sibling tab just persisted. Cheaper than parsing a
+  //                   payload + dedupe; the panel's already wired for
+  //                   server hydration.
+  useEffect(() => {
+    return listenWorkspaceEvents(workspaceId, (evt) => {
+      if (evt.type === 'chat_cleared') {
+        setMessages([]);
+        clearStoredMessages(workspaceId);
+        return;
+      }
+      if (evt.type === 'chat_message_added') {
+        void listChatMessages(workspaceId)
+          .then((rows) => {
+            const fromServer = rows.map(rowToMessage);
+            setMessages(fromServer);
+            saveMessages(workspaceId, fromServer);
+          })
+          .catch(() => null);
+      }
+    });
+  }, [workspaceId]);
+
   // ── Clear-history affordance ──────────────────────────────────────
   const handleClearHistory = useCallback(() => {
     if (typeof window !== 'undefined') {
@@ -364,12 +393,18 @@ export function ChatPanel({
     // stands (the user explicitly asked to wipe the panel) but the
     // server still has the rows — they'll re-hydrate on next mount. We
     // surface a soft banner so the user knows there's drift to resolve.
-    void clearChatMessages(workspaceId).catch((err) => {
-      console.warn('[ChatPanel] server clear failed:', err);
-      setError(
-        'La conversación se limpió localmente, pero no pudimos borrarla en el servidor. Volverá al recargar.',
-      );
-    });
+    void clearChatMessages(workspaceId)
+      .then(() => {
+        // T-MTAB — sibling tabs drop their local mirror so they don't
+        // keep writing into a thread the user just wiped.
+        emitWorkspaceEvent(workspaceId, { type: 'chat_cleared' });
+      })
+      .catch((err) => {
+        console.warn('[ChatPanel] server clear failed:', err);
+        setError(
+          'La conversación se limpió localmente, pero no pudimos borrarla en el servidor. Volverá al recargar.',
+        );
+      });
   }, [workspaceId]);
 
   // ── Background write-through ──────────────────────────────────────
@@ -390,9 +425,18 @@ export function ChatPanel({
         content,
         ...(opts.variant ? { variant: opts.variant } : {}),
         ...(opts.intent ? { intent: opts.intent } : {}),
-      }).catch((err) => {
-        console.warn('[ChatPanel] persist failed:', err);
-      });
+      })
+        .then((row) => {
+          // T-MTAB — server-confirmed write: tell sibling tabs to refetch.
+          // We ship only the message id; the receiver fetches the full
+          // history (simpler than reconstructing the row + dedupe logic).
+          emitWorkspaceEvent(workspaceId, {
+            type: 'chat_message_added', messageId: row.id,
+          });
+        })
+        .catch((err) => {
+          console.warn('[ChatPanel] persist failed:', err);
+        });
     },
     [workspaceId],
   );

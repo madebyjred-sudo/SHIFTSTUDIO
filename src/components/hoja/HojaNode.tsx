@@ -58,6 +58,9 @@ import { cn } from '@/lib/utils';
 import {
   updateNode, type NodeColor, type UpdateNodePatch, type WorkspaceNode,
 } from '@/services/workspaceApi';
+import {
+  emitWorkspaceEvent, listenWorkspaceEvents,
+} from '@/lib/workspace-broadcast';
 import { createSlashExtension } from './HojaSlashExtension';
 
 // ─── Color accents (left-edge bar) ────────────────────────────────────
@@ -330,6 +333,13 @@ function HojaNodeImpl({
   const [subtitle, setSubtitle] = useState(data.subtitle ?? '');
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [lastSavedAt, setLastSavedAt] = useState<number | null>(null);
+  // Multi-tab conflict surface (T-MTAB):
+  //   When another tab writes to the SAME hoja while the user is mid-edit
+  //   here, we DON'T silently overwrite their in-flight content. Instead
+  //   we surface a banner offering an explicit reload. `pendingExternalMd`
+  //   stashes the incoming markdown so the Reload button can apply it
+  //   without a network roundtrip.
+  const [externalUpdate, setExternalUpdate] = useState<{ md: string } | null>(null);
   // Tick state lifts a 1-Hz refresh on the relative-time label.
   const [, setTick] = useState(0);
 
@@ -356,9 +366,23 @@ function HojaNodeImpl({
     saveTimer.current = setTimeout(async () => {
       try {
         await updateNode(workspaceId, id, patch);
+        const now = Date.now();
         setSaveState('saved');
-        setLastSavedAt(Date.now());
+        setLastSavedAt(now);
         onUpdate?.(id, patch as Partial<WorkspaceNode>);
+        // T-MTAB — broadcast the new content (if present) so sibling tabs
+        // can update their local mirror and bail on stale debounced flushes.
+        // We only broadcast `hoja_updated` for content changes; title/
+        // subtitle changes piggy-back on the same channel because the
+        // consumer in WorkspaceCanvasPage merges `data` shallowly anyway,
+        // but the timestamp tie-break only matters for body content (the
+        // primary loss vector).
+        const md = (patch.content as { md?: string } | undefined)?.md;
+        if (typeof md === 'string') {
+          emitWorkspaceEvent(workspaceId, {
+            type: 'hoja_updated', nodeId: id, content: { md }, updatedAt: now,
+          });
+        }
       } catch {
         setSaveState('error');
       }
@@ -378,9 +402,19 @@ function HojaNodeImpl({
       try {
         const patch = compute();
         await updateNode(workspaceId, id, patch);
+        const now = Date.now();
         setSaveState('saved');
-        setLastSavedAt(Date.now());
+        setLastSavedAt(now);
         onUpdate?.(id, patch as Partial<WorkspaceNode>);
+        // T-MTAB — fan out the body change to sibling tabs. See scheduleSave
+        // for rationale; this branch is the hot path because content saves
+        // happen on every keystroke burst.
+        const md = (patch.content as { md?: string } | undefined)?.md;
+        if (typeof md === 'string') {
+          emitWorkspaceEvent(workspaceId, {
+            type: 'hoja_updated', nodeId: id, content: { md }, updatedAt: now,
+          });
+        }
       } catch {
         setSaveState('error');
       }
@@ -487,6 +521,65 @@ function HojaNodeImpl({
     };
   }, [lastSavedAt]);
 
+  // ── Multi-tab sync listener (T-MTAB) ─────────────────────────────
+  // Listen for `hoja_updated` events from sibling tabs. Tie-break:
+  //   • Event carries `updatedAt` (epoch ms) of the OTHER tab's save.
+  //   • If our `lastSavedAt` is newer (we wrote AFTER the event was sent),
+  //     ignore the event — our copy is fresher.
+  //   • If the editor is currently focused (user mid-edit) we DO NOT
+  //     auto-overwrite — we'd lose their unsaved keystrokes. Stash the
+  //     incoming md and surface the conflict banner; the user clicks
+  //     "Reload" to apply. Anything they typed in the meantime is theirs.
+  //   • Otherwise (no in-flight edit, no fresher local save) it's safe to
+  //     swap the editor content silently. Mirror that into the parent so
+  //     ReactFlow + chat see the same bytes.
+  //
+  // We stash the latest `lastSavedAt` in a ref so the message handler
+  // doesn't need to be re-bound every save (channel listener churn is
+  // expensive on long sessions).
+  const lastSavedAtRef = useRef<number | null>(null);
+  useEffect(() => { lastSavedAtRef.current = lastSavedAt; }, [lastSavedAt]);
+
+  useEffect(() => {
+    if (!editor) return;
+    return listenWorkspaceEvents(workspaceId, (evt) => {
+      if (evt.type !== 'hoja_updated') return;
+      if (evt.nodeId !== id) return;
+      const localTs = lastSavedAtRef.current;
+      if (localTs !== null && localTs >= evt.updatedAt) return; // we are newer
+      // Don't clobber the user mid-typing — surface a banner and let them
+      // explicitly opt into the reload.
+      if (editor.isFocused) {
+        setExternalUpdate({ md: evt.content.md });
+        return;
+      }
+      // Safe to swap: replace editor content + parent mirror, no save loop
+      // (we don't want to bounce a PATCH back to the server for content we
+      // just received from another tab that already PATCHed).
+      const incomingMd = evt.content.md;
+      lastIncomingMdRef.current = incomingMd;
+      editor.commands.setContent(mdToHtml(incomingMd), { emitUpdate: false });
+      onUpdate?.(id, { content: { md: incomingMd } } as Partial<WorkspaceNode>);
+    });
+  }, [editor, workspaceId, id, onUpdate]);
+
+  // Apply a deferred external update on user click — used by the conflict
+  // banner. Cancels any pending debounced save so we don't ship stale
+  // bytes after the swap.
+  const applyExternalUpdate = useCallback(() => {
+    const pending = externalUpdate;
+    if (!pending || !editor) return;
+    if (saveTimer.current) {
+      clearTimeout(saveTimer.current);
+      saveTimer.current = null;
+    }
+    lastIncomingMdRef.current = pending.md;
+    editor.commands.setContent(mdToHtml(pending.md), { emitUpdate: false });
+    onUpdate?.(id, { content: { md: pending.md } } as Partial<WorkspaceNode>);
+    setExternalUpdate(null);
+    setSaveState('idle');
+  }, [externalUpdate, editor, id, onUpdate]);
+
   // ── Cleanup all timers + editor on unmount ───────────────────────
   // CRITICAL: useEditor returns an instance whose lifecycle the consumer
   // owns. Without editor.destroy() each unmounted hoja leaks its
@@ -577,6 +670,36 @@ function HojaNodeImpl({
           </button>
         </div>
       </div>
+
+      {/* ── Multi-tab conflict banner (T-MTAB) ──────────────────────
+        Surfaces when another tab wrote to the same hoja while the user
+        was typing here. We refuse to auto-overwrite an in-flight edit;
+        the Reload button explicitly applies the incoming content. */}
+      {externalUpdate && (
+        <div
+          role="alert"
+          onMouseDown={(e) => e.stopPropagation()}
+          className="nodrag flex items-start gap-2 px-3 py-2 border-b border-amber-200/70 dark:border-amber-500/30 bg-amber-50/85 dark:bg-amber-900/20 text-[11.5px]"
+        >
+          <AlertCircle className="w-3.5 h-3.5 mt-0.5 text-amber-600 dark:text-amber-400 shrink-0" aria-hidden />
+          <div className="flex-1 min-w-0 leading-snug text-amber-800 dark:text-amber-200">
+            Esta hoja se modificó en otra pestaña. Recargá para ver los cambios.
+          </div>
+          <button
+            type="button"
+            onClick={applyExternalUpdate}
+            className="shrink-0 px-2 py-0.5 rounded-md text-[11px] font-semibold bg-amber-600 hover:bg-amber-700 text-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/50"
+          >
+            Recargar
+          </button>
+          <button
+            type="button"
+            onClick={() => setExternalUpdate(null)}
+            aria-label="Descartar aviso"
+            className="shrink-0 text-amber-700/70 dark:text-amber-300/70 hover:text-amber-900 dark:hover:text-amber-100 text-[14px] leading-none px-1"
+          >×</button>
+        </div>
+      )}
 
       {/* ── TipTap body ─────────────────────────────────────────── */}
       {/*

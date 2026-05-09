@@ -34,6 +34,7 @@ import {
   exportWorkspace, importAsset,
   type WorkspaceRow, type PptxExportResult, type PptxOptions,
 } from '@/services/workspaceApi';
+import { emitWorkspaceEvent } from '@/lib/workspace-broadcast';
 
 // ─── Relative time helper ────────────────────────────────────────────
 function relativeTime(iso: string): string {
@@ -444,6 +445,9 @@ export function WorkspacesListPage() {
     setWorkspaces((prev) => prev.map((w) => w.id === id ? { ...w, title } : w));
     try {
       await updateWorkspace(id, { title });
+      // T-MTAB — broadcast on the workspace's channel so a sibling tab
+      // viewing /workspaces/:id refreshes its header.
+      emitWorkspaceEvent(id, { type: 'workspace_title_changed', title });
     } catch (err) {
       if (typeof prevTitle === 'string') {
         setWorkspaces((prev) => prev.map((w) => w.id === id ? { ...w, title: prevTitle } : w));
