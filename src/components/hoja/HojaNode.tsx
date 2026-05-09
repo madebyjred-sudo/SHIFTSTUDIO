@@ -49,6 +49,7 @@ import TaskItem from '@tiptap/extension-task-item';
 import TextAlign from '@tiptap/extension-text-align';
 import Typography from '@tiptap/extension-typography';
 import CharacterCount from '@tiptap/extension-character-count';
+import Placeholder from '@tiptap/extension-placeholder';
 import { marked } from 'marked';
 import DOMPurify from 'dompurify';
 import {
@@ -463,6 +464,15 @@ function HojaNodeImpl({
       Typography,
       // CharacterCount: exposed via storage; future word-count UI.
       CharacterCount,
+      // Placeholder: surfaces the slash-command affordance for new
+      // users. The HojaSlashExtension is invisible until `/` is typed,
+      // so an empty hoja gives no hint that commands exist. Index.css
+      // already styles `.hoja-prose p.is-editor-empty:first-child::before`
+      // with `content: attr(data-placeholder)` — we just feed it copy.
+      Placeholder.configure({
+        placeholder: 'Escribí o pulsá / para comandos…',
+        emptyEditorClass: 'is-editor-empty',
+      }),
     ],
     content: mdToHtml(initialMd),
     editorProps: {
