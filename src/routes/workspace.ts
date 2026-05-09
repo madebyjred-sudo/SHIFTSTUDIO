@@ -965,6 +965,12 @@ workspaceRouter.post('/:id/transform', async (req: Request, res: Response) => {
     systemPrompt += ` Tone: ${tone}.`;
   }
 
+  // Wire client-disconnect → upstream abort. If the user closes the tab
+  // mid-call, Cerebro/OpenRouter would otherwise keep generating (paid
+  // tokens). callOpenRouter's combineSignals merges this with its timeout.
+  const abortController = new AbortController();
+  req.on('close', () => abortController.abort());
+
   try {
     const t0 = Date.now();
     const text = await callOpenRouter({
@@ -976,6 +982,7 @@ workspaceRouter.post('/:id/transform', async (req: Request, res: Response) => {
       max_tokens: 1500,
       temperature: action === 'expand' ? 0.6 : 0.3,
       timeoutMs: 30_000,
+      signal: abortController.signal,
       tenant: 'shift',
       trace_label: `studio.workspace.transform.${action}`,
     });
@@ -1052,7 +1059,11 @@ interface ArchitectResult {
  * (360 × 280 with 40px gutter — denser than CL2's 660 × 440 because
  *  Studio's canvas viewport is narrower).
  */
-async function runArchitect(workspaceId: string, prompt: string): Promise<ArchitectResult> {
+async function runArchitect(
+  workspaceId: string,
+  prompt: string,
+  signal?: AbortSignal,
+): Promise<ArchitectResult> {
   // LLM calls are routed via Cerebro (`SWARM_API_URL`/v1/llm/invoke); no
   // per-call OpenRouter key check is needed here.
   if (!supabaseAdmin) {
@@ -1121,6 +1132,7 @@ async function runArchitect(workspaceId: string, prompt: string): Promise<Archit
     max_tokens: 16_000,
     temperature: 0.4,
     timeoutMs: 60_000,
+    signal,
     tenant: 'shift',
     trace_label: 'studio.workspace.architect',
   });
@@ -1234,8 +1246,15 @@ workspaceRouter.post('/:id/architect', async (req: Request, res: Response) => {
     return;
   }
 
+  // Wire client-disconnect → upstream abort. If the user closes the tab
+  // mid-build, Cerebro/OpenRouter would otherwise keep generating (paid
+  // tokens). The signal is threaded into runArchitect → callOpenRouter,
+  // where combineSignals merges it with the timeout.
+  const abortController = new AbortController();
+  req.on('close', () => abortController.abort());
+
   try {
-    const result = await runArchitect(id, prompt);
+    const result = await runArchitect(id, prompt, abortController.signal);
     const model = process.env.ARCHITECT_MODEL ?? 'anthropic/claude-sonnet-4.6';
     console.log(
       `[workspace] architect ok ws=${id} hojas=${result.nodes.length} ms=${result.ms}`,
@@ -1692,8 +1711,11 @@ Return ONLY valid JSON matching the schema. No prose, no code fences, no preambl
 
   // ── build: delegate to runArchitect ──
   if (intent === 'build') {
+    // Wire client-disconnect → upstream abort. Threaded into runArchitect.
+    const abortController = new AbortController();
+    req.on('close', () => abortController.abort());
     try {
-      const result = await runArchitect(id, query);
+      const result = await runArchitect(id, query, abortController.signal);
       const model = process.env.ARCHITECT_MODEL ?? 'anthropic/claude-sonnet-4.6';
       res.json({
         ok: true,
@@ -1746,6 +1768,11 @@ Return ONLY valid JSON matching the schema. No prose, no code fences, no preambl
       ((node as Record<string, unknown>).content as Record<string, unknown> | undefined)?.md as string ?? '';
     const editSystem = `You are a creative and strategic editor. ${query}. Return ONLY the resulting markdown text — no preamble.`;
 
+    // Wire client-disconnect → upstream abort. If the user closes the tab
+    // mid-edit, Cerebro/OpenRouter would otherwise keep generating.
+    const abortController = new AbortController();
+    req.on('close', () => abortController.abort());
+
     try {
       const t0 = Date.now();
       const newText = await callOpenRouter({
@@ -1757,6 +1784,7 @@ Return ONLY valid JSON matching the schema. No prose, no code fences, no preambl
         max_tokens: 1500,
         temperature: 0.3,
         timeoutMs: 30_000,
+        signal: abortController.signal,
         tenant: 'shift',
         trace_label: 'studio.workspace.turn.edit_selected',
       });
@@ -1816,6 +1844,11 @@ Return ONLY valid JSON matching the schema. No prose, no code fences, no preambl
       ((node as Record<string, unknown>).content as Record<string, unknown> | undefined)?.md as string ?? '';
     const editSystem = `You are a creative and strategic editor. ${query}. Return ONLY the resulting markdown text — no preamble.`;
 
+    // Wire client-disconnect → upstream abort. If the user closes the tab
+    // mid-edit, Cerebro/OpenRouter would otherwise keep generating.
+    const abortController = new AbortController();
+    req.on('close', () => abortController.abort());
+
     try {
       const t0 = Date.now();
       const newText = await callOpenRouter({
@@ -1827,6 +1860,7 @@ Return ONLY valid JSON matching the schema. No prose, no code fences, no preambl
         max_tokens: 1500,
         temperature: 0.3,
         timeoutMs: 30_000,
+        signal: abortController.signal,
         tenant: 'shift',
         trace_label: 'studio.workspace.turn.edit_by_match',
       });

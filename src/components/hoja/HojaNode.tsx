@@ -50,6 +50,7 @@ import TextAlign from '@tiptap/extension-text-align';
 import Typography from '@tiptap/extension-typography';
 import CharacterCount from '@tiptap/extension-character-count';
 import { marked } from 'marked';
+import DOMPurify from 'dompurify';
 import {
   GripHorizontal, Trash2, Check, Loader2, AlertCircle,
 } from 'lucide-react';
@@ -84,16 +85,45 @@ const COLOR_ACCENTS: Record<NodeColor, string> = {
 //   highlight (mark), text-align (data attr only, no md analog → kept
 //   as raw HTML when present)
 
+// SECURITY: marked@18 removed its built-in sanitizer and the output of
+// this function is fed straight into TipTap's `setContent` (which renders
+// HTML into the editor DOM). Both the marked path AND the "already HTML"
+// fast path must run through DOMPurify or a poisoned `content.md` in the
+// DB (or a malicious server response) could execute scripts in the
+// canvas. The "already HTML" branch is especially risky — older rows
+// saved before the editor pipeline was hardened may contain raw HTML.
+const PURIFY_CONFIG = {
+  ALLOWED_TAGS: [
+    'a', 'p', 'br', 'strong', 'em', 'code', 'pre', 'ul', 'ol', 'li',
+    'blockquote', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'hr', 'img',
+    'table', 'thead', 'tbody', 'tr', 'th', 'td', 'del', 'ins', 'sub',
+    'sup', 'mark', 'span', 'div',
+  ],
+  ALLOWED_ATTR: ['href', 'title', 'alt', 'src', 'class', 'target', 'rel'],
+  ALLOW_DATA_ATTR: false,
+  FORBID_TAGS: [
+    'script', 'style', 'iframe', 'object', 'embed', 'form',
+    'input', 'textarea', 'button', 'svg',
+  ],
+  FORBID_ATTR: [
+    'onerror', 'onload', 'onclick', 'onmouseover', 'onfocus', 'onblur',
+    'onchange', 'onsubmit', 'onkeydown', 'onkeyup', 'onkeypress',
+    'autofocus', 'formaction', 'formmethod', 'xmlns:xlink',
+  ],
+  ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto|tel):|[^a-z]|[a-z+.-]+(?:[^a-z+.\-:]|$))/i,
+};
+
 function mdToHtml(md: string): string {
   if (!md.trim()) return '';
   // Already HTML? (round-trip from a previous save). Detect by leading
   // tag — heuristic but cheap. Marked is tolerant either way.
   if (/^\s*<(h[1-6]|p|ul|ol|blockquote|pre|hr|div|figure|table)\b/i.test(md)) {
-    return md;
+    return DOMPurify.sanitize(md, PURIFY_CONFIG) as unknown as string;
   }
   try {
     const out = marked.parse(md, { async: false, breaks: true, gfm: true });
-    return typeof out === 'string' ? out : '';
+    const html = typeof out === 'string' ? out : '';
+    return DOMPurify.sanitize(html, PURIFY_CONFIG) as unknown as string;
   } catch {
     // Fall back to plain paragraph if parsing trips on weird input.
     return `<p>${escapeHtml(md)}</p>`;

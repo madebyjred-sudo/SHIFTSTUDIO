@@ -7,16 +7,25 @@
  *      and the supabase admin client is configured. We call
  *      `auth.getUser(token)` and trust the resolved id.
  *
- *   2. Frontend-managed bypass — frontend in `VITE_BYPASS_AUTH=true` mode
- *      sends `x-user-id: <uuid>` directly. We trust it because the BFF is
- *      not internet-exposed in this mode (it's behind the Studio dev
- *      tunnel / Authelia gateway). This lets the canvas persist data per
- *      profile even without a real session.
+ *      ⚠ HARD-FAIL: if a Bearer token is supplied but verification fails
+ *      (revoked / expired / network blip) we return `null` immediately —
+ *      we do NOT fall through to the x-user-id branch. Otherwise an
+ *      attacker could send a stale Bearer + spoofed x-user-id and ride
+ *      the silent fallback.
  *
- *   3. Anon fallback — no headers at all. Returns the all-zero UUID so
- *      bypass-mode demos work without crashing on writes. This is dev-
- *      only behavior; production should never hit it because the proxy
- *      always injects an x-user-id.
+ *   2. Frontend-managed bypass — frontend in `VITE_BYPASS_AUTH=true` mode
+ *      sends `x-user-id: <uuid>` directly. Trusted ONLY when both:
+ *        • `NODE_ENV !== 'production'`
+ *        • `STUDIO_TRUST_HEADER_USER_ID === 'true'`
+ *      In production the header is ignored regardless of any other env
+ *      var — Vercel does not strip arbitrary client headers, and the
+ *      CORS allow-list lets browsers send `x-user-id`, so this is the
+ *      only gate keeping x-user-id from being a free spoofing primitive.
+ *      The supplied value must also pass `isValidUuid` to be accepted.
+ *
+ *   3. Anon fallback — no headers at all. Returns the all-zero UUID in
+ *      dev only. Production forcibly disables anon mode regardless of
+ *      `STUDIO_ALLOW_ANON` (we warn at startup if the env var was set).
  *
  * Returns `string | null`. NEVER throws — handlers decide whether to
  * 401 (typical for writes) or accept anon (typical for reads).
@@ -29,34 +38,71 @@ import { supabaseAdmin } from './supabaseAdminClient.js';
 
 const ANON_USER_ID = '00000000-0000-0000-0000-000000000000';
 
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+
+// x-user-id is honored ONLY in dev AND when the operator explicitly opts
+// in via STUDIO_TRUST_HEADER_USER_ID=true. Production is fail-closed.
+const ALLOW_HEADER_USER_ID =
+  !IS_PRODUCTION && process.env.STUDIO_TRUST_HEADER_USER_ID === 'true';
+
+// Anon fallback is dev-only. Even if the operator sets STUDIO_ALLOW_ANON=true
+// in production, we ignore it (and warn at startup so the misconfig is loud).
+const ALLOW_ANON =
+  !IS_PRODUCTION && process.env.STUDIO_ALLOW_ANON === 'true';
+
+if (IS_PRODUCTION && process.env.STUDIO_ALLOW_ANON === 'true') {
+  console.warn(
+    '[auth] STUDIO_ALLOW_ANON=true ignored in production — anon fallback is forcibly disabled.',
+  );
+}
+if (IS_PRODUCTION && process.env.STUDIO_TRUST_HEADER_USER_ID === 'true') {
+  console.warn(
+    '[auth] STUDIO_TRUST_HEADER_USER_ID=true ignored in production — x-user-id is forcibly disabled.',
+  );
+}
+
 export async function getUserIdFromRequest(req: Request): Promise<string | null> {
-  // 1. JWT route — only attempted if we have an admin client AND a Bearer token
+  // 1. JWT route — only attempted if we have an admin client AND a Bearer token.
+  //    If a Bearer token IS present, this branch is authoritative: success → ok,
+  //    any failure → return null (caller responds 401). Never silently fall
+  //    through to x-user-id.
   const authHeader = req.headers.authorization || req.headers.Authorization;
   const headerStr = Array.isArray(authHeader) ? authHeader[0] : authHeader;
   if (headerStr && typeof headerStr === 'string' && headerStr.startsWith('Bearer ')) {
     const token = headerStr.slice('Bearer '.length).trim();
-    if (token && supabaseAdmin) {
-      try {
-        const { data, error } = await supabaseAdmin.auth.getUser(token);
-        if (!error && data?.user?.id) return data.user.id;
-      } catch (err) {
-        // Soft-fail to next layer; never let auth crash the handler.
-        console.warn('[auth] supabase.auth.getUser threw:', (err as Error).message);
-      }
+    if (!token || !supabaseAdmin) {
+      // Malformed Bearer (empty token) or no admin client to verify with —
+      // fail closed. Do NOT consult x-user-id.
+      return null;
+    }
+    try {
+      const { data, error } = await supabaseAdmin.auth.getUser(token);
+      if (!error && data?.user?.id) return data.user.id;
+      // Verification returned an error, or no user — token is invalid.
+      // Fail closed: return null so the route responds 401.
+      return null;
+    } catch (err) {
+      // Network blip / supabase outage — still fail closed. Surface a
+      // warning so ops can see the failure mode in logs.
+      console.warn('[auth] supabase.auth.getUser threw:', (err as Error).message);
+      return null;
     }
   }
 
-  // 2. Frontend-managed bypass
-  const xUser = req.headers['x-user-id'];
-  const xUserStr = Array.isArray(xUser) ? xUser[0] : xUser;
-  if (xUserStr && typeof xUserStr === 'string' && xUserStr.length > 0) {
-    return xUserStr;
+  // 2. Frontend-managed bypass — DEV ONLY, gated, UUID-validated.
+  if (ALLOW_HEADER_USER_ID) {
+    const xUser = req.headers['x-user-id'];
+    const xUserStr = Array.isArray(xUser) ? xUser[0] : xUser;
+    if (xUserStr && typeof xUserStr === 'string' && xUserStr.length > 0) {
+      if (isValidUuid(xUserStr)) return xUserStr;
+      // Malformed → reject explicitly rather than silently pass through.
+      return null;
+    }
   }
 
-  // 3. Anon fallback — only in dev / bypass mode
-  if (process.env.NODE_ENV !== 'production' || process.env.STUDIO_ALLOW_ANON === 'true') {
-    return ANON_USER_ID;
-  }
+  // 3. Anon fallback — dev only AND opt-in via STUDIO_ALLOW_ANON. In
+  //    production this is always null regardless of env.
+  if (ALLOW_ANON) return ANON_USER_ID;
 
   return null;
 }

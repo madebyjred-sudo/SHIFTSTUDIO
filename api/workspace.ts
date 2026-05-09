@@ -77,10 +77,16 @@ function getApp(): express.Express {
       res.setHeader('Access-Control-Allow-Origin', origin);
     }
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
-    res.setHeader(
-      'Access-Control-Allow-Headers',
-      'Content-Type, Authorization, x-tenant-id, x-user-id',
-    );
+    // x-user-id is intentionally OMITTED from the allow-list in production:
+    // the auth helper rejects it as a spoofing vector, and exposing it via
+    // CORS would let a browser-side attacker pre-flight-spoof the header
+    // even before the server-side check runs. Dev keeps it for local
+    // bypass-mode demos.
+    const allowHeaders =
+      process.env.NODE_ENV === 'production'
+        ? 'Content-Type, Authorization, x-tenant-id'
+        : 'Content-Type, Authorization, x-tenant-id, x-user-id';
+    res.setHeader('Access-Control-Allow-Headers', allowHeaders);
     res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition');
     if (req.method === 'OPTIONS') {
       res.status(204).end();
