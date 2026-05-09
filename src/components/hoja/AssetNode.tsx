@@ -161,6 +161,21 @@ function AssetNodeImpl({
             </div>
           )}
         </div>
+
+        {/* Phase 3.G — "no indexado" badge for documents/audio whose
+            extracted_text is missing or empty. The chat agent can't
+            read these assets, so we surface that the file exists on the
+            canvas but won't be searchable in conversation. */}
+        {(data.type === 'document' || data.type === 'audio') &&
+         !(content?.extracted_text && content.extracted_text.length > 0) && (
+          <div
+            className="absolute bottom-2 right-2 text-[10px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-700 dark:text-amber-300 pointer-events-none"
+            title="Este archivo no fue indexado para chat (muy grande o tipo no soportado)."
+            aria-label="Archivo no indexado para chat"
+          >
+            ⚠ no indexado
+          </div>
+        )}
       </div>
 
       {/* ── Lightbox for images ────────────────────────────────── */}
@@ -208,5 +223,11 @@ export const AssetNode = memo(AssetNodeImpl, (prev, next) => {
   if (ac?.url !== bc?.url) return false;
   if (ac?.filename !== bc?.filename) return false;
   if (ac?.size !== bc?.size) return false;
+  // Phase 3.G: re-render when indexing status changes — the "no indexado"
+  // badge depends on extracted_text presence, so flipping this must
+  // bypass memo bailout.
+  const aHasText = !!(ac?.extracted_text && ac.extracted_text.length > 0);
+  const bHasText = !!(bc?.extracted_text && bc.extracted_text.length > 0);
+  if (aHasText !== bHasText) return false;
   return true;
 });

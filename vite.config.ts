@@ -58,9 +58,10 @@ export default defineConfig(({ mode }) => {
             ) {
               return 'tiptap-vendor';
             }
-            if (id.includes('node_modules/@supabase/')) {
-              return 'supabase-vendor';
-            }
+            // Phase 3.G: dropped the @supabase/ → supabase-vendor rule.
+            // The browser bundle no longer touches @supabase/* directly
+            // (only the server hits it through openRouterDirect /
+            // workspaceApi → fetch), so the chunk was emitting empty.
             if (
               id.includes('node_modules/react-markdown/') ||
               id.includes('node_modules/remark-') ||

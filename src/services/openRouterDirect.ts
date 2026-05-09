@@ -95,6 +95,14 @@ interface InvokeResponse {
 }
 
 /**
+ * Module-level guard so the "telemetry disabled" warning fires at most
+ * once per process. Without it, a missing SUPABASE_SERVICE_ROLE_KEY
+ * would silently swallow every call_log write — Phase 3 cost telemetry
+ * just wouldn't show up and there'd be no signal in the logs.
+ */
+let _adminWarnIssued = false;
+
+/**
  * Fire-and-forget INSERT into studio_ai_call_log. Never throws —
  * a logging failure must not break the user-facing response.
  *
@@ -114,7 +122,15 @@ function logAiCall(row: {
   error_code?: string | null;
   error_message?: string | null;
 }): void {
-  if (!supabaseAdmin) return;
+  if (!supabaseAdmin) {
+    if (!_adminWarnIssued) {
+      _adminWarnIssued = true;
+      console.warn(
+        '[ai_call_log] supabaseAdmin not available — telemetry disabled. Set SUPABASE_SERVICE_ROLE_KEY.',
+      );
+    }
+    return;
+  }
   const usage = row.usage ?? {};
   const cost = computeCost(row.model, usage);
   void (async () => {

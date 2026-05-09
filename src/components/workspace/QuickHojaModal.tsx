@@ -23,6 +23,31 @@ import { Loader2, Sparkles, X } from 'lucide-react';
 import { runArchitect, type WorkspaceNode } from '@/services/workspaceApi';
 import { cn } from '@/lib/utils';
 
+// ─── Error translations (Phase 3.G) ───────────────────────────────────
+// The architect / turn endpoints surface stable English error codes
+// (e.g. `architect_invalid_json`) that previously bled through to the
+// user. Map the known set into Spanish; fall back to the raw message
+// when nothing matches so we never hide an unknown failure mode.
+const ERROR_TRANSLATIONS: Record<string, string> = {
+  architect_invalid_json: 'El modelo devolvió respuesta inválida. Probá de nuevo.',
+  architect_empty_response: 'El modelo no generó hojas. Probá de nuevo.',
+  architect_below_minimum: 'El modelo generó muy pocas hojas. Probá con un prompt más claro.',
+  architect_upstream_error: 'Error temporal del servicio. Probá de nuevo.',
+  prompt_too_long: 'El prompt es muy largo (máx 4000 caracteres).',
+  prompt_required: 'Escribí un prompt antes de generar.',
+  not_authenticated: 'Tu sesión expiró. Recargá la página.',
+  daily_token_budget_exhausted: 'Llegaste al tope diario de tokens.',
+};
+
+function translateError(msg: string): string {
+  const code = msg.match(/^([a-z_]+)/)?.[1];
+  if (code && ERROR_TRANSLATIONS[code]) return ERROR_TRANSLATIONS[code];
+  if (msg.startsWith('HTTP 504') || msg.includes('504')) {
+    return 'El servidor demoró demasiado. Probá de nuevo.';
+  }
+  return msg;
+}
+
 // ─── Types ────────────────────────────────────────────────────────────
 
 interface Props {
@@ -98,7 +123,7 @@ export function QuickHojaModal({ open, onClose, workspaceId, onCreated }: Props)
       onClose();
     } catch (err) {
       if (ac.signal.aborted) return;
-      setError((err as Error).message);
+      setError(translateError((err as Error).message));
     } finally {
       if (abortRef.current === ac) abortRef.current = null;
       setLoading(false);
