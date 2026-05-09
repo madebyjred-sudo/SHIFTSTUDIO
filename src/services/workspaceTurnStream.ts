@@ -162,7 +162,12 @@ export async function streamWorkspaceTurn(args: StreamWorkspaceTurnArgs): Promis
 
   const contentType = res.headers.get('content-type') ?? '';
 
-  // ── JSON mode (build / edit_*) ────────────────────────────────────
+  // ── JSON mode (build / edit_* / chat-as-of-2026-05-08) ───────────
+  // Chat used to be SSE but Vercel buffers SSE on Hobby/Pro tiers and
+  // failures truncated to empty responses. Now /turn returns JSON for
+  // every intent. We special-case 'chat' here: the JSON envelope has a
+  // `text` field which we forward as a single token chunk so the chat
+  // panel renders it as one bubble (no token-by-token UX, but reliable).
   if (!contentType.includes('text/event-stream')) {
     try {
       const body = (await res.json()) as Record<string, unknown>;
@@ -172,10 +177,14 @@ export async function streamWorkspaceTurn(args: StreamWorkspaceTurnArgs): Promis
         intent_confidence: body.intent_confidence as number | undefined,
         target_node_id: (body.target_node_id ?? body.node_id) as string | null | undefined,
       });
-      args.onChunk({
-        type: 'workspace_action',
-        payload: body as WorkspaceActionPayload,
-      });
+      if (intent === 'chat' && typeof body.text === 'string') {
+        args.onChunk({ type: 'token', payload: body.text });
+      } else {
+        args.onChunk({
+          type: 'workspace_action',
+          payload: body as WorkspaceActionPayload,
+        });
+      }
       args.onChunk({ type: 'done' });
       args.onDone?.();
     } catch (err) {

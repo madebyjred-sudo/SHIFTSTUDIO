@@ -1428,22 +1428,6 @@ Do NOT include prose. Return only the JSON object.`;
       .filter(Boolean)
       .join('\n\n');
 
-    // Open SSE response.
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.flushHeaders?.();
-
-    if (res.writableEnded) return;
-    res.write(
-      `event: meta\ndata: ${JSON.stringify({
-        intent: 'chat',
-        intent_confidence: classifierConfidence,
-        agent_id: agentId,
-        deep_insight: deepInsight,
-      })}\n\n`,
-    );
-
     // Build OpenRouter messages: system + safe history + current user query.
     const orMessages: OpenRouterMessage[] = [
       { role: 'system', content: scopeSystemPrompt },
@@ -1451,47 +1435,63 @@ Do NOT include prose. Return only the JSON object.`;
       { role: 'user', content: query },
     ];
 
+    // JSON mode (was SSE — switched 2026-05-08 because Vercel buffers SSE on
+    // Hobby/Pro tiers, and SSE failures were silently truncating to empty
+    // responses. With JSON we return a single envelope; specific upstream
+    // errors (402 no credits, 401 invalid key, 429 rate limit) propagate
+    // cleanly to the client. The frontend's streamWorkspaceTurn already
+    // handles JSON-mode responses for build/edit; we surface chat the same
+    // way and have the client render the assembled text as one bubble.
     let assembled = '';
-    let tokensForwarded = 0;
+    let upstreamError: { code: number; message: string } | null = null;
     try {
-      await streamOpenRouter({
+      assembled = await callOpenRouter({
         model: TURN_CHAT_MODEL,
         messages: orMessages,
         temperature: 0.5,
         max_tokens: 4_000,
-        timeoutMs: 90_000,
+        timeoutMs: 55_000, // < Vercel maxDuration of 60s
         signal: abortController.signal,
-        onChunk: (text) => {
-          assembled += text;
-          tokensForwarded++;
-          // Frontend's streamWorkspaceTurn parser expects {type, payload}
-          // envelopes — match that contract for drop-in compatibility
-          // with the CL2-style chat parser the Studio canvas uses.
-          if (res.writableEnded) return;
-          res.write(`data: ${JSON.stringify({ type: 'token', payload: text })}\n\n`);
-        },
       });
       console.log(
-        `[workspace/turn] chat ok tokens=${tokensForwarded} model=${TURN_CHAT_MODEL} ws=${id}`,
+        `[workspace/turn] chat ok chars=${assembled.length} model=${TURN_CHAT_MODEL} ws=${id}`,
       );
-    } catch (streamErr) {
-      const msg = (streamErr as Error).message;
-      console.warn('[workspace/turn] chat stream failed:', msg);
-      if (!res.writableEnded) {
-        res.write(
-          `data: ${JSON.stringify({
-            type: 'token',
-            payload: `\n\n_[error: ${msg}]_`,
-          })}\n\n`,
-        );
-      }
+    } catch (callErr) {
+      const msg = (callErr as Error).message;
+      console.warn('[workspace/turn] chat call failed:', msg);
+      // Parse the OpenRouter error for a clean status code if possible.
+      const codeMatch = msg.match(/openrouter\s+(\d+)/i);
+      const code = codeMatch ? parseInt(codeMatch[1], 10) : 502;
+      upstreamError = { code, message: msg };
     }
 
-    if (!res.writableEnded) {
-      res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
-      res.write(`data: [DONE]\n\n`);
-      res.end();
+    if (upstreamError) {
+      res.status(upstreamError.code === 401 || upstreamError.code === 402 ? 402 : 502).json({
+        ok: false,
+        intent: 'chat',
+        error: 'chat_upstream_failed',
+        detail: upstreamError.message,
+        // Hint for the user — common causes the diagnostic should call out.
+        hint:
+          upstreamError.code === 402
+            ? 'OpenRouter sin créditos. Recarga en https://openrouter.ai/credits.'
+            : upstreamError.code === 401
+              ? 'OPENROUTER_API_KEY inválida o revocada.'
+              : upstreamError.code === 429
+                ? 'Rate limit alcanzado. Espera un momento y vuelve a intentar.'
+                : 'Error desde OpenRouter — ver detail.',
+      });
+      return;
     }
+
+    res.json({
+      ok: true,
+      intent: 'chat',
+      text: assembled,
+      model: TURN_CHAT_MODEL,
+      agent_id: agentId,
+      intent_confidence: classifierConfidence,
+    });
 
     // ── Peaje ingest (fire-and-forget) ──
     // Compute message_id and upstream_model fallbacks at THIS call site
