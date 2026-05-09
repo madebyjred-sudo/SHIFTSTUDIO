@@ -4,3 +4,4 @@
  * mount. Add new routers here as they land.
  */
 export { workspaceRouter } from './workspace.js';
+export { adminRouter } from './admin.js';

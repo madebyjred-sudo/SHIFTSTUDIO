@@ -4,7 +4,7 @@ import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
 import { AGENT_MAP, MODEL_MAP, isDebateRequest } from "./src/shared/constants.js";
-import { workspaceRouter } from "./src/routes/index.js";
+import { workspaceRouter, adminRouter } from "./src/routes/index.js";
 import { correlationMiddleware } from "./src/routes/workspace.js";
 import { logger } from "./src/lib/logger.js";
 
@@ -326,6 +326,10 @@ async function startServer() {
   // Service-role Supabase client; manually filters by user_id from
   // jwt / x-user-id / anon fallback (see src/services/auth.ts).
   app.use("/api/workspace", workspaceRouter);
+
+  // Admin BFF — operator views over studio_ai_call_log. Gated on the
+  // ADMIN_USER_IDS env var allowlist (see src/routes/admin.ts).
+  app.use("/api/admin", adminRouter);
 
   // List available agents endpoint (Proxy to Swarm)
   app.get("/api/agents", async (req, res) => {
