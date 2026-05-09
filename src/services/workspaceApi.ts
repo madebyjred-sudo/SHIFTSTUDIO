@@ -553,30 +553,6 @@ export async function runArchitect(
   return { nodes: json.nodes ?? [] };
 }
 
-export interface TurnRequest {
-  message: string;
-  selected_node_id?: string | null;
-  history?: Array<{ role: 'user' | 'assistant'; content: string }>;
-}
-
-export interface TurnResponse {
-  reply?: string;
-  intent?: string;
-  node_id?: string;
-  new_content?: { md?: string };
-  nodes?: WorkspaceNode[];
-}
-
-export async function runTurn(workspaceId: string, body: TurnRequest): Promise<TurnResponse> {
-  const res = await fetch(`/api/workspace/${workspaceId}/turn`, {
-    method: 'POST',
-    headers: await authedHeaders({ 'Content-Type': 'application/json' }),
-    body: JSON.stringify(body),
-  });
-  const json = await handleJson<{ ok: boolean } & TurnResponse>(res);
-  return json;
-}
-
 // ─── Chat message persistence ─────────────────────────────────────────
 //
 // Server-side persistence for ChatPanel conversations. localStorage stays
