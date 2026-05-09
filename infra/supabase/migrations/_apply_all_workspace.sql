@@ -11,6 +11,7 @@
 --   0006_studio_workspace_chat_messages_fk_userid.sql        (FK chat_messages.user_id → auth.users)
 --   0007_studio_workspace_citations_dedup_per_workspace.sql  (per-workspace citation dedup)
 --   0008_studio_ai_call_log.sql                              (per-LLM-call cost + token telemetry)
+--   0009_architect_advisory_lock.sql                         (advisory-lock helper for /architect concurrency)
 --
 -- Idempotent: every statement uses CREATE IF NOT EXISTS / DROP IF EXISTS /
 -- ON CONFLICT DO NOTHING / pg_policies guards. Safe to re-run.
@@ -359,6 +360,73 @@ create index if not exists studio_ai_call_log_workspace
   on studio_ai_call_log(workspace_id, created_at desc) where workspace_id is not null;
 
 alter table studio_ai_call_log enable row level security;
+
+-- ════════════════════════════════════════════════════════════════════
+-- 0009_architect_advisory_lock.sql
+-- ════════════════════════════════════════════════════════════════════
+-- studio_architect_insert_with_offset
+-- Serializes /architect runs on the same workspace via a Postgres
+-- transaction-scoped advisory lock. Folds the maxBottom read + insert
+-- into one SECURITY DEFINER function so the lock survives across both
+-- steps (a TS-side pg_advisory_xact_lock would release between RPC
+-- round-trips and so wouldn't actually serialize anything).
+
+create or replace function studio_architect_insert_with_offset(
+  p_workspace_id uuid,
+  p_rows         jsonb
+)
+returns setof studio_workspace_nodes
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  lock_key    bigint := abs(hashtextextended(p_workspace_id::text, 0));
+  v_max_bottom float;
+  v_offset_y   float;
+  v_row        jsonb;
+  v_inserted   studio_workspace_nodes%rowtype;
+begin
+  if not pg_try_advisory_xact_lock(lock_key) then
+    raise exception 'architect_in_progress' using errcode = 'P0001';
+  end if;
+
+  select coalesce(max(n.y + coalesce(n.height, 280)), 0)
+  into   v_max_bottom
+  from   studio_workspace_nodes n
+  where  n.workspace_id = p_workspace_id;
+
+  if v_max_bottom > 0 then
+    v_offset_y := v_max_bottom + 40;
+  else
+    v_offset_y := 80;
+  end if;
+
+  for v_row in select * from jsonb_array_elements(p_rows)
+  loop
+    insert into studio_workspace_nodes (
+      workspace_id, type, title, subtitle, content, color,
+      x, y, width, height
+    )
+    values (
+      p_workspace_id,
+      coalesce(v_row->>'type', 'hoja'),
+      coalesce(v_row->>'title', 'Sin título'),
+      coalesce(v_row->>'subtitle', ''),
+      coalesce((v_row->'content')::jsonb, '{}'::jsonb),
+      coalesce(v_row->>'color', 'default'),
+      coalesce((v_row->>'x')::float, 0),
+      coalesce((v_row->>'y')::float, 0) + v_offset_y,
+      coalesce((v_row->>'width')::float, 360),
+      coalesce((v_row->>'height')::float, 280)
+    )
+    returning * into v_inserted;
+
+    return next v_inserted;
+  end loop;
+
+  return;
+end $$;
 
 -- ════════════════════════════════════════════════════════════════════
 -- END.  Verify in Supabase Studio → Table Editor / Storage that the

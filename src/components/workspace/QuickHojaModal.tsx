@@ -33,6 +33,7 @@ const ERROR_TRANSLATIONS: Record<string, string> = {
   architect_empty_response: 'El modelo no generó hojas. Probá de nuevo.',
   architect_below_minimum: 'El modelo generó muy pocas hojas. Probá con un prompt más claro.',
   architect_upstream_error: 'Error temporal del servicio. Probá de nuevo.',
+  architect_in_progress: 'Otra generación está en curso. Esperá unos segundos.',
   prompt_too_long: 'El prompt es muy largo (máx 4000 caracteres).',
   prompt_required: 'Escribí un prompt antes de generar.',
   not_authenticated: 'Tu sesión expiró. Recargá la página.',

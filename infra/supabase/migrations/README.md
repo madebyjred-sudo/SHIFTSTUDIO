@@ -37,6 +37,7 @@ checks), so reruns are safe.
 | 0006 | `0006_studio_workspace_chat_messages_fk_userid.sql`        | Adds missing FK `studio_workspace_chat_messages.user_id → auth.users(id) ON DELETE CASCADE`                         |
 | 0007 | `0007_studio_workspace_citations_dedup_per_workspace.sql`  | Adds `workspace_id` column and tightens citation dedup to `(user_id, workspace_id, chunk_id)`                       |
 | 0008 | `0008_studio_ai_call_log.sql`                              | Creates `studio_ai_call_log` for per-LLM-call cost + token telemetry (Phase 3.B Studio-side cost attribution)        |
+| 0009 | `0009_architect_advisory_lock.sql`                         | Adds `studio_architect_insert_with_offset()` — advisory-lock helper that serializes concurrent `/architect` runs on the same workspace |
 
 ## Tables created
 
@@ -49,6 +50,7 @@ checks), so reruns are safe.
 Plus:
 
 - Function `studio_touch_updated_at()` — generic trigger fn for `updated_at`.
+- Function `studio_architect_insert_with_offset(uuid, jsonb)` — SECURITY DEFINER helper called by `runArchitect` to insert a deck of hojas under a transaction-scoped advisory lock, preventing concurrent /architect runs from racing on the max-Y read.
 - Triggers `studio_ws_touch`, `studio_wsn_touch` — call the fn on UPDATE.
 - Storage bucket `studio-workspace-assets` (public read, owner-prefixed write, 500MB cap).
 
@@ -78,6 +80,7 @@ psql "$SUPABASE_DB_URL" -f 0005_studio_workspace_chat_messages.sql
 psql "$SUPABASE_DB_URL" -f 0006_studio_workspace_chat_messages_fk_userid.sql
 psql "$SUPABASE_DB_URL" -f 0007_studio_workspace_citations_dedup_per_workspace.sql
 psql "$SUPABASE_DB_URL" -f 0008_studio_ai_call_log.sql
+psql "$SUPABASE_DB_URL" -f 0009_architect_advisory_lock.sql
 ```
 
 ### Option C — Supabase Studio SQL editor (one-shot)
@@ -110,8 +113,8 @@ You can rerun any migration without producing duplicates or errors.
 Each file ends with a commented `-- DOWN ROLLBACK` block listing the exact
 DROP statements needed. To roll back:
 
-1. **Run DOWN sections in reverse order** (0008 first, then 0007 → 0006 →
-   0005 → 0004 → 0003 → 0002 → 0001).
+1. **Run DOWN sections in reverse order** (0009 first, then 0008 → 0007 →
+   0006 → 0005 → 0004 → 0003 → 0002 → 0001).
 2. Uncomment the statements inside the `-- DOWN ROLLBACK` block of the file
    you want to revert.
 3. Execute via psql or the Supabase SQL editor.

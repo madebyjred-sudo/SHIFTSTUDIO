@@ -1145,15 +1145,12 @@ async function runArchitect(
         canvasContextBlocks.join('\n\n---\n\n')
       : '';
 
-  // Compute next free Y so multiple architect runs stack vertically.
-  const { data: existing } = await supabaseAdmin
-    .from('studio_workspace_nodes')
-    .select('y, height')
-    .eq('workspace_id', workspaceId);
-  const maxBottom = (existing ?? []).reduce(
-    (m, n) => Math.max(m, ((n.y as number) ?? 0) + ((n.height as number) ?? 0)),
-    0,
-  );
+  // Note: the next-free-Y read used to live here as a separate SELECT,
+  // but we moved it into studio_architect_insert_with_offset() so it
+  // runs under the same xact-scoped advisory lock as the INSERT. Two
+  // tabs hitting /architect on the same workspace would otherwise both
+  // observe the same maxBottom and stack their decks on top of each
+  // other (Debug 2 Flow 4). See migration 0009.
 
   // Call Cerebro (which routes to the architect model). Cerebro's
   // /v1/llm/invoke does not expose `response_format`, so we append a
@@ -1221,36 +1218,54 @@ async function runArchitect(
   }
 
   // Layout: 4-column grid, 360×280 with 40px gutter, 80px left margin.
+  // Y-positions are emitted relative to a 0 baseline; the SQL helper
+  // adds the workspace-wide y-offset under an advisory lock.
   const NODE_W = 360;
   const NODE_H = 280;
   const GAP = 40;
   const COLS = 4;
   const VALID_COLORS = new Set(['default', 'burgundy', 'ink', 'sage', 'amber']);
-  const yOffset = maxBottom > 0 ? maxBottom + GAP : 80;
 
   const rows = parsed.hojas.slice(0, 7).map((h, i) => {
     const col = i % COLS;
     const row = Math.floor(i / COLS);
     const colorRaw = String(h.color ?? 'default');
     return {
-      workspace_id: workspaceId,
+      // workspace_id, type, color, title, subtitle, content carry the
+      // same shape as before — the SQL helper just routes them into
+      // the same INSERT it used to do directly. x is final; y is
+      // relative (the helper offsets it by maxBottom + GAP, or 80 on
+      // an empty canvas).
       type: 'hoja',
       title: String(h.title ?? 'Untitled').slice(0, 200),
       subtitle: String(h.subtitle ?? '').slice(0, 200),
       content: { md: String(h.content_md ?? '') },
       color: VALID_COLORS.has(colorRaw) ? colorRaw : 'default',
       x: col * (NODE_W + GAP) + 80,
-      y: yOffset + row * (NODE_H + GAP),
+      y: row * (NODE_H + GAP),
       width: NODE_W,
       height: NODE_H,
     };
   });
 
-  const { data: created, error: insErr } = await supabaseAdmin
-    .from('studio_workspace_nodes')
-    .insert(rows)
-    .select('*');
-  if (insErr) throw new Error(insErr.message);
+  // Single RPC: acquires xact-scoped advisory lock keyed on workspaceId,
+  // computes maxBottom, inserts every row offset by maxBottom + 40 (or
+  // 80 if the workspace is empty). Concurrent runs on the same
+  // workspace race only on the lock — the loser raises P0001 with
+  // message 'architect_in_progress', which we surface so the caller
+  // (and ultimately the frontend) can render a friendly retry hint.
+  const { data: created, error: insErr } = await supabaseAdmin.rpc(
+    'studio_architect_insert_with_offset',
+    { p_workspace_id: workspaceId, p_rows: rows },
+  );
+  if (insErr) {
+    if (insErr.message?.includes('architect_in_progress')) {
+      throw Object.assign(new Error('architect_in_progress'), {
+        code: 'architect_in_progress',
+      });
+    }
+    throw new Error(insErr.message);
+  }
 
   // Bump workspace updated_at so the listing refresh picks up the change.
   try {
@@ -1319,7 +1334,12 @@ workspaceRouter.post('/:id/architect', async (req: Request, res: Response) => {
   } catch (err) {
     const msg = (err as Error).message;
     reqLog(req).warn('workspace.architect.failed', { message: msg });
-    if (msg.startsWith('openrouter_')) {
+    if (msg === 'architect_in_progress') {
+      // Another /architect run on the same workspace already holds the
+      // advisory lock. 409 lets the client retry without surfacing a
+      // scary 5xx.
+      res.status(409).json({ ok: false, error: 'architect_in_progress' });
+    } else if (msg.startsWith('openrouter_')) {
       res.status(502).json({ ok: false, error: 'architect_upstream_error', detail: msg.slice(0, 200) });
     } else {
       res.status(500).json({ ok: false, error: msg });
@@ -1796,7 +1816,9 @@ Return ONLY valid JSON matching the schema. No prose, no code fences, no preambl
     } catch (err) {
       const msg = (err as Error).message;
       reqLog(req).warn('workspace.turn.build.failed', { message: msg });
-      if (msg.startsWith('openrouter_')) {
+      if (msg === 'architect_in_progress') {
+        res.status(409).json({ ok: false, intent: 'build', error: 'architect_in_progress' });
+      } else if (msg.startsWith('openrouter_')) {
         res
           .status(502)
           .json({ ok: false, intent: 'build', error: 'architect_upstream_error', detail: msg.slice(0, 200) });
