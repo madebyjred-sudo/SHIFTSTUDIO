@@ -355,10 +355,39 @@ const ASSET_MIME_ALLOWLIST: ReadonlyArray<string> = [
 
 const STUDIO_ASSETS_BUCKET = 'studio-workspace-assets';
 
+/**
+ * Progress payload passed to `importAsset`'s `onProgress` callback while
+ * the file uploads. Bytes mirror XHR's `loaded`/`total`; `percent` is a
+ * pre-rounded 0-100 integer for convenience.
+ */
+export interface UploadProgress {
+  bytesUploaded: number;
+  bytesTotal: number;
+  percent: number;
+}
+
 export async function importAsset(
   workspaceId: string,
   file: File,
-  opts: { x?: number; y?: number; width?: number; height?: number } = {},
+  opts: {
+    x?: number;
+    y?: number;
+    width?: number;
+    height?: number;
+    /**
+     * AbortSignal — when aborted, cancels the in-flight XHR upload and
+     * rejects with `Error('Upload aborted')`. The post-upload finalize
+     * call is not abortable today (server-side text extraction races
+     * with abort and the orphan blob is cleaned up by the BFF anyway).
+     */
+    signal?: AbortSignal;
+    /**
+     * Fired on each XHR progress event during the storage PUT. Browsers
+     * without `lengthComputable` progress events skip these callbacks;
+     * the UI should fall back to a 0% / 100% binary state in that case.
+     */
+    onProgress?: (p: UploadProgress) => void;
+  } = {},
 ): Promise<WorkspaceNode> {
   if (!supabase) {
     throw new ApiError('supabase_unavailable', 503);
@@ -405,32 +434,95 @@ export async function importAsset(
   const path = `${userId}/${workspaceId}/${objectId}-${safeName}`;
 
   // Direct upload — bypasses Vercel entirely. The 4.5MB body limit only
-  // applies to Vercel function invocations; supabase-js posts straight to
-  // the Storage REST API. Surfacing the storage error verbatim is critical
-  // (silent supabase-js hangs were "no funciona" symptom for large files).
+  // applies to Vercel function invocations; the storage REST API has its
+  // own 500MB cap (handled above).
+  //
+  // Two-step flow (replaces the old `supabase.storage.upload(path, file)`):
+  //   1. Ask Supabase for a signed upload URL — RLS still gates this, so
+  //      the user's session JWT must allow `insert` on the target path.
+  //   2. PUT the file via XHR so we can wire `xhr.upload.onprogress`
+  //      (the supabase-js fetch wrapper does not surface progress events).
+  //
+  // Surfacing the storage error verbatim is critical — silent supabase-js
+  // hangs were the "no funciona" symptom for large files pre-Phase 2.
   console.log(
     `[importAsset] uploading ${file.name} (${(file.size / 1024 / 1024).toFixed(2)}MB, ${file.type}) → ${path}`,
   );
   const t0 = Date.now();
-  const { error: upErr } = await supabase.storage
+
+  // Step 1 — signed URL (token baked into the query string).
+  const { data: signedUrlData, error: signErr } = await supabase.storage
     .from(STUDIO_ASSETS_BUCKET)
-    .upload(path, file, {
-      contentType: file.type,
-      upsert: false,
-    });
-  if (upErr) {
-    console.error('[importAsset] storage upload failed:', upErr);
-    // supabase-js error shape: { message, statusCode?, error? }. Status 413
-    // means we beat the in-flight cap (rare given client check above) or
-    // the bucket cap; status 400 / "row level security" means RLS denied.
-    const detail =
-      ('statusCode' in upErr && (upErr as { statusCode?: string }).statusCode === '413')
-        ? 'Archivo excede el límite del bucket (500MB).'
-        : /row level security|policy/i.test(upErr.message)
-          ? 'Permisos de Supabase Storage denegaron la subida — sesión inválida o ruta fuera de tu carpeta.'
-          : upErr.message;
-    throw new ApiError(`Falla al subir: ${detail}`, 500);
+    .createSignedUploadUrl(path);
+  if (signErr || !signedUrlData) {
+    console.error('[importAsset] createSignedUploadUrl failed:', signErr);
+    const msg = signErr?.message ?? 'unknown';
+    const detail = /row level security|policy/i.test(msg)
+      ? 'Permisos de Supabase Storage denegaron la subida — sesión inválida o ruta fuera de tu carpeta.'
+      : msg;
+    throw new ApiError(`Falla al crear URL de subida: ${detail}`, 500);
   }
+
+  // Step 2 — XHR PUT with progress events. We resolve on a 2xx response
+  // and reject on every other terminal state (network error, abort, non-2xx).
+  // Falls through gracefully when `lengthComputable` is false: no progress
+  // callbacks fire, the caller sees 0% the whole way, then 100% on resolve.
+  await new Promise<void>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('PUT', signedUrlData.signedUrl);
+    xhr.setRequestHeader('Content-Type', file.type);
+
+    xhr.upload.addEventListener('progress', (e) => {
+      if (e.lengthComputable && opts.onProgress) {
+        const percent = Math.min(
+          100,
+          Math.max(0, Math.round((e.loaded / e.total) * 100)),
+        );
+        opts.onProgress({
+          bytesUploaded: e.loaded,
+          bytesTotal: e.total,
+          percent,
+        });
+      }
+    });
+
+    xhr.addEventListener('load', () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        // Force a 100% tick on success — useful for progress bars that
+        // never see lengthComputable=true and would otherwise stick at 0.
+        if (opts.onProgress) {
+          opts.onProgress({
+            bytesUploaded: file.size,
+            bytesTotal: file.size,
+            percent: 100,
+          });
+        }
+        resolve();
+      } else {
+        reject(new Error(`Falla al subir (${xhr.status}): ${xhr.statusText || 'upload failed'}`));
+      }
+    });
+    xhr.addEventListener('error', () => reject(new Error('Network error during upload')));
+    xhr.addEventListener('abort', () => reject(new Error('Upload aborted')));
+
+    // Wire AbortSignal → xhr.abort. Honor a signal that's already aborted
+    // by tearing down before the request even hits the wire.
+    if (opts.signal) {
+      if (opts.signal.aborted) {
+        xhr.abort();
+        return;
+      }
+      opts.signal.addEventListener('abort', () => xhr.abort(), { once: true });
+    }
+
+    xhr.send(file);
+  }).catch((err) => {
+    console.error('[importAsset] storage upload failed:', err);
+    throw new ApiError(
+      err instanceof Error ? err.message : 'Falla al subir el archivo',
+      500,
+    );
+  });
   console.log(`[importAsset] upload ok in ${Date.now() - t0}ms, finalizing…`);
 
   // Tell the BFF to finalize: download server-side, extract text, insert row.
