@@ -20,7 +20,9 @@
  * the canvas. This panel only owns the chat surface.
  */
 import {
+  memo,
   useCallback,
+  useDeferredValue,
   useEffect,
   useMemo,
   useRef,
@@ -367,12 +369,16 @@ export function ChatPanel({
     [workspaceId],
   );
 
-  // ── Smooth scroll-to-bottom on new content ────────────────────────
+  // ── Scroll-to-bottom on new content ──────────────────────────────
+  // During streaming we'd otherwise fire `behavior: 'smooth'` per token
+  // (50–100/sec), and the compounding smooth animations cause judder.
+  // Use 'auto' (instant) while a stream is in flight; reserve 'smooth'
+  // for message boundaries (streaming flips false → true → false).
   useEffect(() => {
     const el = messagesEndRef.current;
     if (!el) return;
-    el.scrollIntoView({ behavior: 'smooth', block: 'end' });
-  }, [messages, streamingText]);
+    el.scrollIntoView({ behavior: streaming ? 'auto' : 'smooth', block: 'end' });
+  }, [messages, streamingText, streaming]);
 
   // ── Auto-grow textarea (max ~6 lines ≈ 144px) ─────────────────────
   useEffect(() => {
@@ -773,42 +779,60 @@ function EmptyState() {
   );
 }
 
-function MessageBubble({ message }: { message: ChatMessage }) {
-  const isUser = message.role === 'user';
-  const isAction = message.variant === 'action';
+// MessageBubble is memoized: every streaming-text token mutation re-runs
+// the parent's render, and without memo each existing message re-renders
+// + re-parses its markdown — O(n²) work for long answers. The custom
+// comparator only re-renders when the message id, content, or variant
+// actually change (the only fields that affect output).
+const MessageBubble = memo(
+  function MessageBubble({ message }: { message: ChatMessage }) {
+    const isUser = message.role === 'user';
+    const isAction = message.variant === 'action';
 
-  if (isAction) {
+    // Cache rendered markdown per message — `marked.parse` is non-trivial
+    // and unchanged content shouldn't re-walk on every parent render.
+    const html = useMemo(
+      () => (isUser || isAction ? '' : renderMarkdown(message.content)),
+      [message.content, isUser, isAction],
+    );
+
+    if (isAction) {
+      return (
+        <div className="flex justify-center animate-in fade-in slide-in-from-bottom-1 duration-200">
+          <div className="rounded-full bg-[#1534dc]/8 dark:bg-[#8b5cf6]/15 border border-[#1534dc]/15 dark:border-[#8b5cf6]/25 px-3 py-1">
+            <p className="text-[11px] font-medium text-[#1534dc] dark:text-[#a892ee]">{message.content}</p>
+          </div>
+        </div>
+      );
+    }
+
     return (
-      <div className="flex justify-center animate-in fade-in slide-in-from-bottom-1 duration-200">
-        <div className="rounded-full bg-[#1534dc]/8 dark:bg-[#8b5cf6]/15 border border-[#1534dc]/15 dark:border-[#8b5cf6]/25 px-3 py-1">
-          <p className="text-[11px] font-medium text-[#1534dc] dark:text-[#a892ee]">{message.content}</p>
+      <div className={cn('flex animate-in fade-in slide-in-from-bottom-1 duration-200', isUser ? 'justify-end' : 'justify-start')}>
+        <div
+          className={cn(
+            'rounded-2xl px-4 py-3 max-w-[88%] text-[13px] leading-relaxed',
+            isUser
+              ? 'bg-[#1534dc] dark:bg-[#8b5cf6] text-white ml-auto shadow-sm shadow-[#1534dc]/20 dark:shadow-[#8b5cf6]/20'
+              : 'bg-white/85 dark:bg-white/[0.06] text-[#0e1745] dark:text-white border border-black/5 dark:border-white/10',
+          )}
+        >
+          {isUser ? (
+            <p className="whitespace-pre-wrap">{message.content}</p>
+          ) : (
+            <div
+              className="hoja-prose chat-md max-w-none"
+              dangerouslySetInnerHTML={{ __html: html }}
+            />
+          )}
         </div>
       </div>
     );
-  }
-
-  return (
-    <div className={cn('flex animate-in fade-in slide-in-from-bottom-1 duration-200', isUser ? 'justify-end' : 'justify-start')}>
-      <div
-        className={cn(
-          'rounded-2xl px-4 py-3 max-w-[88%] text-[13px] leading-relaxed',
-          isUser
-            ? 'bg-[#1534dc] dark:bg-[#8b5cf6] text-white ml-auto shadow-sm shadow-[#1534dc]/20 dark:shadow-[#8b5cf6]/20'
-            : 'bg-white/85 dark:bg-white/[0.06] text-[#0e1745] dark:text-white border border-black/5 dark:border-white/10',
-        )}
-      >
-        {isUser ? (
-          <p className="whitespace-pre-wrap">{message.content}</p>
-        ) : (
-          <div
-            className="hoja-prose chat-md max-w-none"
-            dangerouslySetInnerHTML={{ __html: renderMarkdown(message.content) }}
-          />
-        )}
-      </div>
-    </div>
-  );
-}
+  },
+  (prev, next) =>
+    prev.message.id === next.message.id &&
+    prev.message.content === next.message.content &&
+    prev.message.variant === next.message.variant,
+);
 
 function StreamingBubble({
   text,
@@ -817,6 +841,17 @@ function StreamingBubble({
   text: string;
   isBuildingNodes: boolean;
 }) {
+  // useDeferredValue lets React skip re-rendering this bubble for
+  // intermediate streaming-text values when token bursts come in faster
+  // than the browser can paint. Pair it with a memoized markdown parse
+  // so we don't re-run `marked.parse` on every render — only when the
+  // deferred text actually settles on a new value.
+  const deferredText = useDeferredValue(text);
+  const html = useMemo(
+    () => (deferredText ? renderMarkdown(deferredText) : ''),
+    [deferredText],
+  );
+
   // Build mode: server returns a single JSON envelope (no token stream),
   // so we render a neutral phase loader instead of bouncing dots.
   if (isBuildingNodes) {
@@ -838,13 +873,13 @@ function StreamingBubble({
         className={cn(
           'rounded-2xl px-4 py-3 max-w-[88%] text-[13px] leading-relaxed',
           'bg-white/85 dark:bg-white/[0.06] text-[#0e1745] dark:text-white border border-black/5 dark:border-white/10',
-          !text && 'animate-pulse',
+          !deferredText && 'animate-pulse',
         )}
       >
-        {text ? (
+        {deferredText ? (
           <div
             className="hoja-prose chat-md max-w-none"
-            dangerouslySetInnerHTML={{ __html: renderMarkdown(text) }}
+            dangerouslySetInnerHTML={{ __html: html }}
           />
         ) : (
           <span className="inline-flex items-center gap-1">
