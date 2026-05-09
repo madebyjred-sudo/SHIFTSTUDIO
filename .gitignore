@@ -12,3 +12,8 @@ Lab_Reports_Drafts/
 Lab_Scripts/
 .mcp.json
 .vercel
+
+# Playwright artifacts
+test-results/
+playwright-report/
+playwright/.cache/
