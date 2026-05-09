@@ -705,7 +705,7 @@ workspaceRouter.post('/citations', async (req: Request, res: Response) => {
           note: typeof note === 'string' ? note : '',
           node_id: pinNodeId,
         },
-        { onConflict: 'user_id,chunk_id', ignoreDuplicates: false }
+        { onConflict: 'user_id,workspace_id,chunk_id', ignoreDuplicates: false }
       )
       .select('id, chunk_id, source_label, excerpt, note, node_id, created_at')
       .single();

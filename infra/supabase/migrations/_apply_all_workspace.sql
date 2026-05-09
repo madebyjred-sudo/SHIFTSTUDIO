@@ -3,9 +3,13 @@
 -- ════════════════════════════════════════════════════════════════════
 --
 -- Generated bundle of:
---   0001_studio_workspace.sql            (tables + RLS + triggers)
---   0002_studio_workspace_asset_types.sql (asset types + storage bucket + RLS)
---   0003_studio_workspace_pptx_cache.sql (last_pptx jsonb column)
+--   0001_studio_workspace.sql                                (tables + RLS + triggers)
+--   0002_studio_workspace_asset_types.sql                    (asset types + storage bucket + RLS)
+--   0003_studio_workspace_pptx_cache.sql                     (last_pptx jsonb column)
+--   0004_raise_studio_assets_size_cap.sql                    (raise bucket cap 100MB → 500MB)
+--   0005_studio_workspace_chat_messages.sql                  (chat history persistence)
+--   0006_studio_workspace_chat_messages_fk_userid.sql        (FK chat_messages.user_id → auth.users)
+--   0007_studio_workspace_citations_dedup_per_workspace.sql  (per-workspace citation dedup)
 --
 -- Idempotent: every statement uses CREATE IF NOT EXISTS / DROP IF EXISTS /
 -- ON CONFLICT DO NOTHING / pg_policies guards. Safe to re-run.
@@ -15,12 +19,14 @@
 --   2. SQL Editor → New query.
 --   3. Paste the entire contents of THIS file. Run.
 --   4. Verify in Table Editor: studio_workspaces, studio_workspace_nodes,
---      studio_workspace_citations all show RLS shield icons.
---   5. Storage → studio-workspace-assets bucket exists, public read.
+--      studio_workspace_citations, studio_workspace_chat_messages all show
+--      RLS shield icons.
+--   5. Storage → studio-workspace-assets bucket exists with 500MB cap,
+--      public read.
 --
 -- ROLLBACK: see the DOWN block at the bottom of each source migration
 -- (commented in the source files). Apply DOWN blocks in REVERSE order
--- (0003, then 0002, then 0001).
+-- (0007 → 0006 → 0005 → 0004 → 0003 → 0002 → 0001).
 
 -- ════════════════════════════════════════════════════════════════════
 -- 0001_studio_workspace.sql
@@ -206,6 +212,110 @@ alter table if exists studio_workspaces
 
 comment on column studio_workspaces.last_pptx is
   'Most-recent Gamma PPTX generation for this workspace. NULL when never generated. Gamma exportUrl is signed and valid ~7 days; consumers should regenerate if older.';
+
+-- ════════════════════════════════════════════════════════════════════
+-- 0004_raise_studio_assets_size_cap.sql
+-- ════════════════════════════════════════════════════════════════════
+-- Raise studio-workspace-assets bucket from 100MB → 500MB.
+-- Reason: users hit the silent 413 ceiling on large PDFs (CCCR proposals,
+-- design briefs with embedded images). Vercel function has 60s on Pro
+-- which is plenty for downloading 500MB server-side and extracting text.
+update storage.buckets
+   set file_size_limit = 524288000
+ where id = 'studio-workspace-assets';
+
+-- ════════════════════════════════════════════════════════════════════
+-- 0005_studio_workspace_chat_messages.sql
+-- ════════════════════════════════════════════════════════════════════
+-- Permanent storage for ChatPanel conversations. Scoped per workspace + user.
+-- Cascade-deletes when the parent workspace is deleted.
+--
+-- localStorage stays as a warm cache for instant render; this table is the
+-- source of truth so a user can switch devices and see their chat history.
+create table if not exists public.studio_workspace_chat_messages (
+  id uuid primary key default gen_random_uuid(),
+  workspace_id uuid not null references public.studio_workspaces(id) on delete cascade,
+  user_id uuid not null,
+  role text not null check (role in ('user','assistant','system')),
+  content text not null,
+  variant text check (variant in ('default','action') or variant is null),
+  intent text check (intent in ('chat','build','edit_selected','edit_by_match') or intent is null),
+  created_at timestamptz not null default now()
+);
+
+create index if not exists studio_workspace_chat_messages_ws_idx
+  on public.studio_workspace_chat_messages (workspace_id, created_at);
+create index if not exists studio_workspace_chat_messages_user_idx
+  on public.studio_workspace_chat_messages (user_id);
+
+-- RLS: user only reads/writes their own rows.
+alter table public.studio_workspace_chat_messages enable row level security;
+
+do $$ begin
+  if not exists (
+    select 1 from pg_policies
+    where schemaname = 'public'
+      and tablename = 'studio_workspace_chat_messages'
+      and policyname = 'studio_chat_msgs_self'
+  ) then
+    create policy "studio_chat_msgs_self" on public.studio_workspace_chat_messages
+      for all
+      using (user_id = auth.uid())
+      with check (user_id = auth.uid());
+  end if;
+end $$;
+
+-- ════════════════════════════════════════════════════════════════════
+-- 0006_studio_workspace_chat_messages_fk_userid.sql
+-- ════════════════════════════════════════════════════════════════════
+-- Adds FK from studio_workspace_chat_messages.user_id → auth.users(id) ON DELETE CASCADE.
+-- Original 0005 created the column without an FK, leaving chat rows orphaned
+-- on user delete. Inconsistent with the cascade pattern used by
+-- studio_workspaces.user_id.
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint
+    where conname = 'studio_workspace_chat_messages_user_id_fkey'
+  ) then
+    alter table studio_workspace_chat_messages
+      add constraint studio_workspace_chat_messages_user_id_fkey
+      foreign key (user_id) references auth.users(id) on delete cascade;
+  end if;
+end $$;
+
+-- ════════════════════════════════════════════════════════════════════
+-- 0007_studio_workspace_citations_dedup_per_workspace.sql
+-- ════════════════════════════════════════════════════════════════════
+-- Tighten dedup: a user can pin the same chunk in different workspaces.
+-- Old (user_id, chunk_id) UNIQUE silently overwrote the first pinning if
+-- the user re-pinned the same chunk in a second workspace.
+-- New: (user_id, workspace_id, chunk_id) so each workspace gets its own row.
+
+-- Step 1: add workspace_id column (nullable; existing rows backfill to NULL).
+alter table if exists studio_workspace_citations
+  add column if not exists workspace_id uuid
+  references studio_workspaces(id) on delete cascade;
+
+create index if not exists studio_workspace_citations_ws_idx
+  on studio_workspace_citations (workspace_id)
+  where workspace_id is not null;
+
+-- Step 2: drop old dedup index if exists.
+do $$
+begin
+  if exists (
+    select 1 from pg_indexes
+    where indexname = 'studio_workspace_citations_dedup'
+  ) then
+    drop index if exists studio_workspace_citations_dedup;
+  end if;
+end $$;
+
+-- Step 3: create new unique index on (user_id, workspace_id, chunk_id).
+create unique index if not exists studio_workspace_citations_dedup
+  on studio_workspace_citations(user_id, workspace_id, chunk_id);
 
 -- ════════════════════════════════════════════════════════════════════
 -- END.  Verify in Supabase Studio → Table Editor / Storage that the
