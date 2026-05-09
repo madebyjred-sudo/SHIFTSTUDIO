@@ -609,9 +609,9 @@ export function HojaFormatMenu({ onCreateHojaFromSelection, workspaceId }: Props
 
         {stats && mode === 'idle' && (
           <div className="mt-1 flex items-center justify-center gap-2 text-[10px] tabular-nums text-[#0e1745]/45 dark:text-white/40 px-2">
-            <span>{stats.words.toLocaleString('es-CR')} palabras</span>
+            <span>{stats.words.toLocaleString('es')} palabras</span>
             <span className="opacity-60">·</span>
-            <span>{stats.chars.toLocaleString('es-CR')} caracteres</span>
+            <span>{stats.chars.toLocaleString('es')} caracteres</span>
           </div>
         )}
         </motion.div>

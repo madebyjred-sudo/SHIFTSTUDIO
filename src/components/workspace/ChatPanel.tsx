@@ -76,6 +76,10 @@ function storageKeyFor(workspaceId: string): string {
   return `${STORAGE_KEY_PREFIX}${workspaceId}`;
 }
 
+/** Module-level so the warning fires at most once per session — repeated
+ *  saves on a full quota would otherwise flood the console + the banner. */
+let quotaWarned = false;
+
 /**
  * Read persisted messages for a workspace. Returns [] on any failure
  * (private mode, corrupt JSON, missing window in SSR-style envs).
@@ -118,9 +122,18 @@ function saveMessages(workspaceId: string, messages: ChatMessage[]): void {
       storageKeyFor(workspaceId),
       JSON.stringify(capped),
     );
-  } catch {
+  } catch (e) {
     // Quota exceeded / private browsing / disabled storage. Drop the
     // write — chat still works in-session, just won't survive reload.
+    // Phase 3.G: surface ONCE so the user understands why their history
+    // isn't sticking instead of staring at a silently-broken panel.
+    if (!quotaWarned) {
+      quotaWarned = true;
+      console.warn('[chat] localStorage write failed (quota or private mode):', e);
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('chat:quota_exceeded'));
+      }
+    }
   }
 }
 
@@ -238,6 +251,21 @@ export function ChatPanel({
     abortRef.current = null;
     pendingTimers.current.forEach((t) => clearTimeout(t));
     pendingTimers.current.clear();
+  }, []);
+
+  // ── localStorage quota banner (Phase 3.G) ────────────────────────
+  // saveMessages dispatches `chat:quota_exceeded` once per session when
+  // a write fails (private mode / quota / disabled storage). We surface
+  // it in the same banner that handles streaming errors so the user
+  // understands why their history is no longer sticking.
+  useEffect(() => {
+    const onQuota = () => {
+      setError(
+        'Tu historial de chat no se está guardando (modo privado o cuota llena). Funcionará en sesión.',
+      );
+    };
+    window.addEventListener('chat:quota_exceeded', onQuota);
+    return () => window.removeEventListener('chat:quota_exceeded', onQuota);
   }, []);
 
   // ── Re-hydrate when workspaceId changes (defense-in-depth). ───────
@@ -643,6 +671,12 @@ export function ChatPanel({
         </div>
 
         {/* ── Selected hoja chip ──────────────────────────────── */}
+        {/* Phase 3.G TODO: surface "· truncada" when the selected hoja's
+            body exceeds 5000 chars (server truncates selBody before
+            shipping it to the model). Skipped for now: HojaTitle prop
+            only carries id/title/subtitle, no body length. Wiring this
+            requires either passing the full nodes[] down or adding a
+            bodyLength field to HojaTitle from the canvas. */}
         {selectedHoja ? (
           <div className="mt-3 flex items-center gap-2 px-3 py-2 rounded-xl bg-[#1534dc]/8 dark:bg-[#8b5cf6]/12 border border-[#1534dc]/15 dark:border-[#8b5cf6]/20 animate-in fade-in slide-in-from-top-1 duration-200">
             <BookOpen className="w-3 h-3 text-[#1534dc] dark:text-[#8b5cf6] shrink-0" aria-hidden />

@@ -236,6 +236,15 @@ function CanvasInner({
     setPptxPending(null);
   }, []);
 
+  // ── Surface a backend error in the inline banner. Auto-dismiss 6s. ──
+  // Hoisted above handleNodesChange so the drag-position save catch can
+  // surface failures instead of swallowing them silently (Phase 3.G).
+  const showActionError = useCallback((title: string, detail: string) => {
+    console.error(`[workspace] ${title}:`, detail);
+    setActionError({ title, detail });
+    scheduleTimer(() => setActionError(null), 6000);
+  }, [scheduleTimer]);
+
   // ── Persist position on drag end (debounced 300ms) ───────────────
   const handleNodesChange = useCallback((changes: NodeChange[]) => {
     onNodesChange(changes);
@@ -246,45 +255,21 @@ function CanvasInner({
         if (existing) clearTimeout(existing);
         const timer = setTimeout(() => {
           positionSaveTimers.current.delete(id);
-          updateNode(workspaceId, id, { x: position.x, y: position.y }).catch(() => null);
+          updateNode(workspaceId, id, { x: position.x, y: position.y }).catch((err) =>
+            showActionError(
+              'No pudimos guardar la posición',
+              err instanceof Error ? err.message : 'Error desconocido',
+            ),
+          );
         }, 300);
         positionSaveTimers.current.set(id, timer);
       }
     }
-  }, [onNodesChange, workspaceId]);
+  }, [onNodesChange, workspaceId, showActionError]);
 
-  // ── Keyboard: Delete/Backspace removes selected ──────────────────
-  // Scoped to the canvas pane (not window) so Backspace anywhere else in
-  // the app — toolbar, chat, popovers, modals — never destroys a node.
-  // Also gated behind a confirm because the previous global handler had
-  // a high blast radius: clicking into a hoja header and back out left
-  // selectedNodeId set, so a stray Backspace after dismissing a popover
-  // would delete the last-selected node with zero recovery surface.
+  // canvasPaneRef declared up-front so handleAddHoja's keydown handler
+  // (registered in the useEffect below) can reference the same DOM node.
   const canvasPaneRef = useRef<HTMLDivElement | null>(null);
-  useEffect(() => {
-    const el = canvasPaneRef.current;
-    if (!el) return;
-    const handler = (e: KeyboardEvent) => {
-      if (
-        e.target instanceof HTMLInputElement ||
-        e.target instanceof HTMLTextAreaElement ||
-        (e.target as HTMLElement).contentEditable === 'true'
-      ) return;
-      if ((e.key === 'Delete' || e.key === 'Backspace') && selectedNodeId) {
-        if (!window.confirm('¿Borrar la hoja seleccionada? Esta acción no se puede deshacer.')) return;
-        void handleDelete(selectedNodeId);
-      }
-    };
-    el.addEventListener('keydown', handler);
-    return () => el.removeEventListener('keydown', handler);
-  }, [selectedNodeId, handleDelete]);
-
-  // ── Surface a backend error in the inline banner. Auto-dismiss 6s. ──
-  const showActionError = useCallback((title: string, detail: string) => {
-    console.error(`[workspace] ${title}:`, detail);
-    setActionError({ title, detail });
-    scheduleTimer(() => setActionError(null), 6000);
-  }, [scheduleTimer]);
 
   // ── Add hoja ─────────────────────────────────────────────────────
   const handleAddHoja = useCallback(async (pos?: { x: number; y: number }) => {
@@ -307,6 +292,40 @@ function CanvasInner({
       );
     }
   }, [workspaceId, nodes.length, setNodes, fitView, handleDelete, handleSelect, handleNodeUpdate, scheduleTimer, showActionError]);
+
+  // ── Keyboard: Delete/Backspace removes selected ──────────────────
+  // Scoped to the canvas pane (not window) so Backspace anywhere else in
+  // the app — toolbar, chat, popovers, modals — never destroys a node.
+  // Also gated behind a confirm because the previous global handler had
+  // a high blast radius: clicking into a hoja header and back out left
+  // selectedNodeId set, so a stray Backspace after dismissing a popover
+  // would delete the last-selected node with zero recovery surface.
+  //
+  // Phase 3.G — also handles the 'n' shortcut: when the canvas pane has
+  // focus and the user is not typing in an input, 'n' creates a new hoja
+  // at the next grid position. Same focus-scope guard as Backspace.
+  useEffect(() => {
+    const el = canvasPaneRef.current;
+    if (!el) return;
+    const handler = (e: KeyboardEvent) => {
+      if (
+        e.target instanceof HTMLInputElement ||
+        e.target instanceof HTMLTextAreaElement ||
+        (e.target as HTMLElement).contentEditable === 'true'
+      ) return;
+      if ((e.key === 'Delete' || e.key === 'Backspace') && selectedNodeId) {
+        if (!window.confirm('¿Borrar la hoja seleccionada? Esta acción no se puede deshacer.')) return;
+        void handleDelete(selectedNodeId);
+        return;
+      }
+      if (e.key === 'n' && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        e.preventDefault();
+        void handleAddHoja();
+      }
+    };
+    el.addEventListener('keydown', handler);
+    return () => el.removeEventListener('keydown', handler);
+  }, [selectedNodeId, handleDelete, handleAddHoja]);
 
   // ── Upload asset ─────────────────────────────────────────────────
   // Process every file in the batch even if some fail. We keep a

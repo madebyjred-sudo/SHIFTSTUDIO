@@ -654,7 +654,7 @@ function SaveIndicator({
     return (
       <span
         className="inline-flex items-center gap-1 text-[10.5px] font-medium text-emerald-700/85 dark:text-emerald-400/85"
-        title={`Última escritura: ${new Date(lastSavedAt).toLocaleString('es-CR')}`}
+        title={`Última escritura: ${new Date(lastSavedAt).toLocaleString('es')}`}
         role="status"
       >
         <Check className="w-3 h-3" aria-hidden />
@@ -678,5 +678,5 @@ function formatRelativeAgo(ts: number): string {
   if (min < 60) return `hace ${min} min`;
   const hr = Math.floor(min / 60);
   if (hr < 24)  return `hace ${hr} h`;
-  return new Date(ts).toLocaleDateString('es-CR');
+  return new Date(ts).toLocaleDateString('es');
 }
