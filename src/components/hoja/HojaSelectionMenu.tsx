@@ -13,16 +13,19 @@
  *   • Preguntar    — opens custom prompt input (⌘K shortcut)
  *
  * Why GLOBAL instead of inside HojaNode:
- *   - Zero coupling to the editor instance — works off DOM selections.
  *   - Single mount point handles N hojas on the canvas.
+ *   - DOM-level selection capture decouples from per-node refs.
+ *   - Editor instance is recovered from the captured `.ProseMirror`
+ *     element via hojaEditorRegistry — kept thin and deterministic.
  *
  * Replacement strategy:
- *   We use document.execCommand('insertText') to swap the selection. It
- *   is technically deprecated, but it remains the only API that
- *   propagates correctly through ProseMirror's DOM mutation observer in
- *   v3, keeping the editor's history + auto-save in sync. Modern
- *   alternatives (Range.deleteContents + insertNode) bypass PM and break
- *   undo.
+ *   We swap the selection through TipTap's chain commands
+ *   (deleteSelection + insertContent). Earlier revisions used
+ *   document.execCommand('insertText'), but it is deprecated and Safari
+ *   ProseMirror has known input-event quirks that drop or duplicate the
+ *   replacement. The chain version routes through PM's transaction
+ *   pipeline directly, so history + auto-save stay in sync without
+ *   relying on a deprecated DOM API.
  *
  * `transformText` here uses Studio's API contract (`{ text, instruction,
  * mode }`) — different from CL2's `{ selection, action }` shape.
@@ -35,6 +38,7 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { transformText } from '@/services/workspaceApi';
+import { getHojaEditor } from '@/components/hoja/hojaEditorRegistry';
 
 const MAX_SELECTION_CHARS = 4000;
 const MIN_SELECTION_CHARS = 4;     // ignore single-word fat-finger drags
@@ -61,6 +65,7 @@ interface SelectionSnapshot {
   text: string;
   rect: DOMRect;
   range: Range;            // kept so we can replace exactly what was highlighted
+  editor: HTMLElement;     // the .ProseMirror element — used to look up the TipTap Editor instance
 }
 
 interface Props {
@@ -99,21 +104,21 @@ export function HojaSelectionMenu({ workspaceId, onAskChat, onCreateHojaFromSele
     // Walk up from the anchor to confirm we're inside a ProseMirror editor.
     // HojaNode mounts TipTap which renders a `.ProseMirror` contenteditable.
     let node: Node | null = range.startContainer;
-    let inEditor = false;
+    let editorEl: HTMLElement | null = null;
     while (node) {
       if (node instanceof HTMLElement && node.classList.contains('ProseMirror')) {
-        inEditor = true;
+        editorEl = node;
         break;
       }
       node = node.parentNode;
     }
-    if (!inEditor) {
+    if (!editorEl) {
       if (mode === 'menu') { setSnap(null); setMode('idle'); }
       return;
     }
 
     const rect = range.getBoundingClientRect();
-    setSnap({ text, rect, range: range.cloneRange() });
+    setSnap({ text, rect, range: range.cloneRange(), editor: editorEl });
     if (mode === 'idle') setMode('menu');
   }, [mode]);
 
@@ -204,6 +209,8 @@ export function HojaSelectionMenu({ workspaceId, onAskChat, onCreateHojaFromSele
   // ── Apply preview → swap the selection in the editor ────────────────
   const applyPreview = useCallback(() => {
     if (!snap || !transformPreview) return;
+    const editor = getHojaEditor(snap.editor);
+    if (!editor) return;
     // Restore the selection range we captured (the user may have clicked
     // elsewhere after the menu opened, collapsing the document selection).
     const sel = window.getSelection();
@@ -211,9 +218,11 @@ export function HojaSelectionMenu({ workspaceId, onAskChat, onCreateHojaFromSele
       sel.removeAllRanges();
       sel.addRange(snap.range);
     }
-    // execCommand routes through ProseMirror's mutation observer →
-    // editor's internal state stays consistent and auto-save fires.
-    document.execCommand('insertText', false, transformPreview);
+    // Route through TipTap's chain so PM's transaction pipeline drives
+    // the swap. Editor's internal state stays consistent and auto-save
+    // fires the same way it would for a manual edit — but without the
+    // deprecated execCommand('insertText') Safari quirks.
+    editor.chain().focus().deleteSelection().insertContent(transformPreview).run();
     setMode('idle');
     setSnap(null);
     setTransformPreview('');
