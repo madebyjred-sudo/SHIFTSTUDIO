@@ -52,6 +52,9 @@ import {
   type WorkspaceNode, type PptxExportResult, type PptxOptions,
 } from '@/services/workspaceApi';
 import type { WorkspaceActionPayload } from '@/services/workspaceTurnStream';
+import {
+  emitWorkspaceEvent, listenWorkspaceEvents,
+} from '@/lib/workspace-broadcast';
 
 // ─── Node type registration ───────────────────────────────────────────
 const NODE_TYPES = {
@@ -178,7 +181,16 @@ function CanvasInner({
   const handleDelete = useCallback(async (nodeId: string) => {
     setNodes((ns) => ns.filter((n) => n.id !== nodeId));
     if (selectedNodeIdRef.current === nodeId) setSelectedNodeId(null);
-    await deleteNode(workspaceId, nodeId).catch(() => null);
+    try {
+      await deleteNode(workspaceId, nodeId);
+      // T-MTAB — fan out to sibling tabs so they drop the node from their
+      // mirrored canvas. Skipped on failure: we don't want Tab B to delete
+      // a node Tab A failed to remove server-side.
+      emitWorkspaceEvent(workspaceId, { type: 'hoja_deleted', nodeId });
+    } catch {
+      // Silent — listener side won't see the event, both tabs still show
+      // the node, the user can retry from either.
+    }
   }, [workspaceId, setNodes]);
 
   // ── Select callback ──────────────────────────────────────────────
@@ -220,6 +232,52 @@ function CanvasInner({
       })),
     );
   }, [handleDelete, handleSelect, handleNodeUpdate, setNodes]);
+
+  // ── Multi-tab sync listener (T-MTAB) ─────────────────────────────
+  // Per-workspace BroadcastChannel: react to add/delete from sibling
+  // tabs. `hoja_updated` is handled inside HojaNode (closer to the
+  // editor's tie-break + in-flight banner), so we ignore it here to
+  // avoid duplicate work.
+  //
+  //   • hoja_deleted  → drop the row from local nodes and clear selection
+  //                     if the deleted node was the focused one.
+  //   • hoja_added    → refetch the workspace's node list. Cheaper than
+  //                     reconstructing the RF shape with our local
+  //                     callbacks, and it rehydrates content.md too. We
+  //                     don't add the node optimistically because the
+  //                     emitter only ships an id, not the full row.
+  useEffect(() => {
+    return listenWorkspaceEvents(workspaceId, (evt) => {
+      if (evt.type === 'hoja_deleted') {
+        setNodes((ns) => ns.filter((n) => n.id !== evt.nodeId));
+        if (selectedNodeIdRef.current === evt.nodeId) setSelectedNodeId(null);
+        return;
+      }
+      if (evt.type === 'hoja_added') {
+        // Refetch to pick up the new node. Skip the loading spinner —
+        // this is a background sync, not the initial mount.
+        listNodes(workspaceId, { withContent: true })
+          .then((apiNodes) => {
+            setNodes((prev) => {
+              const prevById = new Map(prev.map((n) => [n.id, n]));
+              return apiNodes.map((n) => {
+                const existing = prevById.get(n.id);
+                // Preserve the existing RF wrapper for nodes we already
+                // have so we don't clobber selection/drag state. Only
+                // newly arrived ids get a fresh wrapper.
+                if (existing) return existing;
+                return toRFNode(n, workspaceId, {
+                  onDelete: handleDelete,
+                  onSelect: handleSelect,
+                  onUpdate: handleNodeUpdate,
+                });
+              });
+            });
+          })
+          .catch(() => null);
+      }
+    });
+  }, [workspaceId, setNodes, handleDelete, handleSelect, handleNodeUpdate]);
 
   // ── Cleanup all pending timers + dismiss modals on unmount.
   //    Important #2 + #3 + T9 modal hygiene. ────────────────────────
@@ -285,6 +343,9 @@ function CanvasInner({
       setNodes((ns) => [...ns, rfNode]);
       setSelectedNodeId(apiNode.id);
       scheduleTimer(() => fitView({ padding: 0.15, duration: 400 }), 50);
+      // T-MTAB — sibling tabs refetch on `hoja_added` (cheaper than
+      // reconstructing the RF node shape with our local callbacks).
+      emitWorkspaceEvent(workspaceId, { type: 'hoja_added', nodeId: apiNode.id });
     } catch (err) {
       showActionError(
         'No pudimos crear la hoja',
@@ -345,6 +406,7 @@ function CanvasInner({
         });
         const rfNode = toRFNode(apiNode, workspaceId, { onDelete: handleDelete, onSelect: handleSelect, onUpdate: handleNodeUpdate });
         setNodes((ns) => [...ns, rfNode]);
+        emitWorkspaceEvent(workspaceId, { type: 'hoja_added', nodeId: apiNode.id });
       } catch (err) {
         const detail = err instanceof Error ? err.message : 'Error desconocido';
         failures.push(`${file.name}: ${detail}`);
@@ -401,6 +463,9 @@ function CanvasInner({
           onUpdate: handleNodeUpdate,
         });
         scheduleTimer(() => setNodes((ns) => [...ns, rf]), i * 120);
+        // T-MTAB — broadcast each newly materialized node so sibling
+        // tabs pick them up (they refetch on `hoja_added`).
+        emitWorkspaceEvent(workspaceId, { type: 'hoja_added', nodeId: n.id });
       }
       scheduleTimer(() => fitView({ padding: 0.18, duration: 600 }), newNodes.length * 120 + 100);
       return;
@@ -437,6 +502,8 @@ function CanvasInner({
         onUpdate: handleNodeUpdate,
       });
       scheduleTimer(() => setNodes((ns) => [...ns, rf]), i * 120);
+      // T-MTAB — same fan-out as the build-intent path.
+      emitWorkspaceEvent(workspaceId, { type: 'hoja_added', nodeId: n.id });
     }
     scheduleTimer(() => fitView({ padding: 0.18, duration: 600 }), newNodes.length * 120 + 100);
   }, [workspaceId, setNodes, fitView, handleDelete, handleSelect, handleNodeUpdate, scheduleTimer]);
@@ -888,9 +955,24 @@ export function WorkspaceCanvasPage({ workspaceId }: { workspaceId: string }) {
     return () => { alive = false; };
   }, [workspaceId]);
 
+  // T-MTAB — pick up rename events from sibling tabs (this page or the
+  // workspaces list). The actual updateWorkspace call lives in
+  // handleTitleChange below; here we just sync the local label.
+  useEffect(() => {
+    return listenWorkspaceEvents(workspaceId, (evt) => {
+      if (evt.type === 'workspace_title_changed') setTitle(evt.title);
+    });
+  }, [workspaceId]);
+
   const handleTitleChange = useCallback(async (newTitle: string) => {
     setTitle(newTitle);
-    await updateWorkspace(workspaceId, { title: newTitle }).catch(() => null);
+    try {
+      await updateWorkspace(workspaceId, { title: newTitle });
+      emitWorkspaceEvent(workspaceId, { type: 'workspace_title_changed', title: newTitle });
+    } catch {
+      // Silent — local title still reflects user intent; sibling tabs
+      // won't get notified, which is the safer default on a server error.
+    }
   }, [workspaceId]);
 
   return (
