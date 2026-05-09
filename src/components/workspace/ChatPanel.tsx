@@ -31,6 +31,7 @@ import {
   ArrowUp, BookOpen, Loader2, Sparkles, StopCircle, Trash2,
 } from 'lucide-react';
 import { marked } from 'marked';
+import DOMPurify from 'dompurify';
 import { cn } from '@/lib/utils';
 import {
   streamWorkspaceTurn,
@@ -162,13 +163,40 @@ interface ChatPanelProps {
 }
 
 // ─── Markdown renderer (memo-ed, async:false for sync return) ─────────
+//
+// SECURITY: marked@18 removed its built-in sanitizer. Output is fed to
+// `dangerouslySetInnerHTML`, so we MUST sanitize with DOMPurify before
+// the HTML reaches the DOM. Without this, an assistant response (or
+// any localStorage-poisoned message) containing `<img onerror=…>`,
+// `<script>`, `<iframe>`, etc. would execute in the user's session.
+const PURIFY_CONFIG = {
+  ALLOWED_TAGS: [
+    'a', 'p', 'br', 'strong', 'em', 'code', 'pre', 'ul', 'ol', 'li',
+    'blockquote', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'hr', 'img',
+    'table', 'thead', 'tbody', 'tr', 'th', 'td', 'del', 'ins', 'sub',
+    'sup', 'mark', 'span', 'div',
+  ],
+  ALLOWED_ATTR: ['href', 'title', 'alt', 'src', 'class', 'target', 'rel'],
+  ALLOW_DATA_ATTR: false,
+  FORBID_TAGS: [
+    'script', 'style', 'iframe', 'object', 'embed', 'form',
+    'input', 'textarea', 'button', 'svg',
+  ],
+  FORBID_ATTR: [
+    'onerror', 'onload', 'onclick', 'onmouseover', 'onfocus', 'onblur',
+    'onchange', 'onsubmit', 'onkeydown', 'onkeyup', 'onkeypress',
+    'autofocus', 'formaction', 'formmethod', 'xmlns:xlink',
+  ],
+  ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto|tel):|[^a-z]|[a-z+.-]+(?:[^a-z+.\-:]|$))/i,
+};
 
 function renderMarkdown(md: string): string {
   try {
     const out = marked.parse(md, { async: false, breaks: true, gfm: true });
-    return typeof out === 'string' ? out : '';
+    const html = typeof out === 'string' ? out : '';
+    return DOMPurify.sanitize(html, PURIFY_CONFIG) as unknown as string;
   } catch {
-    return md;
+    return DOMPurify.sanitize(md, PURIFY_CONFIG) as unknown as string;
   }
 }
 
