@@ -344,6 +344,16 @@ export async function importAsset(
     );
   }
 
+  // Bucket caps at 500MB. Reject larger files locally with a clear message
+  // before attempting the upload (otherwise supabase-js hangs silently).
+  const MAX_BYTES = 500 * 1024 * 1024;
+  if (file.size > MAX_BYTES) {
+    throw new ApiError(
+      `Archivo demasiado grande (${(file.size / 1024 / 1024).toFixed(1)}MB). Máximo: 500MB.`,
+      413,
+    );
+  }
+
   // Stable object path. UUID prefix prevents collisions on identical
   // filenames; the safe-name pass strips characters that confuse Supabase
   // Storage's URL signing.
@@ -356,7 +366,12 @@ export async function importAsset(
 
   // Direct upload — bypasses Vercel entirely. The 4.5MB body limit only
   // applies to Vercel function invocations; supabase-js posts straight to
-  // the Storage REST API.
+  // the Storage REST API. Surfacing the storage error verbatim is critical
+  // (silent supabase-js hangs were "no funciona" symptom for large files).
+  console.log(
+    `[importAsset] uploading ${file.name} (${(file.size / 1024 / 1024).toFixed(2)}MB, ${file.type}) → ${path}`,
+  );
+  const t0 = Date.now();
   const { error: upErr } = await supabase.storage
     .from(STUDIO_ASSETS_BUCKET)
     .upload(path, file, {
@@ -364,8 +379,19 @@ export async function importAsset(
       upsert: false,
     });
   if (upErr) {
-    throw new ApiError(`Falla al subir: ${upErr.message}`, 500);
+    console.error('[importAsset] storage upload failed:', upErr);
+    // supabase-js error shape: { message, statusCode?, error? }. Status 413
+    // means we beat the in-flight cap (rare given client check above) or
+    // the bucket cap; status 400 / "row level security" means RLS denied.
+    const detail =
+      ('statusCode' in upErr && (upErr as { statusCode?: string }).statusCode === '413')
+        ? 'Archivo excede el límite del bucket (500MB).'
+        : /row level security|policy/i.test(upErr.message)
+          ? 'Permisos de Supabase Storage denegaron la subida — sesión inválida o ruta fuera de tu carpeta.'
+          : upErr.message;
+    throw new ApiError(`Falla al subir: ${detail}`, 500);
   }
+  console.log(`[importAsset] upload ok in ${Date.now() - t0}ms, finalizing…`);
 
   // Tell the BFF to finalize: download server-side, extract text, insert row.
   const res = await fetch(`/api/workspace/${workspaceId}/nodes/finalize-asset`, {
