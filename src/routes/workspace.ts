@@ -953,8 +953,8 @@ workspaceRouter.post('/:id/transform', async (req: Request, res: Response) => {
   //   TRANSFORM_EXPAND_MODEL — heavier model for `expand` (more reasoning needed)
   const model =
     action === 'expand'
-      ? (process.env.TRANSFORM_EXPAND_MODEL ?? 'anthropic/claude-sonnet-4')
-      : (process.env.TRANSFORM_MODEL ?? 'google/gemini-2.5-flash');
+      ? (process.env.TRANSFORM_EXPAND_MODEL ?? 'google/gemini-3.1-pro-preview')
+      : (process.env.TRANSFORM_MODEL ?? 'google/gemini-3.1-flash-lite-preview');
 
   // Build system prompt. For 'custom', the user's instruction IS the prompt.
   let systemPrompt = TRANSFORM_SYSTEMS[action];
@@ -1111,7 +1111,7 @@ async function runArchitect(workspaceId: string, prompt: string): Promise<Archit
   const JSON_STRICT_SUFFIX =
     '\n\nReturn ONLY valid JSON matching the schema. No prose, no code fences, no preamble. Start your response with `{` and end with `}`.';
   const t0 = Date.now();
-  const model = process.env.ARCHITECT_MODEL ?? 'google/gemini-2.5-flash';
+  const model = process.env.ARCHITECT_MODEL ?? 'google/gemini-3.1-pro-preview';
   const raw = await callOpenRouter({
     model,
     messages: [
@@ -1236,7 +1236,7 @@ workspaceRouter.post('/:id/architect', async (req: Request, res: Response) => {
 
   try {
     const result = await runArchitect(id, prompt);
-    const model = process.env.ARCHITECT_MODEL ?? 'google/gemini-2.5-flash';
+    const model = process.env.ARCHITECT_MODEL ?? 'google/gemini-3.1-pro-preview';
     console.log(
       `[workspace] architect ok ws=${id} hojas=${result.nodes.length} ms=${result.ms}`,
     );
@@ -1265,9 +1265,12 @@ workspaceRouter.post('/:id/architect', async (req: Request, res: Response) => {
 //   TURN_CLASSIFIER_MODEL — short, JSON-only, low-cost
 //   TURN_CHAT_MODEL       — user-facing streaming
 //   TURN_EDIT_MODEL       — non-streamed node update
-const TURN_CLASSIFIER_MODEL = process.env.TURN_CLASSIFIER_MODEL ?? 'google/gemini-2.5-flash';
-const TURN_CHAT_MODEL = process.env.TURN_CHAT_MODEL ?? 'anthropic/claude-sonnet-4';
-const TURN_EDIT_MODEL = process.env.TURN_EDIT_MODEL ?? 'google/gemini-2.5-flash';
+// Model defaults reviewed 2026-05-09. Gemini 3.x family wins price/quality
+// at this workload (vision-native, 1M context, configurable thinking).
+// Sonnet 4.6 stays available as fallback via TURN_CHAT_MODEL env override.
+const TURN_CLASSIFIER_MODEL = process.env.TURN_CLASSIFIER_MODEL ?? 'google/gemini-3.1-flash-lite-preview';
+const TURN_CHAT_MODEL = process.env.TURN_CHAT_MODEL ?? 'google/gemini-3-flash-preview';
+const TURN_EDIT_MODEL = process.env.TURN_EDIT_MODEL ?? 'google/gemini-3-flash-preview';
 
 type TurnIntent = 'chat' | 'build' | 'edit_selected' | 'edit_by_match';
 
@@ -1689,7 +1692,7 @@ Return ONLY valid JSON matching the schema. No prose, no code fences, no preambl
   if (intent === 'build') {
     try {
       const result = await runArchitect(id, query);
-      const model = process.env.ARCHITECT_MODEL ?? 'google/gemini-2.5-flash';
+      const model = process.env.ARCHITECT_MODEL ?? 'google/gemini-3.1-pro-preview';
       res.json({
         ok: true,
         intent: 'build',
