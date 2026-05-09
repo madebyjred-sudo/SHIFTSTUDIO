@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run lint  # tsc --noEmit
+        continue-on-error: true  # 37 pre-existing errors in unrelated files
+      - name: Typecheck (workspace surface only)
+        run: |
+          npx tsc --noEmit 2>&1 | tee tsc-output.txt
+          # Fail if NEW errors appear in workspace files
+          if grep -E "(routes/workspace|services/(workspaceApi|workspaceTurnStream|openRouterDirect|peajeClient|puntoMedioClient|gammaApi|supabaseAdminClient|auth)|components/(hoja|workspace)|pages/Workspace|api/workspace|lib/router)" tsc-output.txt; then
+            echo "ERROR: TypeScript errors found in workspace surface"
+            exit 1
+          fi
+
+  smoke:
+    runs-on: ubuntu-latest
+    needs: [typecheck]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - name: Install Playwright browsers
+        run: npx playwright install chromium --with-deps
+      - run: npm run test:smoke
+      - name: Upload report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-smoke
+          path: playwright-report/
+          retention-days: 7
+
+  security:
+    runs-on: ubuntu-latest
+    needs: [typecheck]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npx playwright install chromium --with-deps
+      - run: npm run test:security
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-security
+          path: playwright-report/
+          retention-days: 7
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [typecheck]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run build
+      - name: Bundle size report
+        run: |
+          echo "## Bundle sizes" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| File | Size | Gzipped |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|------|---------|" >> $GITHUB_STEP_SUMMARY
+          for f in dist/assets/*.js; do
+            size=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f")
+            gzipped=$(gzip -c "$f" | wc -c | tr -d ' ')
+            name=$(basename "$f")
+            printf "| %s | %s KB | %s KB |\n" "$name" $((size/1024)) $((gzipped/1024)) >> $GITHUB_STEP_SUMMARY
+          done

@@ -1,5 +1,7 @@
 # Shift Studio
 
+[![CI](https://github.com/madebyjred-sudo/SHIFTSTUDIO/actions/workflows/ci.yml/badge.svg)](https://github.com/madebyjred-sudo/SHIFTSTUDIO/actions/workflows/ci.yml)
+
 Studio frontend + Express BFF.
 
 Conectado a Cerebro Railway (multi-app v3) — chats generan training_pairs con
