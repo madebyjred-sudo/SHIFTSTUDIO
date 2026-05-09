@@ -1,25 +1,19 @@
 /**
  * @file workspaceTurnStream.ts
- * @description Dual-mode streaming client for `POST /api/workspace/:id/turn`.
+ * @description JSON client for `POST /api/workspace/:id/turn`.
  *
- * The BFF endpoint resolves the user's intent server-side and replies in one
- * of two ways:
+ * The BFF endpoint resolves the user's intent server-side and always replies
+ * with `application/json`. Chat replies have `{ text }` which we forward as
+ * a single token chunk so the chat panel renders one bubble; build/edit
+ * replies are forwarded as a `workspace_action` chunk for node mutations.
  *
- *   1. SSE (`Content-Type: text/event-stream`) — when the intent is `chat`.
- *      First event MAY be `event: meta` carrying intent metadata. Subsequent
- *      events are OpenAI-compatible chunks (`data: {choices:[{delta:{content}}]}`),
- *      terminated by `data: [DONE]`.
- *   2. JSON (`Content-Type: application/json`) — when the intent is one of
- *      `build` / `edit_selected` / `edit_by_match`. The body is the action
- *      envelope; the parent handles node mutations.
+ * Used to be dual-mode (SSE for chat). SSE was removed 2026-05-08 because
+ * Vercel Hobby/Pro tiers buffer event-stream responses and chat replies
+ * truncated to empty bodies. JSON-only since.
  *
- * This module abstracts both paths behind a single onChunk pump and surfaces
- * intent metadata via onIntent. Auth uses the same Supabase JWT pattern as
- * `workspaceApi`. A 401 dispatches `workspace:unauthorized` on `window` so
- * the global App listener can clear the session and re-mount AuthView.
- *
- * Ported from /Users/juan/Downloads/shift-cl2/apps/web/src/services/chatStream.ts
- * (workspace-turn subset only — generic /api/chat/stream not relevant here).
+ * Auth uses the same Supabase JWT pattern as `workspaceApi`. A 401
+ * dispatches `workspace:unauthorized` on `window` so the global App
+ * listener can clear the session and re-mount AuthView.
  */
 import { supabase } from './supabaseClient';
 import type { WorkspaceNode } from './workspaceApi';
@@ -160,156 +154,26 @@ export async function streamWorkspaceTurn(args: StreamWorkspaceTurnArgs): Promis
     return;
   }
 
-  const contentType = res.headers.get('content-type') ?? '';
-
-  // ── JSON mode (build / edit_* / chat-as-of-2026-05-08) ───────────
-  // Chat used to be SSE but Vercel buffers SSE on Hobby/Pro tiers and
-  // failures truncated to empty responses. Now /turn returns JSON for
-  // every intent. We special-case 'chat' here: the JSON envelope has a
-  // `text` field which we forward as a single token chunk so the chat
-  // panel renders it as one bubble (no token-by-token UX, but reliable).
-  if (!contentType.includes('text/event-stream')) {
-    try {
-      const body = (await res.json()) as Record<string, unknown>;
-      const intent = (body.intent as string) ?? 'build';
-      args.onIntent?.({
-        intent,
-        intent_confidence: body.intent_confidence as number | undefined,
-        target_node_id: (body.target_node_id ?? body.node_id) as string | null | undefined,
-      });
-      if (intent === 'chat' && typeof body.text === 'string') {
-        args.onChunk({ type: 'token', payload: body.text });
-      } else {
-        args.onChunk({
-          type: 'workspace_action',
-          payload: body as WorkspaceActionPayload,
-        });
-      }
-      args.onChunk({ type: 'done' });
-      args.onDone?.();
-    } catch (err) {
-      args.onChunk({ type: 'error', payload: (err as Error).message ?? 'Invalid JSON envelope' });
-    }
-    return;
-  }
-
-  // ── SSE mode (chat) ───────────────────────────────────────────────
-  if (!res.body) {
-    args.onChunk({ type: 'error', payload: 'No response body for SSE stream' });
-    return;
-  }
-
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  let metaFired = false;
-  let aborted = false;
-
-  // Bridge AbortSignal → reader.cancel(). The fetch call already honors
-  // signal at the network layer, but mid-stream we need to release the
-  // reader explicitly so the loop exits cleanly.
-  const onAbort = () => {
-    aborted = true;
-    void reader.cancel().catch(() => null);
-  };
-  args.signal?.addEventListener('abort', onAbort);
-
+  // JSON envelope — `text` for chat intent, otherwise a workspace_action.
   try {
-    while (true) {
-      let chunk: ReadableStreamReadResult<Uint8Array>;
-      try {
-        chunk = await reader.read();
-      } catch (err) {
-        if (aborted) return;
-        args.onChunk({ type: 'error', payload: (err as Error).message ?? 'Stream read error' });
-        return;
-      }
-      const { done, value } = chunk;
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-
-      // SSE events are separated by blank line (\n\n).
-      const events = buffer.split('\n\n');
-      buffer = events.pop() ?? '';
-
-      for (const evt of events) {
-        if (aborted) return;
-        const lines = evt.split('\n').map((l) => l.trim()).filter(Boolean);
-        if (lines.length === 0) continue;
-
-        const eventLine = lines.find((l) => l.startsWith('event:'));
-        const dataLine = lines.find((l) => l.startsWith('data:'));
-        const eventName = eventLine ? eventLine.slice(6).trim() : 'message';
-        const payload = dataLine ? dataLine.slice(5).trim() : '';
-
-        if (!payload) continue;
-
-        // ── Named meta event — intent routing info ────────────────
-        if (eventName === 'meta' && !metaFired) {
-          metaFired = true;
-          try {
-            const meta = JSON.parse(payload) as {
-              intent?: string;
-              intent_confidence?: number;
-              target_node_id?: string | null;
-            };
-            args.onIntent?.({
-              intent: meta.intent ?? 'chat',
-              intent_confidence: meta.intent_confidence,
-              target_node_id: meta.target_node_id,
-            });
-          } catch {
-            // ignore malformed meta
-          }
-          continue;
-        }
-
-        // ── DONE sentinel ─────────────────────────────────────────
-        if (payload === '[DONE]') {
-          args.onChunk({ type: 'done' });
-          args.onDone?.();
-          return;
-        }
-
-        // ── OpenAI-compatible delta chunk ─────────────────────────
-        try {
-          const parsed = JSON.parse(payload) as {
-            choices?: Array<{ delta?: { content?: string } }>;
-            delta?: { text?: string };
-            type?: string;
-            payload?: unknown;
-          };
-
-          const tokenText =
-            parsed?.choices?.[0]?.delta?.content ??
-            parsed?.delta?.text ??
-            '';
-          if (tokenText) {
-            args.onChunk({ type: 'token', payload: tokenText });
-            continue;
-          }
-
-          // The server may also emit structured chunks { type: 'done' | 'error' }.
-          if (parsed.type === 'done') {
-            args.onChunk({ type: 'done' });
-            args.onDone?.();
-            return;
-          }
-          if (parsed.type === 'error') {
-            const msg = typeof parsed.payload === 'string' ? parsed.payload : 'Error de servidor';
-            args.onChunk({ type: 'error', payload: msg });
-            return;
-          }
-        } catch {
-          // ignore malformed payload
-        }
-      }
+    const body = (await res.json()) as Record<string, unknown>;
+    const intent = (body.intent as string) ?? 'build';
+    args.onIntent?.({
+      intent,
+      intent_confidence: body.intent_confidence as number | undefined,
+      target_node_id: (body.target_node_id ?? body.node_id) as string | null | undefined,
+    });
+    if (intent === 'chat' && typeof body.text === 'string') {
+      args.onChunk({ type: 'token', payload: body.text });
+    } else {
+      args.onChunk({
+        type: 'workspace_action',
+        payload: body as WorkspaceActionPayload,
+      });
     }
-
-    // Stream closed without an explicit [DONE] sentinel — finalize.
     args.onChunk({ type: 'done' });
     args.onDone?.();
-  } finally {
-    args.signal?.removeEventListener('abort', onAbort);
+  } catch (err) {
+    args.onChunk({ type: 'error', payload: (err as Error).message ?? 'Invalid JSON envelope' });
   }
 }

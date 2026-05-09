@@ -36,7 +36,6 @@
  */
 import crypto from 'node:crypto';
 import { Router, type Request, type Response } from 'express';
-import multer from 'multer';
 import { supabaseAdmin } from '../services/supabaseAdminClient.js';
 import { getUserIdFromRequest, isValidUuid } from '../services/auth.js';
 import {
@@ -1129,7 +1128,7 @@ async function runArchitect(
       { role: 'system', content: ARCHITECT_SYSTEM + canvasContext + JSON_STRICT_SUFFIX },
       { role: 'user', content: prompt },
     ],
-    max_tokens: 16_000,
+    max_tokens: 8_000,
     temperature: 0.4,
     timeoutMs: 60_000,
     signal,
@@ -1357,7 +1356,7 @@ workspaceRouter.post('/:id/turn', async (req: Request, res: Response) => {
   // {role:'user'|'assistant', content:string}. Defends against malicious
   // role:'system' injection (would override our system prompt) and
   // non-string content (would crash the upstream JSON encode). Cap at the
-  // last 20 turns as a defense-in-depth bound on context bloat.
+  // last 10 turns as a defense-in-depth bound on context bloat.
   const safeHistory = history
     .filter(
       (m): m is { role: 'user' | 'assistant'; content: string } =>
@@ -1366,7 +1365,7 @@ workspaceRouter.post('/:id/turn', async (req: Request, res: Response) => {
         (m.role === 'user' || m.role === 'assistant') &&
         typeof m.content === 'string',
     )
-    .slice(-20);
+    .slice(-10);
 
   if (!query) {
     res.status(400).json({ ok: false, error: 'query_required' });
@@ -1505,7 +1504,7 @@ Return ONLY valid JSON matching the schema. No prose, no code fences, no preambl
         .eq('workspace_id', id)
         .in('type', ['hoja', 'note'])
         .order('updated_at', { ascending: false })
-        .limit(8),
+        .limit(5),
     ]);
 
     const nodeBody = (node: Record<string, unknown> | null): string | null => {
@@ -1518,8 +1517,13 @@ Return ONLY valid JSON matching the schema. No prose, no code fences, no preambl
       return body.length > 0 ? body : null;
     };
 
-    const selBody = nodeBody(selNode as Record<string, unknown> | null);
-    const ASSET_CONTEXT_PER_DOC = 8_000;
+    const SEL_BODY_MAX_CHARS = 5_000;
+    const selBodyRaw = nodeBody(selNode as Record<string, unknown> | null);
+    const selBody =
+      selBodyRaw && selBodyRaw.length > SEL_BODY_MAX_CHARS
+        ? selBodyRaw.slice(0, SEL_BODY_MAX_CHARS) + '\n[…truncado por longitud]'
+        : selBodyRaw;
+    const ASSET_CONTEXT_PER_DOC = 5_000;
     const assetBlocks = (assetNodes ?? [])
       .filter((n) => n.id !== selectedNodeId)
       .map((n) => {
@@ -1533,7 +1537,7 @@ Return ONLY valid JSON matching the schema. No prose, no code fences, no preambl
       })
       .filter((s): s is string => Boolean(s));
 
-    const HOJA_CONTEXT_PER_DOC = 5_000;
+    const HOJA_CONTEXT_PER_DOC = 3_000;
     const hojaBlocks = (hojaNodes ?? [])
       .filter((n) => n.id !== selectedNodeId)
       .map((n) => {
@@ -1577,11 +1581,17 @@ Return ONLY valid JSON matching the schema. No prose, no code fences, no preambl
       : '';
 
     // Pull approved RAG from Punto Medio. Soft-fail: if null, just skip.
+    const RAG_BLOCK_MAX_CHARS = 3_000;
     let ragBlock = '';
     try {
       const rag = await getApprovedRag(tenantId);
       if (rag && rag.combined_rag && rag.combined_rag.trim().length > 0) {
-        ragBlock = `[Punto Medio — directrices del tenant]\n${rag.combined_rag.trim()}`;
+        const trimmed = rag.combined_rag.trim();
+        const sliced =
+          trimmed.length > RAG_BLOCK_MAX_CHARS
+            ? trimmed.slice(0, RAG_BLOCK_MAX_CHARS) + '\n[…]'
+            : trimmed;
+        ragBlock = `[Punto Medio — directrices del tenant]\n${sliced}`;
       }
     } catch {
       // already soft-failed inside getApprovedRag, but be defensive.
@@ -1651,7 +1661,7 @@ Return ONLY valid JSON matching the schema. No prose, no code fences, no preambl
       const msg = (callErr as Error).message;
       console.warn('[workspace/turn] chat call failed:', msg);
       // Parse the OpenRouter error for a clean status code if possible.
-      const codeMatch = msg.match(/openrouter\s+(\d+)/i);
+      const codeMatch = msg.match(/openrouter[_\s]+(\d+)/i);
       const code = codeMatch ? parseInt(codeMatch[1], 10) : 502;
       upstreamError = { code, message: msg };
     }
@@ -2723,29 +2733,17 @@ workspaceRouter.post('/:id/export', async (req: Request, res: Response) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// IMPORT — multipart asset upload (image / audio / document)
+// ASSET IMPORT — direct-to-storage flow (see /nodes/finalize-asset below)
 // ═══════════════════════════════════════════════════════════════════════
 //
-// POST /api/workspace/:id/nodes/import (multipart)
-//   field "file"   — required, single file ≤ 100MB
-//   field "x"/"y"  — optional, canvas position; defaults to grid next-slot
-//   field "width"/"height" — optional, defaults are type-aware
+// The legacy multipart `POST /:id/nodes/import` route was removed because
+// Vercel serverless functions reject request bodies > 4.5MB and the bulk
+// of real workspace assets (PDFs, audio, hi-res images) blow that cap.
+// All imports now go through `/nodes/finalize-asset` (browser uploads to
+// Supabase Storage directly with the user's JWT, then POSTs metadata).
 //
-// Pipeline:
-//   1. multer parses the multipart, holds the buffer in memory
-//   2. We sniff the mime → decide node `type` (image/audio/document)
-//   3. Service-role Supabase client uploads to bucket `studio-workspace-assets`
-//      under `${userId}/${workspaceId}/${objectId}-${filename}`
-//   4. Get the public URL (bucket is public-read per migration)
-//   5. Insert studio_workspace_nodes row with type + content={url, ...}
-//   6. Best-effort text extraction for PDF / DOCX / md / txt
-//   7. Respond with the created node
-//
-// Bucket creation is lazy — first import in a fresh Supabase project will
-// create-or-update the bucket. The migration also creates it idempotently.
-//
-// Ported from CL2 (lines 1051-1272). Renames: bucket name is now
-// `studio-workspace-assets`; table is `studio_workspace_nodes`.
+// The shared helpers below — ASSET_TYPE_ALLOWLIST, STUDIO_ASSETS_BUCKET,
+// extractAssetText, getPDFParse — are still used by finalize-asset.
 
 const ASSET_TYPE_ALLOWLIST: Record<string, 'image' | 'audio' | 'document'> = {
   // images
@@ -2767,55 +2765,6 @@ const ASSET_TYPE_ALLOWLIST: Record<string, 'image' | 'audio' | 'document'> = {
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'document',
   'text/plain': 'document',
   'text/markdown': 'document',
-};
-
-// Multer with fileFilter that rejects non-allowlisted MIME types BEFORE
-// buffering the body to RAM — that way a malicious / mistaken upload of a
-// 100MB ZIP with an `image/` claim doesn't churn memory just to be rejected
-// downstream. The in-route check below stays as a defensive double-check.
-const importUpload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 100 * 1024 * 1024 }, // 100MB cap
-  fileFilter: (_req, file, cb) => {
-    if (!ASSET_TYPE_ALLOWLIST[file.mimetype]) {
-      cb(new multer.MulterError('LIMIT_UNEXPECTED_FILE', file.mimetype));
-      return;
-    }
-    cb(null, true);
-  },
-});
-
-// Wraps `importUpload.single('file')` so multer errors surface as JSON
-// envelopes instead of being swallowed by Express's default error handler
-// (which 500s with HTML — useless for the React import modal).
-const importMiddleware = (
-  req: Request,
-  res: Response,
-  next: (err?: unknown) => void,
-) => {
-  importUpload.single('file')(req, res, (err: unknown) => {
-    if (err instanceof multer.MulterError) {
-      const statusMap: Record<string, number> = {
-        LIMIT_FILE_SIZE: 413,
-        LIMIT_UNEXPECTED_FILE: 400,
-      };
-      res.status(statusMap[err.code] ?? 400).json({
-        ok: false,
-        error: err.code === 'LIMIT_FILE_SIZE' ? 'file_too_large' : 'multer_error',
-        detail: err.message,
-      });
-      return;
-    }
-    if (err) {
-      res.status(500).json({
-        ok: false,
-        error: 'upload_error',
-        detail: (err as Error).message,
-      });
-      return;
-    }
-    next();
-  });
 };
 
 const STUDIO_ASSETS_BUCKET = 'studio-workspace-assets';
@@ -2850,10 +2799,10 @@ async function getPDFParse(): Promise<any> {
  * so it'd reply "no hay contenido".
  */
 /** Hard cap above which we skip parser invocation. mammoth + pdf-parse
- *  decompress in memory on top of the multer buffer; on a 100MB doc that
- *  pushes us past 250-300MB resident very quickly and the parsers
- *  routinely OOM or hang. The asset still uploads — we just don't have
- *  searchable text for it. */
+ *  decompress in memory on top of the buffer pulled from storage; on a
+ *  100MB doc that pushes us past 250-300MB resident very quickly and the
+ *  parsers routinely OOM or hang. The asset still uploads — we just don't
+ *  have searchable text for it. */
 const ASSET_EXTRACT_MAX_BYTES = 50_000_000; // 50 MB
 
 async function extractAssetText(buffer: Buffer, mime: string): Promise<string | null> {
@@ -2899,175 +2848,8 @@ async function extractAssetText(buffer: Buffer, mime: string): Promise<string | 
   return null;
 }
 
-let _bucketEnsured = false;
-async function ensureAssetsBucket() {
-  if (_bucketEnsured) return;
-  if (!supabaseAdmin) return;
-  // Service-role client can create buckets. The 409 ("already exists")
-  // response is success-equivalent — flip the flag. For any OTHER error
-  // (network blip, transient 5xx), keep the flag false so the next
-  // import retries. The original code flipped the flag unconditionally,
-  // which silently broke imports forever after a single transient
-  // create-bucket failure.
-  const { error } = await supabaseAdmin.storage.createBucket(STUDIO_ASSETS_BUCKET, {
-    public: true,
-    fileSizeLimit: 100 * 1024 * 1024,
-  });
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const statusCode = (error as any)?.statusCode;
-  if (
-    !error ||
-    error.message?.includes('already exists') ||
-    statusCode === '409' ||
-    statusCode === 409
-  ) {
-    _bucketEnsured = true;
-  } else {
-    console.warn('[workspace] bucket ensure failed:', error.message);
-  }
-}
-
-workspaceRouter.post(
-  '/:id/nodes/import',
-  importMiddleware,
-  async (req: Request, res: Response) => {
-    if (!dbReady(res)) return;
-    const userId = await requireUser(req, res);
-    if (!userId) return;
-    // multer's middleware loosens `req.params` typing — coerce explicitly
-    // so tsc doesn't trip on `string | string[]` inference.
-    const id = String(req.params.id);
-    if (!isValidUuid(id)) {
-      res.status(400).json({ ok: false, error: 'invalid_uuid' });
-      return;
-    }
-    if (!(await ownedWorkspace(userId, id, res))) return;
-
-    if (!req.file) {
-      res.status(400).json({ ok: false, error: 'file_required' });
-      return;
-    }
-
-    const mime = req.file.mimetype;
-    const assetType = ASSET_TYPE_ALLOWLIST[mime];
-    if (!assetType) {
-      res.status(415).json({
-        ok: false,
-        error: 'unsupported_media_type',
-        detail: `MIME "${mime}" no permitido. Soportados: png/jpg/gif/webp/svg, mp3/m4a/wav/ogg/webm, pdf/docx/md/txt.`,
-      });
-      return;
-    }
-
-    await ensureAssetsBucket();
-
-    // Generate a stable name. We use a UUID prefix so two uploads with the
-    // same filename don't collide.
-    const safeName = (req.file.originalname || 'file').replace(/[^\w.\-]/g, '_').slice(0, 200);
-    const objectId = crypto.randomUUID();
-    const objectPath = `${userId}/${id}/${objectId}-${safeName}`;
-
-    try {
-      // Upload
-      const { error: upErr } = await supabaseAdmin!.storage
-        .from(STUDIO_ASSETS_BUCKET)
-        .upload(objectPath, req.file.buffer, {
-          contentType: mime,
-          upsert: false,
-        });
-      if (upErr) throw new Error(`upload: ${upErr.message}`);
-
-      // Public URL
-      const { data: urlData } = supabaseAdmin!.storage
-        .from(STUDIO_ASSETS_BUCKET)
-        .getPublicUrl(objectPath);
-      const publicUrl = urlData.publicUrl;
-
-      // Position + size (type-aware defaults)
-      const x = Number(req.body?.x ?? 80);
-      const y = Number(req.body?.y ?? 80);
-      const defaultDims = {
-        image: { width: 480, height: 360 },
-        audio: { width: 420, height: 140 },
-        document: { width: 380, height: 280 },
-      }[assetType];
-      const width = Number(req.body?.width ?? defaultDims.width);
-      const height = Number(req.body?.height ?? defaultDims.height);
-
-      // Best-effort text extraction for PDFs / DOCXs / plain text. Failure
-      // is non-fatal — the asset still gets uploaded and a node created,
-      // we just can't surface its text. (The extracted text feeds the
-      // workspace turn handler so "qué dice este documento" actually
-      // sees the body, not just the filename.)
-      let extractedText: string | null = null;
-      try {
-        extractedText = await extractAssetText(req.file.buffer, mime);
-      } catch (extractErr) {
-        console.warn(
-          `[workspace] asset_extract_failed mime=${mime} bytes=${req.file.size} error=${(extractErr as Error).message}`,
-        );
-      }
-
-      // Release the multer buffer reference now that both the upload and
-      // the extraction are done. The Buffer object itself stays alive
-      // until the request finishes (Express holds `req`), but swapping
-      // the field to a 0-byte Buffer drops the big allocation so GC can
-      // reclaim it before we serialize the response.
-      if (req.file) {
-        req.file.buffer = Buffer.alloc(0);
-      }
-
-      // Insert node row
-      const { data: node, error: nErr } = await supabaseAdmin!
-        .from('studio_workspace_nodes')
-        .insert({
-          workspace_id: id,
-          type: assetType,
-          x,
-          y,
-          width,
-          height,
-          title: req.file.originalname || safeName,
-          subtitle: `${assetType} · ${(req.file.size / 1024).toFixed(0)} KB`,
-          content: {
-            url: publicUrl,
-            path: objectPath,
-            filename: req.file.originalname || safeName,
-            size: req.file.size,
-            mime,
-            ...(extractedText && extractedText.length > 0
-              ? { extracted_text: extractedText }
-              : {}),
-          },
-          color: 'default',
-        })
-        .select('*')
-        .single();
-      if (nErr) {
-        // Clean up the orphan object on insert failure
-        await supabaseAdmin!.storage
-          .from(STUDIO_ASSETS_BUCKET)
-          .remove([objectPath])
-          .catch(() => null);
-        throw new Error(`insert: ${nErr.message}`);
-      }
-
-      console.log(
-        `[workspace] import ok workspaceId=${id} nodeId=${node.id} mime=${mime} bytes=${req.file.size} type=${assetType}`,
-      );
-
-      res.status(201).json({ ok: true, node });
-    } catch (err) {
-      console.warn(
-        `[workspace] import failed workspaceId=${id} mime=${mime} error=${(err as Error).message}`,
-      );
-      res.status(500).json({ ok: false, error: (err as Error).message });
-    }
-  },
-);
-
 // ═══════════════════════════════════════════════════════════════════════
-// FINALIZE-ASSET — direct-to-storage upload bypass for Vercel 4.5MB limit
+// FINALIZE-ASSET — direct-to-storage upload (replaces legacy /nodes/import)
 // ═══════════════════════════════════════════════════════════════════════
 //
 // POST /api/workspace/:id/nodes/finalize-asset (application/json)
@@ -3075,24 +2857,22 @@ workspaceRouter.post(
 //
 // Why this exists:
 //   Vercel serverless functions reject request bodies > 4.5MB. The legacy
-//   /:id/nodes/import multipart route works for small files but silently
-//   fails on anything bigger — that's the bulk of real workspace assets
-//   (PDFs, audio, hi-res images).
+//   multipart `POST /:id/nodes/import` worked for small files but silently
+//   failed on anything bigger — that's the bulk of real workspace assets
+//   (PDFs, audio, hi-res images). The multipart route was removed.
 //
 // Flow:
 //   1. Browser uploads the file directly to Supabase Storage via supabase-js
 //      SDK using the user's session JWT. RLS policy gates writes by path
 //      prefix `${auth.uid()}/...` so the user can only write to their own
-//      tree. Bucket cap is 100MB.
+//      tree. Bucket cap is 100MB. The bucket itself is created idempotently
+//      by the supabase migration; no runtime ensure-bucket dance needed.
 //   2. Browser POSTs this endpoint with `{ path, mime, filename, size, ... }`
 //      — pure JSON metadata, way under the 4.5MB threshold.
 //   3. We re-validate ownership (path prefix), download the object
 //      server-to-server with the service-role client (no Vercel body
 //      inbound), run extractAssetText, and insert the studio_workspace_nodes
-//      row. Same node shape as /:id/nodes/import.
-//
-// The /:id/nodes/import handler stays in place for backwards compat; this
-// is the new preferred path. Frontend importAsset() now uses this flow.
+//      row.
 workspaceRouter.post(
   '/:id/nodes/finalize-asset',
   async (req: Request, res: Response) => {
@@ -3179,7 +2959,7 @@ workspaceRouter.post(
         .getPublicUrl(path);
       const publicUrl = urlData.publicUrl;
 
-      // Position + size (type-aware defaults — same as /:id/nodes/import).
+      // Position + size (type-aware defaults).
       const x = Number(body.x ?? 80);
       const y = Number(body.y ?? 80);
       const defaultDims = {
