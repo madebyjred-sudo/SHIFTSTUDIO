@@ -14,9 +14,16 @@ import { AuthView } from "./components/AuthView";
 
 import React, { useState, useEffect, lazy, Suspense } from "react";
 import { cn } from "@/lib/utils";
-import { ShiftAIEmbed } from "./components/ShiftAIEmbed";
-import AdminDashboard from "./components/admin/AdminDashboard";
-import { ShiftyNodeCanvas } from "./components/ShiftyNodeCanvas";
+// Phase 3 perf — lazy the conditional-render top-level routes so the chat-only
+// entry doesn't pay for ReactFlow + dagre (Canvas), the admin dashboard, or the
+// embed primitives upfront. Each is only rendered on a specific URL/state.
+const ShiftAIEmbed = lazy(() =>
+  import("./components/ShiftAIEmbed").then((m) => ({ default: m.ShiftAIEmbed })),
+);
+const AdminDashboard = lazy(() => import("./components/admin/AdminDashboard"));
+const ShiftyNodeCanvas = lazy(() =>
+  import("./components/ShiftyNodeCanvas").then((m) => ({ default: m.ShiftyNodeCanvas })),
+);
 import { useActiveGraphStore } from "./store";
 import { useAuthStore } from "./store/useAuthStore";
 import { supabase } from "./services/supabaseClient";
@@ -130,13 +137,21 @@ export default function App() {
     }
   }, []);
 
-  if (isCerebroMode) return <AdminDashboard />;
+  if (isCerebroMode) {
+    return (
+      <Suspense fallback={<WorkspaceRouteFallback />}>
+        <AdminDashboard />
+      </Suspense>
+    );
+  }
 
   if (isEmbedMode) {
     return (
       <ErrorBoundary>
         <ThemeProvider>
-          <ShiftAIEmbed tenantId={tenantConfig.tenantId} />
+          <Suspense fallback={<WorkspaceRouteFallback />}>
+            <ShiftAIEmbed tenantId={tenantConfig.tenantId} />
+          </Suspense>
         </ThemeProvider>
       </ErrorBoundary>
     );
@@ -268,7 +283,9 @@ export default function App() {
                   {/* Center: canvas */}
                   <div className="flex-1 min-h-0 min-w-0 flex flex-col gap-3">
                     <div className="min-h-0 flex-1 bg-white/55 dark:bg-black/20 border border-white/60 dark:border-white/10 rounded-2xl overflow-hidden shadow-[0_8px_35px_rgba(0,0,0,0.08)] dark:shadow-[0_8px_35px_rgba(0,0,0,0.3)]">
-                      <ShiftyNodeCanvas />
+                      <Suspense fallback={<WorkspaceRouteFallback />}>
+                        <ShiftyNodeCanvas />
+                      </Suspense>
                     </div>
 
                     {/* Mobile: compact chat below canvas */}

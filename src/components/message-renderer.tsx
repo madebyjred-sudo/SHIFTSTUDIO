@@ -1,10 +1,14 @@
-import React, { useState } from 'react';
+import React, { useState, lazy, Suspense } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
-import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { Check, Copy, Terminal, Code2, FileJson, FileCode2, Database, Globe, Cpu } from 'lucide-react';
 import { cn } from '@/lib/utils';
+
+// Phase 3 perf — react-syntax-highlighter (~120 KB gz with Prism + vscDarkPlus)
+// is only needed when the assistant emits a fenced code block. Lazy-load it so
+// the chat-only entry stays small. <CodeBlockRenderer> renders a raw <pre>
+// fallback while the chunk resolves.
+const CodeBlockRenderer = lazy(() => import('./code-block-renderer'));
 
 const getLanguageIcon = (lang: string) => {
   const language = lang.toLowerCase();
@@ -81,6 +85,7 @@ export function MessageRenderer({
             const match = /language-(\w+)/.exec(className || '');
             const language = match ? match[1] : '';
             if (!inline && match) {
+              const codeText = String(children).replace(/\n$/, '');
               return (
                 <div className="relative mt-4 first:mt-0 rounded-xl overflow-hidden bg-[#1e1e1e] border border-white/10 shadow-lg font-sans">
                   <div className="flex items-center justify-between px-4 py-2 bg-black/40 border-b border-white/10">
@@ -88,17 +93,26 @@ export function MessageRenderer({
                       {getLanguageIcon(language)}
                       <span>{language}</span>
                     </div>
-                    <CopyButton text={String(children).replace(/\n$/, '')} />
+                    <CopyButton text={codeText} />
                   </div>
-                  <SyntaxHighlighter
-                    {...props}
-                    style={vscDarkPlus}
-                    language={language}
-                    PreTag="div"
-                    customStyle={{ margin: 0, padding: '1rem', background: 'transparent', fontSize: '0.875rem' }}
+                  <Suspense
+                    fallback={
+                      <pre
+                        style={{
+                          margin: 0,
+                          padding: '1rem',
+                          background: 'transparent',
+                          fontSize: '0.875rem',
+                          color: '#d4d4d4',
+                          overflowX: 'auto',
+                        }}
+                      >
+                        <code>{codeText}</code>
+                      </pre>
+                    }
                   >
-                    {String(children).replace(/\n$/, '')}
-                  </SyntaxHighlighter>
+                    <CodeBlockRenderer code={codeText} language={language} passthrough={props} />
+                  </Suspense>
                 </div>
               );
             }
