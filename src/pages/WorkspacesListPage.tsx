@@ -144,19 +144,31 @@ function WorkspaceCard({
 
   return (
     <>
+      {/*
+        WCAG 2.1: a single role="button" wrapper around interactive
+        descendants (kebab, rename input, hidden file input, action menu)
+        violates ARIA — interactive elements cannot nest inside a button.
+        We split the surface: the outer <div> is non-interactive layout,
+        and a separate absolutely-positioned <button> covers ONLY the
+        click-to-navigate area. Sibling controls sit ABOVE that button via
+        higher z-index, so clicks on them never reach the navigation
+        button. Visual layout is unchanged — purely structural HTML fix.
+      */}
       <div
-        onClick={() => !menuOpen && !renaming && onOpen()}
-        onKeyDown={(e) => {
-          if ((e.key === 'Enter' || e.key === ' ') && !menuOpen && !renaming) {
-            e.preventDefault();
-            onOpen();
-          }
-        }}
-        role="button"
-        tabIndex={0}
-        aria-label={`Abrir workspace ${ws.title}`}
-        className="group relative flex flex-col gap-3 p-5 rounded-2xl bg-white/70 dark:bg-white/[0.04] backdrop-blur-xl border border-white/60 dark:border-white/10 hover:border-[#1534dc]/30 dark:hover:border-[#8b5cf6]/30 hover:-translate-y-0.5 hover:shadow-[0_12px_40px_rgba(21,52,220,0.12)] dark:hover:shadow-[0_12px_40px_rgba(139,92,246,0.20)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1534dc]/45 dark:focus-visible:ring-[#8b5cf6]/45 transition-all duration-200 cursor-pointer"
+        className="group relative flex flex-col gap-3 p-5 rounded-2xl bg-white/70 dark:bg-white/[0.04] backdrop-blur-xl border border-white/60 dark:border-white/10 hover:border-[#1534dc]/30 dark:hover:border-[#8b5cf6]/30 hover:-translate-y-0.5 hover:shadow-[0_12px_40px_rgba(21,52,220,0.12)] dark:hover:shadow-[0_12px_40px_rgba(139,92,246,0.20)] focus-within:ring-2 focus-within:ring-[#1534dc]/45 dark:focus-within:ring-[#8b5cf6]/45 transition-all duration-200"
       >
+        {/* Click-to-navigate surface — covers the whole card except where
+            sibling interactive controls (kebab, rename, file input) overlay
+            it via higher z-index. Does NOT contain interactive children. */}
+        {!renaming && (
+          <button
+            type="button"
+            onClick={onOpen}
+            aria-label={`Abrir workspace ${ws.title}`}
+            className="absolute inset-0 z-0 rounded-2xl cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1534dc]/45 dark:focus-visible:ring-[#8b5cf6]/45"
+          />
+        )}
+
         {/* Hidden file input */}
         <input
           ref={fileInputRef}
@@ -164,14 +176,13 @@ function WorkspaceCard({
           accept="image/png,image/jpeg,image/gif,image/webp,image/svg+xml,audio/mpeg,audio/mp4,audio/wav,audio/ogg,audio/webm,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain,text/markdown"
           className="hidden"
           onChange={handleFileChosen}
-          onClick={(e) => e.stopPropagation()}
         />
 
         {/* Inline import error toast */}
         {importError && (
           <div
             role="alert"
-            className="absolute -top-1 left-2 right-2 z-10 px-3 py-1.5 rounded-md bg-red-500 text-white text-[11px] font-medium shadow-lg flex items-center gap-1.5"
+            className="absolute -top-1 left-2 right-2 z-20 px-3 py-1.5 rounded-md bg-red-500 text-white text-[11px] font-medium shadow-lg flex items-center gap-1.5"
           >
             <AlertTriangle className="w-3 h-3 shrink-0" aria-hidden />
             <span className="truncate">{importError}</span>
@@ -179,15 +190,15 @@ function WorkspaceCard({
         )}
 
         {/* Color accent line */}
-        <div className="absolute top-0 left-5 right-5 h-[2px] rounded-b-full bg-gradient-to-r from-[#7A3B47]/40 via-[#1534dc]/30 to-transparent" />
+        <div className="absolute top-0 left-5 right-5 h-[2px] rounded-b-full bg-gradient-to-r from-[#7A3B47]/40 via-[#1534dc]/30 to-transparent pointer-events-none z-[1]" />
 
         {/* Header */}
-        <div className="flex items-start justify-between gap-3">
+        <div className="relative z-10 flex items-start justify-between gap-3 pointer-events-none">
           <div className="w-10 h-10 rounded-xl bg-[#7A3B47]/10 dark:bg-[#7A3B47]/20 flex items-center justify-center shrink-0">
             <BookOpen className="w-5 h-5 text-[#7A3B47]" />
           </div>
 
-          <div className="relative">
+          <div className="relative pointer-events-auto">
             <button
               onClick={(e) => { e.stopPropagation(); setMenuOpen((v) => !v); }}
               aria-label="Más opciones del workspace"
@@ -266,17 +277,16 @@ function WorkspaceCard({
             onChange={(e) => setDraft(e.target.value)}
             onBlur={commitRename}
             onKeyDown={(e) => { if (e.key === 'Enter') commitRename(); if (e.key === 'Escape') setRenaming(false); }}
-            onClick={(e) => e.stopPropagation()}
-            className="text-[17px] font-semibold bg-transparent border-b border-[#1534dc] focus:outline-none text-[#0e1745] dark:text-white w-full"
+            className="relative z-10 text-[17px] font-semibold bg-transparent border-b border-[#1534dc] focus:outline-none text-[#0e1745] dark:text-white w-full"
           />
         ) : (
-          <p className="text-[17px] font-semibold text-[#0e1745] dark:text-white leading-snug line-clamp-2">
+          <p className="relative z-10 text-[17px] font-semibold text-[#0e1745] dark:text-white leading-snug line-clamp-2 pointer-events-none">
             {ws.title}
           </p>
         )}
 
         {/* Meta */}
-        <div className="flex items-center justify-between mt-auto">
+        <div className="relative z-10 flex items-center justify-between mt-auto pointer-events-none">
           <div className="flex items-center gap-1.5">
             <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-[#1534dc]/8 text-[11px] font-medium text-[#1534dc] dark:text-[#8b5cf6]">
               <LayoutGrid className="w-3 h-3" />

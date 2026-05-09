@@ -476,8 +476,15 @@ function HojaNodeImpl({
 
   const handleDelete = useCallback((e: React.MouseEvent) => {
     e.stopPropagation();
+    // Gate destructive action behind a confirm to match the pattern used
+    // by the workspaces list (two-click confirm) and the "Limpiar
+    // conversación" control in ChatPanel (window.confirm). Previously a
+    // single click on the rose Trash icon would delete the hoja with no
+    // recovery surface — error swallowed, no undo.
+    const safeTitle = (title || 'esta hoja').trim() || 'esta hoja';
+    if (!window.confirm(`¿Borrar "${safeTitle}"? Esta acción no se puede deshacer.`)) return;
     onDelete?.(id);
-  }, [id, onDelete]);
+  }, [id, onDelete, title]);
 
   return (
     <div

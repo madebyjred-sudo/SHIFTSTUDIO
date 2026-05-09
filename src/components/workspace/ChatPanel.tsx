@@ -536,16 +536,16 @@ export function ChatPanel({
     }
 
     // If nothing came back AT ALL (no tokens, no action, no message, no error),
-    // emit a visible diagnostic so the user isn't staring at silence. This is
-    // the "chat le pedi que resumiera la hoja y no hizo nada" symptom.
+    // emit a user-facing fallback. The technical detail (likely causes:
+    // OpenRouter credits out, server timeout, classifier failure) goes to
+    // the console for engineering, NOT to the chat surface.
     if (!actionConsumed && !messageEmitted && !lastError) {
-      const fallback =
-        '_No se recibió respuesta del modelo. Posibles causas: créditos de OpenRouter agotados, timeout del servidor (>60s), o error en el clasificador. Revisa /api/workspace/.../turn en DevTools → Network para ver el status real._';
+      console.warn('[chat] No tokens emitted by /turn — likely OpenRouter credits, server timeout, or classifier failure');
+      const fallback = 'No recibimos respuesta. Probá de nuevo, o revisá tu conexión.';
       setMessages((prev) => [
         ...prev,
         { id: `a-${Date.now()}`, role: 'assistant', content: fallback, createdAt: Date.now() },
       ]);
-      setError('No response from /turn — see message below for diagnostics.');
     }
 
     // Whatever happened, finalize the streaming UI state.
@@ -647,9 +647,18 @@ export function ChatPanel({
         ) : null}
       </header>
 
-      {/* ── Messages list ──────────────────────────────────────── */}
+      {/* ── Messages list ────────────────────────────────────────
+        a11y: role="log" + aria-live="polite" so screen-reader users
+        hear streamed assistant tokens as they land. aria-atomic=false
+        means SRs read only what was added on each mutation, not the
+        whole transcript on every chunk. aria-relevant="additions text"
+        keeps text-node updates inside StreamingBubble announceable. */}
       <div
         ref={scrollContainerRef}
+        role="log"
+        aria-live="polite"
+        aria-atomic="false"
+        aria-relevant="additions text"
         className="flex-1 min-h-0 overflow-y-auto px-3 py-3 space-y-3"
       >
         {messages.length === 0 && !streaming && !error && (
