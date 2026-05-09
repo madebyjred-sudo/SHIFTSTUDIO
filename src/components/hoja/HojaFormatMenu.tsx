@@ -19,13 +19,17 @@
  *   - Each dropdown is portaled to document.body (not nested inside
  *     the pill) so the pill's rounded-corner clipping doesn't hide
  *     them.
- *   - DOM-level commands (document.execCommand) drive most actions.
- *     TipTap's mutation observer parses the resulting tags via the
- *     loaded extensions (Underline, Highlight, Link, TextAlign...).
- *   - TaskList has no execCommand; we insertHTML in the exact shape
- *     TipTap's TaskItem.renderHTML emits so parseHTML picks it up.
- *   - AI replacement uses execCommand('insertText') after focus-
- *     restore — keeps PM history + auto-save in sync.
+ *   - Format actions go through TipTap's editor.chain() commands
+ *     (toggleBold, toggleHeading, toggleBulletList, setLink, ...).
+ *     We previously routed via document.execCommand, but that API is
+ *     deprecated and fails inconsistently across browsers — Firefox
+ *     wraps `formatBlock` in <p> instead of replacing, Safari does not
+ *     support insertHTML for taskList, and createLink/unlink behave
+ *     differently per engine. The Editor instance is recovered from
+ *     the captured `.ProseMirror` DOM element via hojaEditorRegistry.
+ *   - AI replacement uses chain().deleteSelection().insertContent(...)
+ *     so PM history + auto-save stay in sync (same effect as the old
+ *     execCommand('insertText'), but cross-browser stable).
  */
 import {
   forwardRef, useCallback, useEffect, useLayoutEffect, useRef, useState,
@@ -44,6 +48,7 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { transformText } from '@/services/workspaceApi';
+import { getHojaEditor } from '@/components/hoja/hojaEditorRegistry';
 
 const MIN_SELECTION_CHARS = 1;
 const MAX_SELECTION_CHARS = 20_000;
@@ -79,6 +84,17 @@ const HIGHLIGHT_COLORS: Array<{ value: string; label: string; preview: string }>
 ];
 
 type BlockKind = 'p' | 'h1' | 'h2' | 'h3';
+
+// All toolbar commands that map 1:1 to TipTap chain calls without args.
+// Block-level transforms (heading, paragraph, link with URL, taskList,
+// AI replace) have dedicated callbacks because they need parameters or
+// side effects beyond a simple chain hop.
+type ToolbarCmd =
+  | 'bold' | 'italic' | 'underline' | 'strikeThrough'
+  | 'justifyLeft' | 'justifyCenter' | 'justifyRight'
+  | 'insertUnorderedList' | 'insertOrderedList'
+  | 'blockquote' | 'codeBlock'
+  | 'unlink';
 const BLOCK_OPTIONS: Array<{ value: BlockKind; label: string; icon: React.ElementType; sample: string }> = [
   { value: 'p',  label: 'Cuerpo',    icon: Pilcrow,   sample: 'Texto normal' },
   { value: 'h1', label: 'Título',    icon: Heading1,  sample: 'Encabezado grande' },
@@ -236,16 +252,42 @@ export function HojaFormatMenu({ onCreateHojaFromSelection, workspaceId }: Props
   }, [dropdown, mode]);
 
   // ── Format command dispatch ──────────────────────────────────────
-  const exec = useCallback((cmd: string, arg?: string) => {
+  // All formatting routes through TipTap's editor.chain() commands.
+  // The captured `snap.editor` is a `.ProseMirror` HTMLElement; we
+  // resolve it to the live Editor instance via the registry that
+  // HojaNode populates on mount. If the lookup fails (editor torn
+  // down between selection capture and click), the call no-ops
+  // gracefully — the toolbar will simply close.
+  const exec = useCallback((cmd: ToolbarCmd) => {
     if (!snap) return;
-    snap.editor.focus();
-    document.execCommand(cmd, false, arg);
+    const editor = getHojaEditor(snap.editor);
+    if (!editor) return;
+    const chain = editor.chain().focus();
+    switch (cmd) {
+      case 'bold':          chain.toggleBold().run(); return;
+      case 'italic':        chain.toggleItalic().run(); return;
+      case 'underline':     chain.toggleUnderline().run(); return;
+      case 'strikeThrough': chain.toggleStrike().run(); return;
+      case 'justifyLeft':   chain.setTextAlign('left').run(); return;
+      case 'justifyCenter': chain.setTextAlign('center').run(); return;
+      case 'justifyRight':  chain.setTextAlign('right').run(); return;
+      case 'insertUnorderedList': chain.toggleBulletList().run(); return;
+      case 'insertOrderedList':   chain.toggleOrderedList().run(); return;
+      case 'blockquote':    chain.toggleBlockquote().run(); return;
+      case 'codeBlock':     chain.toggleCodeBlock().run(); return;
+      case 'unlink':        chain.unsetLink().run(); return;
+    }
   }, [snap]);
 
   const setBlock = useCallback((kind: BlockKind) => {
-    exec('formatBlock', `<${kind}>`);
+    if (!snap) return;
+    const editor = getHojaEditor(snap.editor);
+    if (!editor) return;
+    const chain = editor.chain().focus();
+    if (kind === 'p') chain.setParagraph().run();
+    else chain.toggleHeading({ level: Number(kind.slice(1)) as 1 | 2 | 3 }).run();
     setDropdown(null);
-  }, [exec]);
+  }, [snap]);
 
   // Highlight: manual <mark> wrap. The Highlight extension only parses
   // <mark>, not <span style>, so execCommand('hiliteColor') is unusable.
@@ -312,26 +354,21 @@ export function HojaFormatMenu({ onCreateHojaFromSelection, workspaceId }: Props
 
   const insertTaskList = useCallback(() => {
     if (!snap) return;
-    snap.editor.focus();
-    const sel = window.getSelection();
-    const text = sel?.toString().trim() ?? '';
-    const safe = text
-      ? text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-      : '';
-    const html = [
-      '<ul data-type="taskList">',
-      '<li data-type="taskItem" data-checked="false">',
-      `<label><input type="checkbox"><span></span></label>`,
-      `<div><p>${safe}</p></div>`,
-      '</li>',
-      '</ul>',
-    ].join('');
-    document.execCommand('insertHTML', false, html);
+    const editor = getHojaEditor(snap.editor);
+    if (!editor) return;
+    // TipTap's TaskList extension exposes toggleTaskList(): if the
+    // selection is plain paragraph text, it converts it into a checked
+    // task item; if already inside a task list, it lifts back to a
+    // paragraph. This replaces the manual insertHTML wrap, which was
+    // unsupported on Safari.
+    editor.chain().focus().toggleTaskList().run();
     setDropdown(null);
   }, [snap]);
 
   const handleLink = useCallback(() => {
     if (!snap) return;
+    const editor = getHojaEditor(snap.editor);
+    if (!editor) return;
     const sel = window.getSelection();
     const current = sel ? sel.toString().trim() : '';
     let existingHref = '';
@@ -342,16 +379,35 @@ export function HojaFormatMenu({ onCreateHojaFromSelection, workspaceId }: Props
         n = n.parentNode;
       }
     }
-    const url = window.prompt('URL del enlace (vacío para quitar):', existingHref);
-    if (url === null) return;
-    snap.editor.focus();
-    if (url.trim() === '') {
-      document.execCommand('unlink');
-    } else if (current.length === 0) {
-      document.execCommand('insertHTML', false,
-        `<a href="${escapeAttr(url)}">${escapeHtml(url)}</a>`);
+    const raw = window.prompt('URL del enlace (vacío para quitar):', existingHref);
+    if (raw === null) return;
+    const url = raw.trim();
+    const chain = editor.chain().focus();
+    if (url === '') {
+      chain.unsetLink().run();
+      setDropdown(null);
+      return;
+    }
+    // Validate URL — TipTap's Link mark won't reject malformed input,
+    // and `javascript:`/raw text would slip through. Allow http(s),
+    // mailto: and tel: schemes; otherwise surface an error.
+    if (!/^https?:\/\//i.test(url) && !/^(mailto|tel):/i.test(url)) {
+      setTransformError('URL inválida — debe comenzar con http://, https://, mailto: o tel:');
+      setDropdown(null);
+      return;
+    }
+    if (current.length === 0) {
+      // Selection collapsed: insert the URL as the visible link text,
+      // then mark it as a link. Mirrors the prior insertHTML behavior.
+      chain.insertContent(url).run();
+      const len = url.length;
+      const { from } = editor.state.selection;
+      editor.chain().focus()
+        .setTextSelection({ from: from - len, to: from })
+        .setLink({ href: url, target: '_blank' })
+        .run();
     } else {
-      document.execCommand('createLink', false, url);
+      chain.setLink({ href: url, target: '_blank' }).run();
     }
     setDropdown(null);
   }, [snap]);
@@ -382,13 +438,19 @@ export function HojaFormatMenu({ onCreateHojaFromSelection, workspaceId }: Props
 
   const applyPreview = useCallback(() => {
     if (!snap || !transformResult) return;
+    const editor = getHojaEditor(snap.editor);
+    if (!editor) return;
+    // Restore the captured DOM range so PM picks up the original
+    // selection coordinates, then swap via the chain. Using
+    // deleteSelection + insertContent keeps history + auto-save in
+    // sync the same way the old execCommand('insertText') did, but
+    // without the Safari ProseMirror quirks.
     const sel = window.getSelection();
     if (sel) {
       sel.removeAllRanges();
       sel.addRange(snap.range);
     }
-    snap.editor.focus();
-    document.execCommand('insertText', false, transformResult);
+    editor.chain().focus().deleteSelection().insertContent(transformResult).run();
     setMode('idle');
     setTransformResult('');
     setSnap(null);
@@ -680,8 +742,8 @@ export function HojaFormatMenu({ onCreateHojaFromSelection, workspaceId }: Props
           <DropdownItem onClick={() => exec('insertOrderedList')} icon={<ListOrdered size={13} aria-hidden />}>Lista numerada</DropdownItem>
           <DropdownItem onClick={insertTaskList} icon={<ListChecks size={13} aria-hidden />}>Lista de tareas</DropdownItem>
           <DropdownSep />
-          <DropdownItem onClick={() => exec('formatBlock', '<blockquote>')} icon={<Quote size={13} aria-hidden />}>Cita</DropdownItem>
-          <DropdownItem onClick={() => exec('formatBlock', '<pre>')} icon={<Code size={13} aria-hidden />}>Bloque de código</DropdownItem>
+          <DropdownItem onClick={() => exec('blockquote')} icon={<Quote size={13} aria-hidden />}>Cita</DropdownItem>
+          <DropdownItem onClick={() => exec('codeBlock')} icon={<Code size={13} aria-hidden />}>Bloque de código</DropdownItem>
           <DropdownSep />
           <DropdownItem onClick={handleLink} icon={<LinkIcon size={13} aria-hidden />}>Enlace…</DropdownItem>
           <DropdownItem onClick={() => exec('unlink')} icon={<Unlink size={13} aria-hidden />}>Quitar enlace</DropdownItem>
@@ -834,12 +896,4 @@ function DropdownSep() {
 
 function Sep() {
   return <span className="mx-0.5 self-center h-5 w-px bg-[#0e1745]/[0.08] dark:bg-white/[0.10]" aria-hidden />;
-}
-
-// ─── HTML escape helpers ─────────────────────────────────────────────
-function escapeAttr(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-function escapeHtml(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }

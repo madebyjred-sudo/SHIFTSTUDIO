@@ -58,6 +58,7 @@ import { cn } from '@/lib/utils';
 import {
   updateNode, type NodeColor, type UpdateNodePatch, type WorkspaceNode,
 } from '@/services/workspaceApi';
+import { registerHojaEditor, unregisterHojaEditor } from '@/components/hoja/hojaEditorRegistry';
 import {
   emitWorkspaceEvent, listenWorkspaceEvents,
 } from '@/lib/workspace-broadcast';
@@ -479,6 +480,17 @@ function HojaNodeImpl({
       scheduleContentSave(() => ({ content: { md: htmlToMarkdown(ed.getHTML()) } }));
     },
   });
+
+  // ── Register editor in the global lookup so the floating
+  //    HojaFormatMenu / HojaSelectionMenu can route TipTap chain
+  //    commands to this instance after capturing a DOM-level
+  //    selection. See hojaEditorRegistry.ts for the rationale.
+  useEffect(() => {
+    if (!editor) return;
+    const dom = editor.view.dom as HTMLElement;
+    registerHojaEditor(dom, editor);
+    return () => { unregisterHojaEditor(dom); };
+  }, [editor]);
 
   // ── Sync incoming data changes (e.g. chat-driven refresh) ────────
   // Only push when the prop value differs AND the editor is not focused —
