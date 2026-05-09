@@ -38,6 +38,14 @@ import {
   type IntentMeta,
   type WorkspaceActionPayload,
 } from '@/services/workspaceTurnStream';
+import {
+  clearChatMessages,
+  createChatMessage,
+  listChatMessages,
+  type ChatMessageIntent,
+  type ChatMessageRow,
+  type ChatMessageVariant,
+} from '@/services/workspaceApi';
 
 // ─── Types ────────────────────────────────────────────────────────────
 
@@ -47,6 +55,8 @@ interface ChatMessage {
   content: string;
   /** Synthetic system messages (e.g. "Se crearon 4 hojas") render with a different style. */
   variant?: 'default' | 'action';
+  /** Intent recorded server-side; drives observability. Optional locally. */
+  intent?: ChatMessageIntent;
   createdAt: number;
 }
 
@@ -118,6 +128,26 @@ function clearStoredMessages(workspaceId: string): void {
   } catch {
     // Same as saveMessages — degrade silently.
   }
+}
+
+/**
+ * Map a server-side row into the in-memory ChatMessage shape. Server's
+ * `created_at` (ISO string) becomes a numeric timestamp so both
+ * server-loaded and client-generated messages share one ordering field.
+ */
+function rowToMessage(row: ChatMessageRow): ChatMessage {
+  const createdAt = (() => {
+    const t = Date.parse(row.created_at);
+    return Number.isFinite(t) ? t : Date.now();
+  })();
+  return {
+    id: row.id,
+    role: row.role,
+    content: row.content,
+    variant: (row.variant ?? undefined) as ChatMessage['variant'],
+    intent: (row.intent ?? undefined) as ChatMessageIntent | undefined,
+    createdAt,
+  };
 }
 
 interface ChatPanelProps {
@@ -205,6 +235,49 @@ export function ChatPanel({
     setError(null);
   }, [workspaceId]);
 
+  // ── Server hydration (Supabase = source of truth) ─────────────────
+  //
+  // The localStorage paint (lazy useState above) is the warm cache for
+  // instant first render — no flicker. In parallel, fetch the server
+  // copy. When it returns, replace state with the server's truth and
+  // refresh the localStorage cache. If the fetch fails (offline,
+  // network error, 5xx), keep the localStorage data on screen — the
+  // panel degrades gracefully into offline mode.
+  //
+  // A guard ref prevents a stale fetch from clobbering state if the
+  // user switches workspaces mid-flight: each effect run ties the
+  // resolution to a captured workspaceId.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const rows = await listChatMessages(workspaceId);
+        if (cancelled) return;
+        const fromServer = rows.map(rowToMessage);
+        // Server is authoritative. Even if the localStorage cache had
+        // more (rare — would mean writes that never reached the server),
+        // we replace with the server copy so multi-device users see a
+        // coherent timeline. Local-only writes will reconcile on the
+        // next successful save.
+        setMessages(fromServer);
+        saveMessages(workspaceId, fromServer);
+      } catch (err) {
+        // Network down / 5xx / RLS denied. Keep showing localStorage —
+        // the user can still chat and the warm cache is still useful.
+        // Don't surface an error banner: the offline path is a feature.
+        if (!cancelled) {
+          console.warn(
+            '[ChatPanel] server hydration failed; keeping localStorage cache:',
+            err,
+          );
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [workspaceId]);
+
   // ── Persist on every messages change. ─────────────────────────────
   // Cheap because localStorage is sync but tiny — the cap keeps the
   // serialized payload bounded. Silent on quota errors.
@@ -229,7 +302,42 @@ export function ChatPanel({
     setError(null);
     setMessages([]);
     clearStoredMessages(workspaceId);
+    // Server clear runs in the background. If it fails, the local clear
+    // stands (the user explicitly asked to wipe the panel) but the
+    // server still has the rows — they'll re-hydrate on next mount. We
+    // surface a soft banner so the user knows there's drift to resolve.
+    void clearChatMessages(workspaceId).catch((err) => {
+      console.warn('[ChatPanel] server clear failed:', err);
+      setError(
+        'La conversación se limpió localmente, pero no pudimos borrarla en el servidor. Volverá al recargar.',
+      );
+    });
   }, [workspaceId]);
+
+  // ── Background write-through ──────────────────────────────────────
+  //
+  // Fire-and-forget POST /messages. Failures are logged but never roll
+  // back the UI: the user has already seen their message render. The
+  // next mount's server hydration will reconcile if the write was lost.
+  const persistMessage = useCallback(
+    (
+      role: 'user' | 'assistant' | 'system',
+      content: string,
+      opts: { variant?: ChatMessageVariant; intent?: ChatMessageIntent } = {},
+    ): void => {
+      const trimmed = content.trim();
+      if (!trimmed) return;
+      void createChatMessage(workspaceId, {
+        role,
+        content,
+        ...(opts.variant ? { variant: opts.variant } : {}),
+        ...(opts.intent ? { intent: opts.intent } : {}),
+      }).catch((err) => {
+        console.warn('[ChatPanel] persist failed:', err);
+      });
+    },
+    [workspaceId],
+  );
 
   // ── Smooth scroll-to-bottom on new content ────────────────────────
   useEffect(() => {
@@ -287,9 +395,15 @@ export function ChatPanel({
     setError(null);
     streamingTextRef.current = '';
 
+    // Write-through to Supabase (background). UI already has the bubble.
+    persistMessage('user', trimmed);
+
     let actionConsumed = false;
     let messageEmitted = false;
     let lastError: string | null = null;
+    // Captured so we can tag the persisted assistant row with the
+    // server's classified intent. Updated inside onIntent below.
+    let currentIntent: ChatMessageIntent | undefined;
 
     try {
     await streamWorkspaceTurn({
@@ -303,6 +417,13 @@ export function ChatPanel({
       signal: ac.signal,
       onIntent: (meta: IntentMeta) => {
         setStreamingIntent(meta.intent ?? null);
+        // Track for the assistant-row persistence below. The four valid
+        // values match the server's CHECK constraint; anything else
+        // arrives null and is dropped.
+        const i = meta.intent;
+        if (i === 'chat' || i === 'build' || i === 'edit_selected' || i === 'edit_by_match') {
+          currentIntent = i;
+        }
       },
       onChunk: (chunk) => {
         if (chunk.type === 'token') {
@@ -327,9 +448,14 @@ export function ChatPanel({
               role: 'assistant',
               content: confirmation,
               variant: 'action',
+              intent: currentIntent,
               createdAt: Date.now(),
             },
           ]);
+          persistMessage('assistant', confirmation, {
+            variant: 'action',
+            intent: currentIntent,
+          });
         } else if (chunk.type === 'error') {
           lastError = chunk.payload;
           setError(chunk.payload);
@@ -344,9 +470,11 @@ export function ChatPanel({
                 id: `a-${Date.now()}`,
                 role: 'assistant',
                 content: text,
+                intent: currentIntent,
                 createdAt: Date.now(),
               },
             ]);
+            persistMessage('assistant', text, { intent: currentIntent });
           }
         }
       },
@@ -368,8 +496,15 @@ export function ChatPanel({
       messageEmitted = true;
       setMessages((prev) => [
         ...prev,
-        { id: `a-${Date.now()}`, role: 'assistant', content: text, createdAt: Date.now() },
+        {
+          id: `a-${Date.now()}`,
+          role: 'assistant',
+          content: text,
+          intent: currentIntent,
+          createdAt: Date.now(),
+        },
       ]);
+      persistMessage('assistant', text, { intent: currentIntent });
     }
 
     // If nothing came back AT ALL (no tokens, no action, no message, no error),
@@ -392,14 +527,16 @@ export function ChatPanel({
     setStreamingIntent(null);
     if (abortRef.current === ac) abortRef.current = null;
   }, [
-    input, streaming, buildHistory, workspaceId, selectedNodeId, hojaTitles, onWorkspaceAction,
+    input, streaming, buildHistory, workspaceId, selectedNodeId, hojaTitles, onWorkspaceAction, persistMessage,
   ]);
 
   // ── Stop streaming ────────────────────────────────────────────────
   const handleStop = useCallback(() => {
     abortRef.current?.abort();
     abortRef.current = null;
-    // Persist whatever we have so it isn't lost.
+    // Persist whatever we have so it isn't lost — both locally and to
+    // the server. Stopping mid-stream still produces a valid partial
+    // assistant turn worth keeping in the history.
     if (streamingTextRef.current.trim()) {
       const text = streamingTextRef.current;
       setMessages((prev) => [
@@ -411,12 +548,13 @@ export function ChatPanel({
           createdAt: Date.now(),
         },
       ]);
+      persistMessage('assistant', text);
     }
     streamingTextRef.current = '';
     setStreamingText('');
     setStreaming(false);
     setStreamingIntent(null);
-  }, []);
+  }, [persistMessage]);
 
   // ── Keyboard: Cmd/Ctrl+Enter to send, Enter alone = newline ──────
   const handleKeyDown = useCallback((e: ReactKeyboardEvent<HTMLTextAreaElement>) => {

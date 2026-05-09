@@ -576,3 +576,63 @@ export async function runTurn(workspaceId: string, body: TurnRequest): Promise<T
   const json = await handleJson<{ ok: boolean } & TurnResponse>(res);
   return json;
 }
+
+// ─── Chat message persistence ─────────────────────────────────────────
+//
+// Server-side persistence for ChatPanel conversations. localStorage stays
+// as the warm cache for instant render; Supabase is the source of truth
+// so users can switch devices and see their history.
+//
+// Read: GET /:id/messages → up to 500 newest, ASC (oldest first).
+// Write: POST /:id/messages → returns the inserted row.
+// Clear: DELETE /:id/messages → returns the deleted count.
+
+export type ChatMessageRole = 'user' | 'assistant' | 'system';
+export type ChatMessageVariant = 'default' | 'action';
+export type ChatMessageIntent = 'chat' | 'build' | 'edit_selected' | 'edit_by_match';
+
+export interface ChatMessageRow {
+  id: string;
+  role: ChatMessageRole;
+  content: string;
+  variant: ChatMessageVariant | null;
+  intent: ChatMessageIntent | null;
+  created_at: string;
+}
+
+export interface CreateChatMessageBody {
+  role: ChatMessageRole;
+  content: string;
+  variant?: ChatMessageVariant | null;
+  intent?: ChatMessageIntent | null;
+}
+
+export async function listChatMessages(workspaceId: string): Promise<ChatMessageRow[]> {
+  const res = await fetch(`/api/workspace/${workspaceId}/messages`, {
+    headers: await authedHeaders(),
+  });
+  const body = await handleJson<{ ok: boolean; messages: ChatMessageRow[] }>(res);
+  return body.messages ?? [];
+}
+
+export async function createChatMessage(
+  workspaceId: string,
+  body: CreateChatMessageBody,
+): Promise<ChatMessageRow> {
+  const res = await fetch(`/api/workspace/${workspaceId}/messages`, {
+    method: 'POST',
+    headers: await authedHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(body),
+  });
+  const json = await handleJson<{ ok: boolean; message: ChatMessageRow }>(res);
+  return json.message;
+}
+
+export async function clearChatMessages(workspaceId: string): Promise<number> {
+  const res = await fetch(`/api/workspace/${workspaceId}/messages`, {
+    method: 'DELETE',
+    headers: await authedHeaders(),
+  });
+  const body = await handleJson<{ ok: boolean; deleted?: number }>(res);
+  return body.deleted ?? 0;
+}

@@ -719,6 +719,162 @@ workspaceRouter.post('/citations', async (req: Request, res: Response) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
+// CHAT MESSAGES — permanent persistence of ChatPanel conversations
+// ═══════════════════════════════════════════════════════════════════════
+//
+// localStorage keeps a warm cache for instant render; this table is the
+// authoritative server-side store so users can switch devices and see
+// their chat history. Scoped per workspace + user. Cascade-deletes when
+// the parent workspace is deleted (FK on studio_workspaces).
+
+const CHAT_ROLES = new Set(['user', 'assistant', 'system']);
+const CHAT_VARIANTS = new Set(['default', 'action']);
+const CHAT_INTENTS = new Set(['chat', 'build', 'edit_selected', 'edit_by_match']);
+/** Hard cap on a single message body. Mirrors the BFF's expressive ceiling
+ *  (transform/architect outputs rarely exceed ~8K) with headroom. */
+const CHAT_CONTENT_MAX = 50_000;
+/** Server-side fetch cap. Client renders all but typically caps display. */
+const CHAT_FETCH_LIMIT = 500;
+
+// GET /api/workspace/:id/messages — list persisted chat messages
+//
+// Returns up to CHAT_FETCH_LIMIT newest messages. Query orders DESC so we
+// can apply the limit, then reverses so the response is ASC (oldest →
+// newest) — the shape ChatPanel expects to render.
+//
+// TODO(infinite-scroll): if a workspace ever exceeds CHAT_FETCH_LIMIT,
+// the oldest are hidden. Add a `before` cursor + paginate when this matters.
+workspaceRouter.get('/:id/messages', async (req: Request, res: Response) => {
+  if (!dbReady(res)) return;
+  const userId = await requireUser(req, res);
+  if (!userId) return;
+  const { id } = req.params;
+  if (!isValidUuid(id)) {
+    res.status(400).json({ ok: false, error: 'invalid_uuid' });
+    return;
+  }
+  if (!(await ownedWorkspace(userId, id, res))) return;
+
+  try {
+    const { data, error } = await supabaseAdmin!
+      .from('studio_workspace_chat_messages')
+      .select('id, role, content, variant, intent, created_at')
+      .eq('workspace_id', id)
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false })
+      .limit(CHAT_FETCH_LIMIT);
+    if (error) throw new Error(error.message);
+
+    // Reverse so the response is ASC (oldest first) — matches ChatPanel's
+    // bottom-anchored render order.
+    const messages = (data ?? []).slice().reverse();
+    res.json({ ok: true, messages });
+  } catch (err) {
+    console.error('[workspace] chat messages list failed:', (err as Error).message);
+    res.status(500).json({ ok: false, error: 'chat_messages_list_failed' });
+  }
+});
+
+// POST /api/workspace/:id/messages — append one message
+//
+// Body: { role, content, variant?, intent? }. Validates against the same
+// CHECK constraints the migration enforces so the server returns a clean
+// 400 instead of a Postgres constraint-violation 500.
+workspaceRouter.post('/:id/messages', async (req: Request, res: Response) => {
+  if (!dbReady(res)) return;
+  const userId = await requireUser(req, res);
+  if (!userId) return;
+  const { id } = req.params;
+  if (!isValidUuid(id)) {
+    res.status(400).json({ ok: false, error: 'invalid_uuid' });
+    return;
+  }
+  if (!(await ownedWorkspace(userId, id, res))) return;
+
+  const body = req.body ?? {};
+  const role = typeof body.role === 'string' ? body.role : '';
+  const content = typeof body.content === 'string' ? body.content : '';
+  const variantRaw = body.variant;
+  const intentRaw = body.intent;
+
+  if (!CHAT_ROLES.has(role)) {
+    res.status(400).json({ ok: false, error: 'invalid_role' });
+    return;
+  }
+  if (!content || content.length === 0) {
+    res.status(400).json({ ok: false, error: 'content_required' });
+    return;
+  }
+  if (content.length > CHAT_CONTENT_MAX) {
+    res.status(400).json({ ok: false, error: 'content_too_large' });
+    return;
+  }
+  let variant: string | null = null;
+  if (variantRaw !== undefined && variantRaw !== null) {
+    if (typeof variantRaw !== 'string' || !CHAT_VARIANTS.has(variantRaw)) {
+      res.status(400).json({ ok: false, error: 'invalid_variant' });
+      return;
+    }
+    variant = variantRaw;
+  }
+  let intent: string | null = null;
+  if (intentRaw !== undefined && intentRaw !== null) {
+    if (typeof intentRaw !== 'string' || !CHAT_INTENTS.has(intentRaw)) {
+      res.status(400).json({ ok: false, error: 'invalid_intent' });
+      return;
+    }
+    intent = intentRaw;
+  }
+
+  try {
+    const { data, error } = await supabaseAdmin!
+      .from('studio_workspace_chat_messages')
+      .insert({
+        workspace_id: id,
+        user_id: userId,
+        role,
+        content,
+        variant,
+        intent,
+      })
+      .select('id, role, content, variant, intent, created_at')
+      .single();
+    if (error) throw new Error(error.message);
+    res.status(201).json({ ok: true, message: data });
+  } catch (err) {
+    console.error('[workspace] chat message create failed:', (err as Error).message);
+    res.status(500).json({ ok: false, error: 'chat_message_create_failed' });
+  }
+});
+
+// DELETE /api/workspace/:id/messages — wipe entire chat history for this
+// workspace + user. Returns the deleted row count for telemetry.
+workspaceRouter.delete('/:id/messages', async (req: Request, res: Response) => {
+  if (!dbReady(res)) return;
+  const userId = await requireUser(req, res);
+  if (!userId) return;
+  const { id } = req.params;
+  if (!isValidUuid(id)) {
+    res.status(400).json({ ok: false, error: 'invalid_uuid' });
+    return;
+  }
+  if (!(await ownedWorkspace(userId, id, res))) return;
+
+  try {
+    const { error, count } = await supabaseAdmin!
+      .from('studio_workspace_chat_messages')
+      .delete({ count: 'exact' })
+      .eq('workspace_id', id)
+      .eq('user_id', userId);
+    if (error) throw new Error(error.message);
+    res.json({ ok: true, deleted: count ?? 0 });
+  } catch (err) {
+    console.error('[workspace] chat messages clear failed:', (err as Error).message);
+    res.status(500).json({ ok: false, error: 'chat_messages_clear_failed' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
 // AI PRIMITIVES — transform / architect / turn
 // ═══════════════════════════════════════════════════════════════════════
 //
