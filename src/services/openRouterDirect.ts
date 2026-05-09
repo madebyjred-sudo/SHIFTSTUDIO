@@ -26,7 +26,19 @@
  * classifier callers that need strict JSON output should append a "return
  * ONLY valid JSON" instruction to the system prompt and use
  * `extractJsonObject` to defensively parse the response.
+ *
+ * COST TELEMETRY (Phase 3.B)
+ * --------------------------
+ * After every call we fire-and-forget an INSERT into `studio_ai_call_log`
+ * with model, usage, computed cost, latency, and status. The insert is
+ * wrapped in try/catch + console.warn — log failures NEVER block the
+ * user-facing response. Pricing comes from `services/aiPricing.ts`; if a
+ * model is missing there cost columns fall back to NULL but token / latency
+ * data still lands.
  */
+
+import { supabaseAdmin } from './supabaseAdminClient.js';
+import { computeCost, type UsageInput } from './aiPricing.js';
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const SWARM_API_URL =
@@ -56,6 +68,85 @@ export interface CallArgs {
   /** Trace label for Cerebro logs / dashboard rollups. Recommended:
    *  `studio.workspace.<purpose>` (e.g. `studio.workspace.turn.chat`). */
   trace_label?: string;
+  /** Studio user id (auth.users.id) for cost-attribution telemetry.
+   *  Logged into studio_ai_call_log.user_id. Nullable in dev /
+   *  bypass-auth mode. Not forwarded upstream. */
+  userId?: string | null;
+  /** Studio workspace id when the call is workspace-scoped. Logged
+   *  into studio_ai_call_log.workspace_id. Not forwarded upstream. */
+  workspaceId?: string | null;
+}
+
+/**
+ * Cerebro `/v1/llm/invoke` response shape — extended beyond the
+ * `output`/`text` we used previously to capture usage, call_id, model,
+ * and latency for cost telemetry.
+ */
+interface InvokeResponse {
+  output?: string;
+  text?: string;
+  usage?: UsageInput & {
+    total_tokens?: number | null;
+  };
+  call_id?: string;
+  model?: string;
+  latency_ms?: number;
+  agent_id?: string;
+}
+
+/**
+ * Fire-and-forget INSERT into studio_ai_call_log. Never throws —
+ * a logging failure must not break the user-facing response.
+ *
+ * Called twice from callOpenRouter: once on success (status='ok'),
+ * once on error (status='error' or 'timeout' with error_message).
+ */
+function logAiCall(row: {
+  call_id: string | null;
+  user_id: string | null;
+  workspace_id: string | null;
+  tenant_id: string | null;
+  trace_label: string | null;
+  model: string;
+  usage: (UsageInput & { total_tokens?: number | null }) | null;
+  latency_ms: number;
+  status: 'ok' | 'error' | 'timeout';
+  error_code?: string | null;
+  error_message?: string | null;
+}): void {
+  if (!supabaseAdmin) return;
+  const usage = row.usage ?? {};
+  const cost = computeCost(row.model, usage);
+  void (async () => {
+    try {
+      const { error } = await supabaseAdmin!.from('studio_ai_call_log').insert({
+        call_id: row.call_id,
+        user_id: row.user_id,
+        workspace_id: row.workspace_id,
+        tenant_id: row.tenant_id,
+        app_id: 'studio',
+        trace_label: row.trace_label,
+        model: row.model,
+        input_tokens: usage.input_tokens ?? null,
+        output_tokens: usage.output_tokens ?? null,
+        total_tokens: usage.total_tokens ?? null,
+        cache_creation_input_tokens: usage.cache_creation_input_tokens ?? null,
+        cache_read_input_tokens: usage.cache_read_input_tokens ?? null,
+        cost_usd_input: cost.cost_usd_input,
+        cost_usd_output: cost.cost_usd_output,
+        cost_usd_total: cost.cost_usd_total,
+        latency_ms: row.latency_ms,
+        status: row.status,
+        error_code: row.error_code ?? null,
+        error_message: row.error_message ?? null,
+      });
+      if (error) {
+        console.warn('[ai_call_log] insert failed:', error.message);
+      }
+    } catch (logErr) {
+      console.warn('[ai_call_log] insert threw:', (logErr as Error).message);
+    }
+  })();
 }
 
 function combineSignals(
@@ -184,26 +275,74 @@ export async function callOpenRouter(args: CallArgs): Promise<string> {
   if (system) body.system = system;
   if (typeof args.temperature === 'number') body.temperature = args.temperature;
   if (typeof args.max_tokens === 'number') body.max_tokens = args.max_tokens;
-  body.tenant = args.tenant ?? 'shift';
+  const tenantId = args.tenant ?? 'shift';
+  body.tenant = tenantId;
   if (args.trace_label) body.trace_label = args.trace_label;
 
-  const upstream = await fetch(`${SWARM_API_URL}/v1/llm/invoke`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-    signal,
-  });
+  const t0 = Date.now();
+  let upstream: Response;
+  try {
+    upstream = await fetch(`${SWARM_API_URL}/v1/llm/invoke`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal,
+    });
+  } catch (fetchErr) {
+    // Network / abort / timeout. Log telemetry then re-throw.
+    const err = fetchErr as Error;
+    const isTimeout = err?.message === 'cerebro_timeout' || err?.name === 'AbortError';
+    logAiCall({
+      call_id: null,
+      user_id: args.userId ?? null,
+      workspace_id: args.workspaceId ?? null,
+      tenant_id: tenantId,
+      trace_label: args.trace_label ?? null,
+      model: args.model,
+      usage: null,
+      latency_ms: Date.now() - t0,
+      status: isTimeout ? 'timeout' : 'error',
+      error_message: err?.message?.slice(0, 500) ?? 'fetch_failed',
+    });
+    throw fetchErr;
+  }
 
   if (!upstream.ok) {
     const errBody = await upstream.text().catch(() => '');
+    logAiCall({
+      call_id: null,
+      user_id: args.userId ?? null,
+      workspace_id: args.workspaceId ?? null,
+      tenant_id: tenantId,
+      trace_label: args.trace_label ?? null,
+      model: args.model,
+      usage: null,
+      latency_ms: Date.now() - t0,
+      status: 'error',
+      error_code: String(upstream.status),
+      error_message: errBody.slice(0, 500),
+    });
     // Keep the `openrouter_<status>` prefix shape — callers in
     // workspace.ts switch on it for status mapping (401/402/429/etc).
     throw new Error(`openrouter_${upstream.status}: ${errBody.slice(0, 300)}`);
   }
 
-  const json = (await upstream.json()) as {
-    output?: string;
-    text?: string;
-  };
+  const json = (await upstream.json()) as InvokeResponse;
+  const latencyMs = Date.now() - t0;
+
+  logAiCall({
+    call_id: json.call_id ?? null,
+    user_id: args.userId ?? null,
+    workspace_id: args.workspaceId ?? null,
+    tenant_id: tenantId,
+    trace_label: args.trace_label ?? null,
+    // Prefer the model echoed by Cerebro (confirms what was actually used)
+    // — falls back to the request model if absent.
+    model: json.model ?? args.model,
+    usage: json.usage ?? null,
+    latency_ms: latencyMs,
+    status: 'ok',
+  });
+
   return ((json?.output ?? json?.text) ?? '').trim();
 }

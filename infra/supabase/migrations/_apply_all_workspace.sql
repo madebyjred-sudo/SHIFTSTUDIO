@@ -10,6 +10,7 @@
 --   0005_studio_workspace_chat_messages.sql                  (chat history persistence)
 --   0006_studio_workspace_chat_messages_fk_userid.sql        (FK chat_messages.user_id → auth.users)
 --   0007_studio_workspace_citations_dedup_per_workspace.sql  (per-workspace citation dedup)
+--   0008_studio_ai_call_log.sql                              (per-LLM-call cost + token telemetry)
 --
 -- Idempotent: every statement uses CREATE IF NOT EXISTS / DROP IF EXISTS /
 -- ON CONFLICT DO NOTHING / pg_policies guards. Safe to re-run.
@@ -316,6 +317,48 @@ end $$;
 -- Step 3: create new unique index on (user_id, workspace_id, chunk_id).
 create unique index if not exists studio_workspace_citations_dedup
   on studio_workspace_citations(user_id, workspace_id, chunk_id);
+
+-- ════════════════════════════════════════════════════════════════════
+-- 0008_studio_ai_call_log.sql
+-- ════════════════════════════════════════════════════════════════════
+-- Per-LLM-call audit trail for cost attribution. Writes happen
+-- fire-and-forget from callOpenRouter; failure to write should NEVER
+-- block the user-facing response.
+
+create table if not exists studio_ai_call_log (
+  id            uuid primary key default gen_random_uuid(),
+  call_id       text,
+  created_at    timestamptz not null default now(),
+  user_id       uuid,
+  workspace_id  uuid,
+  tenant_id     text,
+  app_id        text default 'studio',
+  trace_label   text,
+  model         text not null,
+  input_tokens                   integer,
+  output_tokens                  integer,
+  total_tokens                   integer,
+  cache_creation_input_tokens    integer,
+  cache_read_input_tokens        integer,
+  cost_usd_input                 numeric(10, 6),
+  cost_usd_output                numeric(10, 6),
+  cost_usd_total                 numeric(10, 6),
+  latency_ms                     integer,
+  status                         text not null default 'ok',
+  error_code                     text,
+  error_message                  text
+);
+
+create index if not exists studio_ai_call_log_user_created
+  on studio_ai_call_log(user_id, created_at desc) where user_id is not null;
+
+create index if not exists studio_ai_call_log_trace_created
+  on studio_ai_call_log(trace_label, created_at desc);
+
+create index if not exists studio_ai_call_log_workspace
+  on studio_ai_call_log(workspace_id, created_at desc) where workspace_id is not null;
+
+alter table studio_ai_call_log enable row level security;
 
 -- ════════════════════════════════════════════════════════════════════
 -- END.  Verify in Supabase Studio → Table Editor / Storage that the
