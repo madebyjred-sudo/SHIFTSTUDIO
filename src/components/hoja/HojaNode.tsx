@@ -64,20 +64,29 @@ import {
 import { createSlashExtension } from './HojaSlashExtension';
 
 // ─── Color accents (left-edge bar) ────────────────────────────────────
-// Studio palette pared down to two tones: the primary blue/violet for
-// most hojas and a neutral gray for secondary cards. Burgundy/ink/sage/
-// amber are kept for backwards compatibility with rows already in the DB
-// (server allowlist still accepts them) but render as desaturated grays
-// in dark mode so an old workspace doesn't look like a candy shop.
+// Five distinct accents — restored after Phase 2.D collapsed all four
+// non-default variants to identical gray, which made the server-driven
+// `color` field invisible to users (architect/transform return rows
+// tagged burgundy/ink/sage/amber for semantic grouping; if they all
+// render gray the categorization is lost).
 //
-// Saturation in dark mode is held at /30 (was /55 for default and full
-// opacity for the rest) to keep accents calm against #080d1a.
+// Saturation kept low (0.25-0.40 alpha) so accents read as muted
+// editorial bars rather than neon — the original "too saturated"
+// complaint from 2.D was about the tone, not the variety. Each pair
+// is tuned for both light (#fafbff card) and dark (#0c1230 card)
+// backgrounds; values verified against the dark-card token to avoid
+// the under-contrast trap of the previous gray-on-gray render.
 const COLOR_ACCENTS: Record<NodeColor, string> = {
-  default:  'bg-[#1534dc]/30 dark:bg-[#8b5cf6]/30',
-  burgundy: 'bg-[#6b7280]/40 dark:bg-[#9ca3af]/30',
-  ink:      'bg-[#6b7280]/40 dark:bg-[#9ca3af]/30',
-  sage:     'bg-[#6b7280]/40 dark:bg-[#9ca3af]/30',
-  amber:    'bg-[#6b7280]/40 dark:bg-[#9ca3af]/30',
+  // Studio primary — blue (light) / violet (dark)
+  default:  'bg-[#1534dc]/35 dark:bg-[#8b5cf6]/40',
+  // Burgundy — deep rose, professional / formal
+  burgundy: 'bg-[#9f1239]/30 dark:bg-[#fb7185]/35',
+  // Ink — slate, formal / neutral
+  ink:      'bg-[#1e293b]/30 dark:bg-[#94a3b8]/35',
+  // Sage — muted green, organic / supporting
+  sage:     'bg-[#16a34a]/25 dark:bg-[#86efac]/30',
+  // Amber — warm yellow, attention / highlight
+  amber:    'bg-[#d97706]/30 dark:bg-[#fcd34d]/35',
 };
 
 // ─── Markdown ↔ HTML bridge ───────────────────────────────────────────
