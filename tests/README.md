@@ -61,23 +61,35 @@ Priority list (in risk order, per audit 2026-05-09):
 
 ✅ done • ⏳ pending
 
-## CI integration (TODO)
+## CI integration
 
-GitHub Actions workflow `.github/workflows/ci.yml` (not shipped yet):
+`.github/workflows/ci.yml` runs four jobs:
 
-```yaml
-on: [pull_request, push]
-jobs:
-  smoke:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: '20' }
-      - run: npm ci
-      - run: npx playwright install chromium --with-deps
-      - run: npm run test:smoke
-      - run: npm run test:security
-```
+- **typecheck** — `tsc --noEmit` on workspace surface (gates everything below)
+- **smoke** — `npm run test:smoke` against production
+- **security** — `npm run test:security` (P0 hotfix invariants)
+- **build** — `npm run build` + bundle-size report
+- **e2e** — runs `tests/e2e/` against the Vercel preview URL on every PR
+  (gated on `typecheck` + `build`, skipped on push-to-main)
 
-Add E2E job once we have a managed test user and Vercel preview URL.
+### E2E job — required GitHub secrets
+
+The `e2e` job uses
+[`patrickedqvist/wait-for-vercel-preview`](https://github.com/patrickedqvist/wait-for-vercel-preview)
+to discover the preview URL once Vercel finishes deploying, then runs
+`tests/e2e/login-and-create-workspace.spec.ts` against it.
+
+Two repo secrets are required for the spec to actually exercise the login
+flow (the spec auto-skips if either is missing — see
+`test.skip(!EMAIL || !PASSWORD, ...)`):
+
+| Secret               | Value                                              |
+|----------------------|----------------------------------------------------|
+| `E2E_TEST_EMAIL`     | Email of a managed Supabase auth user (`studio-test@shiftpn.com`) |
+| `E2E_TEST_PASSWORD`  | That user's password                               |
+
+Set both in **GitHub → repo → Settings → Secrets and variables → Actions**.
+
+Create / rotate the test user from the Supabase Auth dashboard
+(`Authentication → Users → Add user`) — keep the credentials only in the
+GitHub secrets store and a 1Password / vault entry, never in the repo.

@@ -93,3 +93,36 @@ jobs:
             name=$(basename "$f")
             printf "| %s | %s KB | %s KB |\n" "$name" $((size/1024)) $((gzipped/1024)) >> $GITHUB_STEP_SUMMARY
           done
+
+  e2e:
+    runs-on: ubuntu-latest
+    needs: [typecheck, build]
+    # Only run on PRs (preview deploys), not on push to main
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - name: Wait for Vercel preview deployment
+        id: vercel-preview
+        uses: patrickedqvist/wait-for-vercel-preview@v1.3.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          max_timeout: 600
+      - run: npx playwright install chromium --with-deps
+      - name: Run E2E against preview
+        env:
+          PLAYWRIGHT_BASE_URL: ${{ steps.vercel-preview.outputs.url }}
+          E2E_TEST_EMAIL: ${{ secrets.E2E_TEST_EMAIL }}
+          E2E_TEST_PASSWORD: ${{ secrets.E2E_TEST_PASSWORD }}
+        run: npm run test:e2e
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-e2e
+          path: playwright-report/
+          retention-days: 7
