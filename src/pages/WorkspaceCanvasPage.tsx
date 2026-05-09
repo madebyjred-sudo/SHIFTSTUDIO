@@ -151,6 +151,16 @@ function CanvasInner({
   // Desktop keeps the persistent 360px sidebar.
   const [mobileChatOpen, setMobileChatOpen] = useState(false);
 
+  // ── Per-file upload progress ─────────────────────────────────────
+  // Map<uploadId, {name, percent, size}>. Each entry is created when a
+  // file is picked and removed when its import settles (success or
+  // error). Rendered as a floating list bottom-right so the user sees
+  // bytes moving instead of a static "Importando…" spinner.
+  type ActiveUpload = { name: string; percent: number; size: number };
+  const [uploads, setUploads] = useState<Map<string, ActiveUpload>>(
+    () => new Map(),
+  );
+
   const fileInputRef = useRef<HTMLInputElement>(null);
   // Use a Map so we can iterate it cleanly on unmount.
   const positionSaveTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
@@ -392,6 +402,12 @@ function CanvasInner({
   // Process every file in the batch even if some fail. We keep a
   // running list of failures and report them after the loop so the
   // banner reflects the worst case without silencing successes.
+  //
+  // Progress: each picked file gets a UUID-keyed entry in the `uploads`
+  // map. importAsset's onProgress callback updates `percent` live. The
+  // entry is removed in the finally block once that file's import has
+  // settled (resolved or rejected) so the floating widget shows only
+  // active uploads.
   const handleFilesPicked = useCallback(async (files: FileList | null) => {
     if (!files || files.length === 0) return;
     const basePos = gridPosition(nodes.length);
@@ -399,10 +415,30 @@ function CanvasInner({
     const failures: string[] = [];
     for (const file of Array.from(files)) {
       const offset = i * 24;
+      const uploadId =
+        typeof crypto !== 'undefined' && 'randomUUID' in crypto
+          ? crypto.randomUUID()
+          : `${Date.now()}-${i}-${Math.random().toString(36).slice(2, 8)}`;
+
+      setUploads((prev) => {
+        const next = new Map(prev);
+        next.set(uploadId, { name: file.name, percent: 0, size: file.size });
+        return next;
+      });
+
       try {
         const apiNode = await importAsset(workspaceId, file, {
           x: basePos.x + offset,
           y: basePos.y + offset,
+          onProgress: ({ percent }) => {
+            setUploads((prev) => {
+              // If the entry was already cleared (e.g. unmount), skip.
+              if (!prev.has(uploadId)) return prev;
+              const next = new Map(prev);
+              next.set(uploadId, { name: file.name, percent, size: file.size });
+              return next;
+            });
+          },
         });
         const rfNode = toRFNode(apiNode, workspaceId, { onDelete: handleDelete, onSelect: handleSelect, onUpdate: handleNodeUpdate });
         setNodes((ns) => [...ns, rfNode]);
@@ -410,6 +446,13 @@ function CanvasInner({
       } catch (err) {
         const detail = err instanceof Error ? err.message : 'Error desconocido';
         failures.push(`${file.name}: ${detail}`);
+      } finally {
+        setUploads((prev) => {
+          if (!prev.has(uploadId)) return prev;
+          const next = new Map(prev);
+          next.delete(uploadId);
+          return next;
+        });
       }
       i++;
     }
@@ -663,6 +706,52 @@ function CanvasInner({
               aria-label="Cerrar error"
               className="text-rose-700 dark:text-rose-300 hover:opacity-70 text-lg leading-none shrink-0"
             >×</button>
+          </div>
+        )}
+
+        {/* Floating per-file upload progress (bottom-right). aria-live so
+             screen readers announce progress as percent climbs without
+             stealing focus. Hidden entirely when no uploads are active. */}
+        {uploads.size > 0 && (
+          <div
+            className="absolute bottom-4 right-4 z-30 w-72 space-y-2 pointer-events-none"
+            aria-live="polite"
+            aria-label="Subidas en curso"
+          >
+            {[...uploads.entries()].map(([id, u]) => (
+              <div
+                key={id}
+                className="bg-white/95 dark:bg-[#0c1230]/95 backdrop-blur-xl border border-black/8 dark:border-white/10 rounded-xl p-3 shadow-lg"
+              >
+                <div className="flex justify-between items-center gap-2 text-xs mb-1.5">
+                  <span
+                    className="truncate font-medium text-[#0e1745] dark:text-white"
+                    title={u.name}
+                  >
+                    {u.name}
+                  </span>
+                  <span className="text-[#0e1745]/55 dark:text-white/55 tabular-nums shrink-0">
+                    {u.percent}%
+                  </span>
+                </div>
+                <div
+                  className="h-1.5 bg-black/8 dark:bg-white/10 rounded-full overflow-hidden"
+                  role="progressbar"
+                  aria-valuenow={u.percent}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-label={`Subiendo ${u.name}`}
+                >
+                  <div
+                    className="h-full bg-[#1534dc] dark:bg-[#8b5cf6] transition-all duration-150"
+                    style={{ width: `${u.percent}%` }}
+                  />
+                </div>
+                <div className="text-[10px] text-[#0e1745]/50 dark:text-white/45 mt-1 tabular-nums">
+                  {(u.size / 1_048_576).toFixed(1)} MB
+                </div>
+              </div>
+            ))}
           </div>
         )}
 
