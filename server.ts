@@ -5,6 +5,8 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { AGENT_MAP, MODEL_MAP, isDebateRequest } from "./src/shared/constants.js";
 import { workspaceRouter } from "./src/routes/index.js";
+import { correlationMiddleware } from "./src/routes/workspace.js";
+import { logger } from "./src/lib/logger.js";
 
 dotenv.config();
 
@@ -34,6 +36,13 @@ async function startServer() {
   const PORT = Number(process.env.PORT) || 3001;
 
   app.use(express.json());
+
+  // Per-request correlation: every handler downstream can read
+  // req.requestId / req.log. Mounted globally (not just under
+  // /api/workspace) so the chat / debate / export endpoints inherit
+  // the same shape — they keep using console.* for now, but their
+  // future rewrite picks up correlation IDs for free.
+  app.use(correlationMiddleware);
 
   // CORS — Permite requests del BrandHub (Shift y futuro Garnier)
   app.use((req, res, next) => {
@@ -351,6 +360,17 @@ async function startServer() {
   }
 
   app.listen(PORT, "0.0.0.0", () => {
+    // Structured boot log — feature-flag-style booleans so log greps
+    // can answer "is supabase wired in this deploy?" without sweeping
+    // every endpoint's failure path.
+    logger.info('boot', {
+      node_env: process.env.NODE_ENV ?? 'development',
+      port: PORT,
+      swarm_api_url: SWARM_API_URL,
+      has_supabase: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY),
+      has_openrouter: Boolean(process.env.OPENROUTER_API_KEY),
+      has_gamma: Boolean(process.env.GAMMA_API_KEY),
+    });
     console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
     console.log(`🚀 Shift AI Gateway (v1.0 Bridge) running on http://localhost:${PORT}`);
     console.log(`🧠 Swarm Backend: ${SWARM_API_URL}`);

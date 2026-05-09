@@ -35,7 +35,7 @@
  *   POST   /citations                 save chunk to user inbox / pinned to node
  */
 import crypto from 'node:crypto';
-import { Router, type Request, type Response } from 'express';
+import { Router, type NextFunction, type Request, type Response } from 'express';
 import { supabaseAdmin } from '../services/supabaseAdminClient.js';
 import { getUserIdFromRequest, isValidUuid } from '../services/auth.js';
 import {
@@ -46,8 +46,43 @@ import {
 import { firePeajeIngest } from '../services/peajeClient.js';
 import { getApprovedRag } from '../services/puntoMedioClient.js';
 import { GammaApiError } from '../services/gammaApi.js';
+import { logger, type Logger } from '../lib/logger.js';
 
 export const workspaceRouter = Router();
+
+// ─── Per-request correlation middleware ─────────────────────────────
+//
+// Every workspace request gets:
+//   req.requestId — uuidv4, propagated to every log line in this turn
+//   req.log       — child logger pre-bound with {requestId, route, method}
+//
+// Mounted FIRST so handlers downstream can rely on req.log being set.
+// Also exported so the Vercel bridge (api/workspace.ts) can mount the
+// same middleware before the router runs.
+export function correlationMiddleware(req: Request, _res: Response, next: NextFunction): void {
+  // Idempotent — if an outer mount (e.g. api/workspace.ts on Vercel)
+  // already attached a requestId, reuse it so the same chain of log
+  // lines remains filterable by a single ID.
+  const requestId = req.requestId ?? crypto.randomUUID();
+  req.requestId = requestId;
+  req.log = logger.child({
+    requestId,
+    route: req.path,
+    method: req.method,
+  });
+  next();
+}
+
+workspaceRouter.use(correlationMiddleware);
+
+/**
+ * Pull `req.log` defensively — if upstream forgot to mount the
+ * middleware (shouldn't happen) we fall back to the root logger so
+ * callers never crash on `req.log!.info(...)`.
+ */
+function reqLog(req: Request): Logger {
+  return req.log ?? logger;
+}
 
 // Allowed colors mirror the CHECK constraint in 0001_studio_workspace.sql.
 const ALLOWED_COLORS = new Set(['default', 'burgundy', 'ink', 'sage', 'amber']);
@@ -97,7 +132,7 @@ async function ownedWorkspace(
     .eq('user_id', userId)
     .maybeSingle();
   if (error) {
-    console.error('[workspace] ownership check failed:', error.message);
+    reqLog(res.req).error('workspace.ownership_check.failed', { message: error.message });
     res.status(500).json({ ok: false, error: 'ownership_check_failed' });
     return false;
   }
@@ -158,7 +193,7 @@ workspaceRouter.get('/', async (req: Request, res: Response) => {
 
     res.json({ ok: true, items });
   } catch (err) {
-    console.error('[workspace] list failed:', (err as Error).message);
+    reqLog(req).error('workspace.list.failed', { message: (err as Error).message });
     res.status(500).json({ ok: false, error: 'list_failed' });
   }
 });
@@ -182,10 +217,10 @@ workspaceRouter.post('/', async (req: Request, res: Response) => {
       .single();
     if (error) throw new Error(error.message);
 
-    console.log(`[workspace] created ${data?.id} for user ${userId}`);
+    reqLog(req).info('workspace.create.ok', { workspaceId: data?.id, userId });
     res.status(201).json({ ok: true, workspace: { ...data, node_count: 0 } });
   } catch (err) {
-    console.error('[workspace] create failed:', (err as Error).message);
+    reqLog(req).error('workspace.create.failed', { message: (err as Error).message });
     res.status(500).json({ ok: false, error: 'create_failed' });
   }
 });
@@ -223,7 +258,7 @@ workspaceRouter.get('/:id', async (req: Request, res: Response) => {
 
     res.json({ ok: true, workspace: ws, nodes: nodes ?? [] });
   } catch (err) {
-    console.error('[workspace] get failed:', (err as Error).message);
+    reqLog(req).error('workspace.get.failed', { message: (err as Error).message });
     res.status(500).json({ ok: false, error: 'get_failed' });
   }
 });
@@ -265,7 +300,7 @@ workspaceRouter.patch('/:id', async (req: Request, res: Response) => {
     }
     res.json({ ok: true, workspace: data });
   } catch (err) {
-    console.error('[workspace] update failed:', (err as Error).message);
+    reqLog(req).error('workspace.update.failed', { message: (err as Error).message });
     res.status(500).json({ ok: false, error: 'update_failed' });
   }
 });
@@ -292,10 +327,10 @@ workspaceRouter.delete('/:id', async (req: Request, res: Response) => {
       res.status(404).json({ ok: false, error: 'workspace_not_found' });
       return;
     }
-    console.log(`[workspace] deleted ${id} for user ${userId}`);
+    reqLog(req).info('workspace.delete.ok', { workspaceId: id, userId });
     res.json({ ok: true });
   } catch (err) {
-    console.error('[workspace] delete failed:', (err as Error).message);
+    reqLog(req).error('workspace.delete.failed', { message: (err as Error).message });
     res.status(500).json({ ok: false, error: 'delete_failed' });
   }
 });
@@ -330,7 +365,7 @@ workspaceRouter.get('/:id/nodes', async (req: Request, res: Response) => {
     if (error) throw new Error(error.message);
     res.json({ ok: true, nodes: data ?? [] });
   } catch (err) {
-    console.error('[workspace] nodes list failed:', (err as Error).message);
+    reqLog(req).error('workspace.nodes.list.failed', { message: (err as Error).message });
     res.status(500).json({ ok: false, error: 'nodes_list_failed' });
   }
 });
@@ -361,7 +396,7 @@ workspaceRouter.get('/:id/nodes/:nodeId', async (req: Request, res: Response) =>
     }
     res.json({ ok: true, node: data });
   } catch (err) {
-    console.error('[workspace] node get failed:', (err as Error).message);
+    reqLog(req).error('workspace.node.get.failed', { message: (err as Error).message });
     res.status(500).json({ ok: false, error: 'node_get_failed' });
   }
 });
@@ -419,7 +454,7 @@ workspaceRouter.post('/:id/nodes', async (req: Request, res: Response) => {
     if (error) throw new Error(error.message);
     res.status(201).json({ ok: true, node: data });
   } catch (err) {
-    console.error('[workspace] node create failed:', (err as Error).message);
+    reqLog(req).error('workspace.node.create.failed', { message: (err as Error).message });
     res.status(500).json({ ok: false, error: 'node_create_failed' });
   }
 });
@@ -491,7 +526,7 @@ workspaceRouter.patch('/:id/nodes/:nodeId', async (req: Request, res: Response) 
     }
     res.json({ ok: true, node: data });
   } catch (err) {
-    console.error('[workspace] node update failed:', (err as Error).message);
+    reqLog(req).error('workspace.node.update.failed', { message: (err as Error).message });
     res.status(500).json({ ok: false, error: 'node_update_failed' });
   }
 });
@@ -521,7 +556,7 @@ workspaceRouter.delete('/:id/nodes/:nodeId', async (req: Request, res: Response)
     }
     res.json({ ok: true });
   } catch (err) {
-    console.error('[workspace] node delete failed:', (err as Error).message);
+    reqLog(req).error('workspace.node.delete.failed', { message: (err as Error).message });
     res.status(500).json({ ok: false, error: 'node_delete_failed' });
   }
 });
@@ -617,7 +652,7 @@ workspaceRouter.get('/:id/attach-context', async (req: Request, res: Response) =
       truncated,
     });
   } catch (err) {
-    console.error('[workspace] attach-context failed:', (err as Error).message);
+    reqLog(req).error('workspace.attach_context.failed', { message: (err as Error).message });
     res.status(500).json({ ok: false, error: 'attach_context_failed' });
   }
 });
@@ -684,10 +719,9 @@ workspaceRouter.post('/citations', async (req: Request, res: Response) => {
         return;
       }
     } catch (err) {
-      console.error(
-        '[workspace] citation node ownership check failed:',
-        (err as Error).message
-      );
+      reqLog(req).error('workspace.citation.node_ownership_check.failed', {
+        message: (err as Error).message,
+      });
       res.status(500).json({ ok: false, error: 'citation_save_failed' });
       return;
     }
@@ -712,7 +746,7 @@ workspaceRouter.post('/citations', async (req: Request, res: Response) => {
     if (error) throw new Error(error.message);
     res.status(201).json({ ok: true, citation: data });
   } catch (err) {
-    console.error('[workspace] citation save failed:', (err as Error).message);
+    reqLog(req).error('workspace.citation.save.failed', { message: (err as Error).message });
     res.status(500).json({ ok: false, error: 'citation_save_failed' });
   }
 });
@@ -769,7 +803,7 @@ workspaceRouter.get('/:id/messages', async (req: Request, res: Response) => {
     const messages = (data ?? []).slice().reverse();
     res.json({ ok: true, messages });
   } catch (err) {
-    console.error('[workspace] chat messages list failed:', (err as Error).message);
+    reqLog(req).error('workspace.chat_messages.list.failed', { message: (err as Error).message });
     res.status(500).json({ ok: false, error: 'chat_messages_list_failed' });
   }
 });
@@ -841,7 +875,7 @@ workspaceRouter.post('/:id/messages', async (req: Request, res: Response) => {
     if (error) throw new Error(error.message);
     res.status(201).json({ ok: true, message: data });
   } catch (err) {
-    console.error('[workspace] chat message create failed:', (err as Error).message);
+    reqLog(req).error('workspace.chat_message.create.failed', { message: (err as Error).message });
     res.status(500).json({ ok: false, error: 'chat_message_create_failed' });
   }
 });
@@ -868,7 +902,7 @@ workspaceRouter.delete('/:id/messages', async (req: Request, res: Response) => {
     if (error) throw new Error(error.message);
     res.json({ ok: true, deleted: count ?? 0 });
   } catch (err) {
-    console.error('[workspace] chat messages clear failed:', (err as Error).message);
+    reqLog(req).error('workspace.chat_messages.clear.failed', { message: (err as Error).message });
     res.status(500).json({ ok: false, error: 'chat_messages_clear_failed' });
   }
 });
@@ -994,13 +1028,17 @@ workspaceRouter.post('/:id/transform', async (req: Request, res: Response) => {
     }
 
     const ms = Date.now() - t0;
-    console.log(
-      `[workspace] transform ok action=${action} model=${model} in_chars=${selection.length} out_chars=${text.length} ms=${ms}`,
-    );
+    reqLog(req).info('workspace.transform.ok', {
+      action,
+      model,
+      in_chars: selection.length,
+      out_chars: text.length,
+      ms,
+    });
     res.json({ ok: true, text, action, model, ms });
   } catch (err) {
     const msg = (err as Error).message;
-    console.warn('[workspace] transform failed:', msg);
+    reqLog(req).warn('workspace.transform.failed', { message: msg });
     if (msg.startsWith('openrouter_')) {
       res.status(502).json({ ok: false, error: 'transform_upstream_error', detail: msg.slice(0, 200) });
     } else {
@@ -1167,14 +1205,19 @@ async function runArchitect(
   // is a smell that the model returned skeletons).
   const contentLens = parsed.hojas.map((h) => String(h.content_md ?? '').length);
   const avgLen = contentLens.reduce((s, n) => s + n, 0) / contentLens.length;
+  // runArchitect is shared by /architect and /turn intent=build — it
+  // has no Request handle, so we emit on the root logger. The caller
+  // logs the request-scoped wrapper line.
   if (avgLen < 200) {
-    console.warn(
-      `[architect] LOW CONTENT — avg=${avgLen.toFixed(0)} chars/hoja, count=${parsed.hojas.length}`,
-    );
+    logger.warn('architect.low_content', {
+      avg_chars: Math.round(avgLen),
+      hojas: parsed.hojas.length,
+    });
   } else {
-    console.log(
-      `[architect] ok — ${parsed.hojas.length} hojas, avg ${avgLen.toFixed(0)} chars/body`,
-    );
+    logger.info('architect.ok', {
+      hojas: parsed.hojas.length,
+      avg_chars: Math.round(avgLen),
+    });
   }
 
   // Layout: 4-column grid, 360×280 with 40px gutter, 80px left margin.
@@ -1260,9 +1303,11 @@ workspaceRouter.post('/:id/architect', async (req: Request, res: Response) => {
   try {
     const result = await runArchitect(id, prompt, abortController.signal, userId);
     const model = process.env.ARCHITECT_MODEL ?? 'anthropic/claude-sonnet-4.6';
-    console.log(
-      `[workspace] architect ok ws=${id} hojas=${result.nodes.length} ms=${result.ms}`,
-    );
+    reqLog(req).info('workspace.architect.ok', {
+      workspaceId: id,
+      hojas: result.nodes.length,
+      ms: result.ms,
+    });
     res.json({
       ok: true,
       intent: 'build',
@@ -1273,7 +1318,7 @@ workspaceRouter.post('/:id/architect', async (req: Request, res: Response) => {
     });
   } catch (err) {
     const msg = (err as Error).message;
-    console.warn('[workspace] architect failed:', msg);
+    reqLog(req).warn('workspace.architect.failed', { message: msg });
     if (msg.startsWith('openrouter_')) {
       res.status(502).json({ ok: false, error: 'architect_upstream_error', detail: msg.slice(0, 200) });
     } else {
@@ -1398,7 +1443,7 @@ workspaceRouter.post('/:id/turn', async (req: Request, res: Response) => {
   if (requestedAgentId) {
     intent = agentId === 'lexa' ? 'chat' : selectedNodeId ? 'edit_selected' : 'build';
     classifierTargetNodeId = selectedNodeId ?? null;
-    console.log(`[workspace/turn] agent_picker agent=${agentId} intent=${intent}`);
+    reqLog(req).info('workspace.turn.agent_picker', { agent: agentId, intent });
   } else if (mode === 'manual' && forcedIntent) {
     intent = forcedIntent;
   } else {
@@ -1456,11 +1501,13 @@ Return ONLY valid JSON matching the schema. No prose, no code fences, no preambl
       classifierTargetNodeId = clfParsed.target_node_id ?? null;
       intent =
         classifierConfidence >= 0.7 && clfParsed.intent ? clfParsed.intent : 'chat';
-      console.log(
-        `[workspace/turn] classifier intent=${intent} conf=${classifierConfidence.toFixed(2)} target=${classifierTargetNodeId}`,
-      );
+      reqLog(req).info('workspace.turn.classifier.ok', {
+        intent,
+        confidence: Number(classifierConfidence.toFixed(2)),
+        target_node_id: classifierTargetNodeId,
+      });
     } catch (clfErr) {
-      console.warn('[workspace/turn] classifier failed:', (clfErr as Error).message);
+      reqLog(req).warn('workspace.turn.classifier.failed', { message: (clfErr as Error).message });
       intent = 'chat';
     }
   }
@@ -1663,12 +1710,14 @@ Return ONLY valid JSON matching the schema. No prose, no code fences, no preambl
         userId,
         workspaceId: id,
       });
-      console.log(
-        `[workspace/turn] chat ok chars=${assembled.length} model=${TURN_CHAT_MODEL} ws=${id}`,
-      );
+      reqLog(req).info('workspace.turn.chat.ok', {
+        chars: assembled.length,
+        model: TURN_CHAT_MODEL,
+        workspaceId: id,
+      });
     } catch (callErr) {
       const msg = (callErr as Error).message;
-      console.warn('[workspace/turn] chat call failed:', msg);
+      reqLog(req).warn('workspace.turn.chat.failed', { message: msg });
       // Parse the OpenRouter error for a clean status code if possible.
       const codeMatch = msg.match(/openrouter[_\s]+(\d+)/i);
       const code = codeMatch ? parseInt(codeMatch[1], 10) : 502;
@@ -1746,7 +1795,7 @@ Return ONLY valid JSON matching the schema. No prose, no code fences, no preambl
       });
     } catch (err) {
       const msg = (err as Error).message;
-      console.warn('[workspace/turn] build failed:', msg);
+      reqLog(req).warn('workspace.turn.build.failed', { message: msg });
       if (msg.startsWith('openrouter_')) {
         res
           .status(502)
@@ -1826,7 +1875,7 @@ Return ONLY valid JSON matching the schema. No prose, no code fences, no preambl
       });
     } catch (err) {
       const msg = (err as Error).message;
-      console.warn('[workspace/turn] edit_selected failed:', msg);
+      reqLog(req).warn('workspace.turn.edit_selected.failed', { message: msg });
       if (msg.startsWith('openrouter_')) {
         res
           .status(502)
@@ -1905,7 +1954,7 @@ Return ONLY valid JSON matching the schema. No prose, no code fences, no preambl
       });
     } catch (err) {
       const msg = (err as Error).message;
-      console.warn('[workspace/turn] edit_by_match failed:', msg);
+      reqLog(req).warn('workspace.turn.edit_by_match.failed', { message: msg });
       if (msg.startsWith('openrouter_')) {
         res
           .status(502)
@@ -2068,9 +2117,10 @@ workspaceRouter.post('/:id/export', async (req: Request, res: Response) => {
         if (start.status === 'complete') {
           // Cache hit — same shape the legacy "wait for it" flow returned.
           const result = start.result;
-          console.log(
-            `[workspace] export pptx cache hit workspaceId=${id} generationId=${result.generationId}`,
-          );
+          reqLog(req).info('workspace.export.pptx.cache_hit', {
+            workspaceId: id,
+            generationId: result.generationId,
+          });
           res.json({
             ok: true,
             format: 'pptx',
@@ -2086,9 +2136,11 @@ workspaceRouter.post('/:id/export', async (req: Request, res: Response) => {
           return;
         }
         // Pending — return the generationId so the client can poll.
-        console.log(
-          `[workspace] export pptx kicked off workspaceId=${id} hojas=${ordered.length} generationId=${start.generationId}`,
-        );
+        reqLog(req).info('workspace.export.pptx.kicked_off', {
+          workspaceId: id,
+          hojas: ordered.length,
+          generationId: start.generationId,
+        });
         res.json({
           ok: true,
           format: 'pptx',
@@ -2102,9 +2154,11 @@ workspaceRouter.post('/:id/export', async (req: Request, res: Response) => {
         return;
       } catch (err) {
         if (err instanceof GammaApiError) {
-          console.warn(
-            `[workspace] export pptx failed workspaceId=${id} code=${err.code} error=${err.message}`,
-          );
+          reqLog(req).warn('workspace.export.pptx.failed', {
+            workspaceId: id,
+            code: err.code,
+            message: err.message,
+          });
           const statusMap: Record<string, number> = {
             auth: 503,
             insufficient_credits: 402,
@@ -2755,9 +2809,12 @@ workspaceRouter.post('/:id/export', async (req: Request, res: Response) => {
     void NumberFormat;
     const buffer = await Packer.toBuffer(doc);
 
-    console.log(
-      `[workspace] export ok workspaceId=${id} format=${format} hojas=${ordered.length} bytes=${buffer.length}`,
-    );
+    reqLog(req).info('workspace.export.ok', {
+      workspaceId: id,
+      format,
+      hojas: ordered.length,
+      bytes: buffer.length,
+    });
 
     res.setHeader(
       'Content-Type',
@@ -2766,7 +2823,7 @@ workspaceRouter.post('/:id/export', async (req: Request, res: Response) => {
     res.setHeader('Content-Disposition', `attachment; filename="${safeName}.docx"`);
     res.send(buffer);
   } catch (err) {
-    console.warn('[workspace] export failed:', (err as Error).message);
+    reqLog(req).warn('workspace.export.failed', { message: (err as Error).message });
     res.status(500).json({ ok: false, error: (err as Error).message });
   }
 });
@@ -2826,9 +2883,11 @@ workspaceRouter.get('/:id/export/pptx-status', async (req: Request, res: Respons
     }
 
     if (out.status === 'failed') {
-      console.warn(
-        `[workspace] pptx-status failed workspaceId=${id} generationId=${generationId} error=${out.error}`,
-      );
+      reqLog(req).warn('workspace.pptx_status.failed', {
+        workspaceId: id,
+        generationId,
+        message: out.error,
+      });
       res.json({
         ok: true,
         status: 'failed',
@@ -2840,9 +2899,10 @@ workspaceRouter.get('/:id/export/pptx-status', async (req: Request, res: Respons
 
     // Complete.
     const result = out.result;
-    console.log(
-      `[workspace] pptx-status complete workspaceId=${id} generationId=${result.generationId}`,
-    );
+    reqLog(req).info('workspace.pptx_status.complete', {
+      workspaceId: id,
+      generationId: result.generationId,
+    });
     res.json({
       ok: true,
       status: 'complete',
@@ -2858,9 +2918,11 @@ workspaceRouter.get('/:id/export/pptx-status', async (req: Request, res: Respons
     });
   } catch (err) {
     if (err instanceof GammaApiError) {
-      console.warn(
-        `[workspace] pptx-status gamma error workspaceId=${id} code=${err.code} error=${err.message}`,
-      );
+      reqLog(req).warn('workspace.pptx_status.gamma_error', {
+        workspaceId: id,
+        code: err.code,
+        message: err.message,
+      });
       const statusMap: Record<string, number> = {
         auth: 503,
         insufficient_credits: 402,
@@ -2880,7 +2942,7 @@ workspaceRouter.get('/:id/export/pptx-status', async (req: Request, res: Respons
       });
       return;
     }
-    console.warn('[workspace] pptx-status failed:', (err as Error).message);
+    reqLog(req).warn('workspace.pptx_status.failed', { message: (err as Error).message });
     res.status(500).json({ ok: false, error: (err as Error).message });
   }
 });
@@ -2966,9 +3028,12 @@ async function extractAssetText(buffer: Buffer, mime: string): Promise<string | 
   // Per-format size cap. Above this we skip extraction outright — the
   // parsers (mammoth / pdf-parse) overflow before they finish.
   if (buffer.length > ASSET_EXTRACT_MAX_BYTES) {
-    console.warn(
-      `[workspace] asset_extract_skipped_oversize mime=${mime} bytes=${buffer.length} cap=${ASSET_EXTRACT_MAX_BYTES}`,
-    );
+    // No request scope here (free helper); root logger is fine.
+    logger.warn('workspace.asset_extract.skipped_oversize', {
+      mime,
+      bytes: buffer.length,
+      cap: ASSET_EXTRACT_MAX_BYTES,
+    });
     return null;
   }
   // PDF
@@ -3128,9 +3193,11 @@ workspaceRouter.post(
       try {
         extractedText = await extractAssetText(fileBuffer, mime);
       } catch (extractErr) {
-        console.warn(
-          `[workspace] asset_extract_failed mime=${mime} bytes=${size} error=${(extractErr as Error).message}`,
-        );
+        reqLog(req).warn('workspace.asset_extract.failed', {
+          mime,
+          bytes: size,
+          message: (extractErr as Error).message,
+        });
       }
 
       // Release the buffer reference now that upload + extraction are done.
@@ -3173,15 +3240,21 @@ workspaceRouter.post(
         throw new Error(`insert: ${nErr.message}`);
       }
 
-      console.log(
-        `[workspace] finalize-asset ok workspaceId=${id} nodeId=${node.id} mime=${mime} bytes=${size} type=${assetType}`,
-      );
+      reqLog(req).info('workspace.finalize_asset.ok', {
+        workspaceId: id,
+        nodeId: node.id,
+        mime,
+        bytes: size,
+        type: assetType,
+      });
 
       res.status(201).json({ ok: true, node });
     } catch (err) {
-      console.warn(
-        `[workspace] finalize-asset failed workspaceId=${id} mime=${mime} error=${(err as Error).message}`,
-      );
+      reqLog(req).warn('workspace.finalize_asset.failed', {
+        workspaceId: id,
+        mime,
+        message: (err as Error).message,
+      });
       res.status(500).json({ ok: false, error: (err as Error).message });
     }
   },
@@ -3276,9 +3349,10 @@ workspaceRouter.post(
         truncated: extracted.includes('[…truncado por longitud]'),
       });
     } catch (err) {
-      console.warn(
-        `[workspace] reextract failed nodeId=${nodeId} error=${(err as Error).message}`,
-      );
+      reqLog(req).warn('workspace.reextract.failed', {
+        nodeId,
+        message: (err as Error).message,
+      });
       res.status(500).json({ ok: false, error: (err as Error).message });
     }
   },

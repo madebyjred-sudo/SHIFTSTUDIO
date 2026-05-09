@@ -48,7 +48,7 @@
  */
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import express from 'express';
-import { workspaceRouter } from '../src/routes/workspace.js';
+import { workspaceRouter, correlationMiddleware } from '../src/routes/workspace.js';
 
 // One-shot Express app, lazily constructed on cold-start. Vercel keeps
 // the warm container around between invocations so this is built once
@@ -94,6 +94,13 @@ function getApp(): express.Express {
     }
     next();
   });
+
+  // Per-request correlation: attach req.requestId + req.log BEFORE the
+  // workspace router runs. The router itself also mounts the same
+  // middleware (so direct Express tests still get correlation IDs); the
+  // double-mount is idempotent — if `req.requestId` is already set the
+  // child logger just replaces itself with one bound to the same id.
+  app.use(correlationMiddleware);
 
   // Mount the same router server.ts uses. Path prefix matches the URL
   // shape Vercel sends ("/api/workspace/...") so the router's relative
