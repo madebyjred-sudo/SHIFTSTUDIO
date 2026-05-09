@@ -246,7 +246,16 @@ function CanvasInner({
   }, [onNodesChange, workspaceId]);
 
   // ── Keyboard: Delete/Backspace removes selected ──────────────────
+  // Scoped to the canvas pane (not window) so Backspace anywhere else in
+  // the app — toolbar, chat, popovers, modals — never destroys a node.
+  // Also gated behind a confirm because the previous global handler had
+  // a high blast radius: clicking into a hoja header and back out left
+  // selectedNodeId set, so a stray Backspace after dismissing a popover
+  // would delete the last-selected node with zero recovery surface.
+  const canvasPaneRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
+    const el = canvasPaneRef.current;
+    if (!el) return;
     const handler = (e: KeyboardEvent) => {
       if (
         e.target instanceof HTMLInputElement ||
@@ -254,11 +263,12 @@ function CanvasInner({
         (e.target as HTMLElement).contentEditable === 'true'
       ) return;
       if ((e.key === 'Delete' || e.key === 'Backspace') && selectedNodeId) {
+        if (!window.confirm('¿Borrar la hoja seleccionada? Esta acción no se puede deshacer.')) return;
         void handleDelete(selectedNodeId);
       }
     };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
+    el.addEventListener('keydown', handler);
+    return () => el.removeEventListener('keydown', handler);
   }, [selectedNodeId, handleDelete]);
 
   // ── Surface a backend error in the inline banner. Auto-dismiss 6s. ──
@@ -506,8 +516,26 @@ function CanvasInner({
         </div>
       )}
 
-      {/* ── Canvas ────────────────────────────────────────────────── */}
-      <div className="flex-1 relative h-full">
+      {/* ── Canvas ──────────────────────────────────────────────────
+        tabIndex=-1 + ref + onBlur: lets the pane hold focus so the
+        scoped Backspace listener fires, and clears the selection when
+        focus actually leaves the canvas (e.g. user tabs into ChatPanel
+        or a popover). Without this, selectedNodeId could linger across
+        unrelated focus changes and a stray Backspace would delete it. */}
+      <div
+        ref={canvasPaneRef}
+        tabIndex={-1}
+        onBlur={(e) => {
+          // Cast through `unknown` because xyflow's `Node` type shadows
+          // the DOM Node import in this file. We just need a DOM-Node
+          // reference for `contains` to detect cross-pane focus moves.
+          const next = e.relatedTarget as unknown as globalThis.Node | null;
+          if (!e.currentTarget.contains(next)) {
+            setSelectedNodeId(null);
+          }
+        }}
+        className="flex-1 relative h-full focus:outline-none"
+      >
         {/* Inline action error banner — surfaces backend failures from
              create/import so the user sees the real reason instead of a
              silent no-op. Auto-dismissed after 6s, also dismissable. */}
