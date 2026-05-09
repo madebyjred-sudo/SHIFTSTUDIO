@@ -984,6 +984,8 @@ workspaceRouter.post('/:id/transform', async (req: Request, res: Response) => {
       signal: abortController.signal,
       tenant: 'shift',
       trace_label: `studio.workspace.transform.${action}`,
+      userId,
+      workspaceId: id,
     });
 
     if (!text) {
@@ -1062,6 +1064,7 @@ async function runArchitect(
   workspaceId: string,
   prompt: string,
   signal?: AbortSignal,
+  userId?: string,
 ): Promise<ArchitectResult> {
   // LLM calls are routed via Cerebro (`SWARM_API_URL`/v1/llm/invoke); no
   // per-call OpenRouter key check is needed here.
@@ -1134,6 +1137,8 @@ async function runArchitect(
     signal,
     tenant: 'shift',
     trace_label: 'studio.workspace.architect',
+    userId: userId ?? null,
+    workspaceId,
   });
 
   let parsed: { hojas?: Array<Record<string, unknown>>; summary?: string };
@@ -1253,7 +1258,7 @@ workspaceRouter.post('/:id/architect', async (req: Request, res: Response) => {
   req.on('close', () => abortController.abort());
 
   try {
-    const result = await runArchitect(id, prompt, abortController.signal);
+    const result = await runArchitect(id, prompt, abortController.signal, userId);
     const model = process.env.ARCHITECT_MODEL ?? 'anthropic/claude-sonnet-4.6';
     console.log(
       `[workspace] architect ok ws=${id} hojas=${result.nodes.length} ms=${result.ms}`,
@@ -1436,8 +1441,10 @@ Return ONLY valid JSON matching the schema. No prose, no code fences, no preambl
         max_tokens: 2000,
         temperature: 0.1,
         timeoutMs: 15_000,
-        tenant: 'shift',
+        tenant: tenantId,
         trace_label: 'studio.workspace.turn.classifier',
+        userId,
+        workspaceId: id,
       });
       const clfParsed = JSON.parse(extractJsonObject(clfRaw) || '{}') as {
         intent?: TurnIntent;
@@ -1651,8 +1658,10 @@ Return ONLY valid JSON matching the schema. No prose, no code fences, no preambl
         max_tokens: 4_000,
         timeoutMs: 55_000, // < Vercel maxDuration of 60s
         signal: abortController.signal,
-        tenant: 'shift',
+        tenant: tenantId,
         trace_label: 'studio.workspace.turn.chat',
+        userId,
+        workspaceId: id,
       });
       console.log(
         `[workspace/turn] chat ok chars=${assembled.length} model=${TURN_CHAT_MODEL} ws=${id}`,
@@ -1725,7 +1734,7 @@ Return ONLY valid JSON matching the schema. No prose, no code fences, no preambl
     const abortController = new AbortController();
     req.on('close', () => abortController.abort());
     try {
-      const result = await runArchitect(id, query, abortController.signal);
+      const result = await runArchitect(id, query, abortController.signal, userId);
       const model = process.env.ARCHITECT_MODEL ?? 'anthropic/claude-sonnet-4.6';
       res.json({
         ok: true,
@@ -1795,8 +1804,10 @@ Return ONLY valid JSON matching the schema. No prose, no code fences, no preambl
         temperature: 0.3,
         timeoutMs: 30_000,
         signal: abortController.signal,
-        tenant: 'shift',
+        tenant: tenantId,
         trace_label: 'studio.workspace.turn.edit_selected',
+        userId,
+        workspaceId: id,
       });
 
       await supabaseAdmin!
@@ -1871,8 +1882,10 @@ Return ONLY valid JSON matching the schema. No prose, no code fences, no preambl
         temperature: 0.3,
         timeoutMs: 30_000,
         signal: abortController.signal,
-        tenant: 'shift',
+        tenant: tenantId,
         trace_label: 'studio.workspace.turn.edit_by_match',
+        userId,
+        workspaceId: id,
       });
 
       await supabaseAdmin!
