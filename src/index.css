@@ -37,6 +37,37 @@
     --radius-bubble: 1.25rem;
     --radius-modal: 1rem;
 
+    /* ── shadcn token mapping (added for line-chart + card + badge) ──
+       Tailwind v4 maps `bg-X`/`text-X-foreground`/etc to `--color-X`.
+       Tokens below resolve shadcn class names against Studio's palette
+       so dropped-in shadcn components (Card, Badge, ChartContainer)
+       render correctly in light AND dark mode. */
+    --color-background: #ffffff;
+    --color-foreground: #0e1745;
+    --color-card: #ffffff;
+    --color-card-foreground: #0e1745;
+    --color-popover: #ffffff;
+    --color-popover-foreground: #0e1745;
+    --color-primary-foreground: #ffffff;
+    --color-secondary-foreground: #ffffff;
+    --color-muted: #f1f5f9;
+    --color-muted-foreground: rgba(14, 23, 69, 0.55);
+    --color-accent: #f1f5f9;
+    --color-accent-foreground: #0e1745;
+    --color-destructive: #ef4444;
+    --color-destructive-foreground: #ffffff;
+    --color-border: rgba(148, 163, 184, 0.3);
+    --color-input: rgba(148, 163, 184, 0.4);
+    --color-ring: #1534dc;
+
+    /* Recharts categorical palette — used by demo via var(--chart-2) etc.
+       Tuned to Studio palette (blue/violet primary + supporting hues). */
+    --chart-1: #1534dc;     /* Studio primary blue */
+    --chart-2: #8b5cf6;     /* violet */
+    --chart-3: #06b6d4;     /* cyan */
+    --chart-4: #f59e0b;     /* amber */
+    --chart-5: #ec4899;     /* pink */
+
     --text-micro: 0.6875rem;
     --text-micro--line-height: 1rem;
     --text-caption: 0.75rem;
@@ -128,6 +159,34 @@ button {
    ReactFlow / xyflow — Dark Mode Overrides
    Controls buttons, MiniMap, and edges need explicit dark styling
    ═══════════════════════════════════════════════════════════════════ */
+
+/* Dark-mode override of the shadcn token bundle. Same names as light
+   defaults (defined in @theme), just inverted lightness. */
+.dark {
+    --color-background: #080d1a;
+    --color-foreground: #ffffff;
+    --color-card: #0c1230;
+    --color-card-foreground: #ffffff;
+    --color-popover: #0c1230;
+    --color-popover-foreground: #ffffff;
+    --color-primary-foreground: #ffffff;
+    --color-secondary-foreground: #ffffff;
+    --color-muted: rgba(255, 255, 255, 0.06);
+    --color-muted-foreground: rgba(255, 255, 255, 0.55);
+    --color-accent: rgba(255, 255, 255, 0.08);
+    --color-accent-foreground: #ffffff;
+    --color-destructive: #f87171;
+    --color-destructive-foreground: #ffffff;
+    --color-border: rgba(255, 255, 255, 0.12);
+    --color-input: rgba(255, 255, 255, 0.18);
+    --color-ring: #8b5cf6;
+
+    --chart-1: #8b5cf6;     /* dark-mode primary violet */
+    --chart-2: #a78bfa;     /* lighter violet */
+    --chart-3: #22d3ee;     /* cyan */
+    --chart-4: #fbbf24;     /* amber */
+    --chart-5: #f472b6;     /* pink */
+}
 
 /* Controls: button backgrounds & SVG fill */
 .dark .react-flow__controls {
