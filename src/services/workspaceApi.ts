@@ -172,6 +172,50 @@ class ApiError extends Error {
   }
 }
 
+/**
+ * Retry an async fn with exponential backoff. Use ONLY for idempotent
+ * operations (GETs). Never retry mutations — risk of double-applying.
+ *
+ * Behavior:
+ *   - Retries on network errors and 5xx responses.
+ *   - Retries on 429 (rate limit) but NOT other 4xx (those are deterministic
+ *     failures — auth, validation, missing rows — retrying would just amplify
+ *     the same error).
+ *   - Backoff is exponential (baseDelay * 2^attempt) with ±15% jitter to
+ *     spread retries across tabs that crash-reload simultaneously.
+ *   - Honors AbortSignal between attempts; in-flight fetches need to wire
+ *     the same signal themselves to abort mid-request.
+ */
+async function retryIdempotent<T>(
+  fn: () => Promise<T>,
+  opts: { maxAttempts?: number; baseDelayMs?: number; signal?: AbortSignal } = {},
+): Promise<T> {
+  const maxAttempts = opts.maxAttempts ?? 3;
+  const baseDelayMs = opts.baseDelayMs ?? 500;
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (opts.signal?.aborted) throw new Error('aborted');
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      // Don't retry deterministic 4xx (except 429); they won't change.
+      if (err instanceof ApiError) {
+        if (err.status >= 400 && err.status < 500 && err.status !== 429) {
+          throw err;
+        }
+      }
+      if (attempt < maxAttempts) {
+        const jitter = Math.random() * 0.3 + 0.85;
+        await new Promise((r) =>
+          setTimeout(r, baseDelayMs * Math.pow(2, attempt - 1) * jitter),
+        );
+      }
+    }
+  }
+  throw lastErr;
+}
+
 async function handleJson<T>(res: Response): Promise<T> {
   const text = await res.text();
   let body: unknown = null;
@@ -198,11 +242,15 @@ async function handleJson<T>(res: Response): Promise<T> {
 
 export async function listWorkspaces(opts: { archived?: boolean } = {}): Promise<WorkspaceRow[]> {
   const qs = opts.archived ? '?archived=1' : '';
-  const res = await fetch(`/api/workspace${qs}`, {
-    headers: await authedHeaders(),
+  // Idempotent GET — retried via retryIdempotent on flaky networks. The
+  // mutation listWorkspaces+create paths are NOT retried (see createWorkspace).
+  return retryIdempotent(async () => {
+    const res = await fetch(`/api/workspace${qs}`, {
+      headers: await authedHeaders(),
+    });
+    const body = await handleJson<{ ok: boolean; items: WorkspaceRow[] }>(res);
+    return body.items ?? [];
   });
-  const body = await handleJson<{ ok: boolean; items: WorkspaceRow[] }>(res);
-  return body.items ?? [];
 }
 
 export async function createWorkspace(
@@ -218,10 +266,14 @@ export async function createWorkspace(
 }
 
 export async function getWorkspace(id: string): Promise<{ workspace: WorkspaceRow; nodes: WorkspaceNode[] }> {
-  const res = await fetch(`/api/workspace/${id}`, {
-    headers: await authedHeaders(),
+  // Idempotent GET — retried via retryIdempotent. updateWorkspace/deleteWorkspace
+  // (PATCH/DELETE) are intentionally un-retried below.
+  return retryIdempotent(async () => {
+    const res = await fetch(`/api/workspace/${id}`, {
+      headers: await authedHeaders(),
+    });
+    return handleJson<{ workspace: WorkspaceRow; nodes: WorkspaceNode[] }>(res).then((b) => b);
   });
-  return handleJson<{ workspace: WorkspaceRow; nodes: WorkspaceNode[] }>(res).then((b) => b);
 }
 
 export async function updateWorkspace(
@@ -252,19 +304,25 @@ export async function listNodes(
   opts: { withContent?: boolean } = {},
 ): Promise<WorkspaceNode[]> {
   const qs = opts.withContent ? '?withContent=1' : '';
-  const res = await fetch(`/api/workspace/${workspaceId}/nodes${qs}`, {
-    headers: await authedHeaders(),
+  // Idempotent GET — retried via retryIdempotent.
+  return retryIdempotent(async () => {
+    const res = await fetch(`/api/workspace/${workspaceId}/nodes${qs}`, {
+      headers: await authedHeaders(),
+    });
+    const body = await handleJson<{ ok: boolean; nodes: WorkspaceNode[] }>(res);
+    return body.nodes ?? [];
   });
-  const body = await handleJson<{ ok: boolean; nodes: WorkspaceNode[] }>(res);
-  return body.nodes ?? [];
 }
 
 export async function getNode(workspaceId: string, nodeId: string): Promise<WorkspaceNode> {
-  const res = await fetch(`/api/workspace/${workspaceId}/nodes/${nodeId}`, {
-    headers: await authedHeaders(),
+  // Idempotent GET — retried via retryIdempotent.
+  return retryIdempotent(async () => {
+    const res = await fetch(`/api/workspace/${workspaceId}/nodes/${nodeId}`, {
+      headers: await authedHeaders(),
+    });
+    const body = await handleJson<{ ok: boolean; node: WorkspaceNode }>(res);
+    return body.node;
   });
-  const body = await handleJson<{ ok: boolean; node: WorkspaceNode }>(res);
-  return body.node;
 }
 
 export interface CreateNodeBody {
@@ -555,13 +613,17 @@ export async function importAsset(
 export async function attachContext(workspaceId: string): Promise<{
   nodes: Array<{ id: string; title: string; subtitle?: string; md: string }>;
 }> {
-  const res = await fetch(`/api/workspace/${workspaceId}/attach-context`, {
-    headers: await authedHeaders(),
+  // Idempotent GET — retried via retryIdempotent. Server-side this is a
+  // pure read aggregating hoja markdown; safe to repeat.
+  return retryIdempotent(async () => {
+    const res = await fetch(`/api/workspace/${workspaceId}/attach-context`, {
+      headers: await authedHeaders(),
+    });
+    return handleJson<{
+      ok: boolean;
+      nodes: Array<{ id: string; title: string; subtitle?: string; md: string }>;
+    }>(res).then((b) => ({ nodes: b.nodes ?? [] }));
   });
-  return handleJson<{
-    ok: boolean;
-    nodes: Array<{ id: string; title: string; subtitle?: string; md: string }>;
-  }>(res).then((b) => ({ nodes: b.nodes ?? [] }));
 }
 
 // ─── Export (md/docx/pptx) ────────────────────────────────────────────
@@ -892,11 +954,15 @@ export interface CreateChatMessageBody {
 }
 
 export async function listChatMessages(workspaceId: string): Promise<ChatMessageRow[]> {
-  const res = await fetch(`/api/workspace/${workspaceId}/messages`, {
-    headers: await authedHeaders(),
+  // Idempotent GET — retried via retryIdempotent. createChatMessage and
+  // clearChatMessages below are mutations and intentionally un-retried.
+  return retryIdempotent(async () => {
+    const res = await fetch(`/api/workspace/${workspaceId}/messages`, {
+      headers: await authedHeaders(),
+    });
+    const body = await handleJson<{ ok: boolean; messages: ChatMessageRow[] }>(res);
+    return body.messages ?? [];
   });
-  const body = await handleJson<{ ok: boolean; messages: ChatMessageRow[] }>(res);
-  return body.messages ?? [];
 }
 
 export async function createChatMessage(
@@ -919,4 +985,58 @@ export async function clearChatMessages(workspaceId: string): Promise<number> {
   });
   const body = await handleJson<{ ok: boolean; deleted?: number }>(res);
   return body.deleted ?? 0;
+}
+
+// ─── Admin: usage summary (Wave B) ───────────────────────────────────
+//
+// Aggregates `studio_ai_call_log` by user / workspace / trace_label / day.
+// Server-side gating: only allowlisted ADMIN_USER_IDS see cross-tenant data.
+// See src/routes/admin.ts for the SQL.
+
+export interface AdminUsagePerUser {
+  user_id: string;
+  calls: number;
+  cost_usd_total: number;
+  input_tokens: number;
+  output_tokens: number;
+  last_call_at: string | null;
+}
+
+export interface AdminUsagePerWorkspace {
+  workspace_id: string;
+  calls: number;
+  cost_usd_total: number;
+}
+
+export interface AdminUsagePerTrace {
+  trace_label: string;
+  calls: number;
+  cost_usd_total: number;
+}
+
+export interface AdminUsageDaily {
+  date: string; // YYYY-MM-DD
+  cost_usd_total: number;
+  calls: number;
+}
+
+export interface AdminUsageSummary {
+  ok: boolean;
+  /** Window the aggregation covers, in days (mirrors ?days=). */
+  windowDays: number;
+  perUser: AdminUsagePerUser[];
+  perWorkspace: AdminUsagePerWorkspace[];
+  perTrace: AdminUsagePerTrace[];
+  daily: AdminUsageDaily[];
+}
+
+export async function getAdminUsageSummary(days = 30): Promise<AdminUsageSummary> {
+  // Idempotent GET — retried like the other reads above. Wraps so a flaky
+  // first hit doesn't surface as a hard error in the dashboard.
+  return retryIdempotent(async () => {
+    const res = await fetch(`/api/admin/usage/summary?days=${days}`, {
+      headers: await authedHeaders(),
+    });
+    return handleJson<AdminUsageSummary>(res);
+  });
 }

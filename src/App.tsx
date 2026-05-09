@@ -40,6 +40,9 @@ const WorkspacesListPage = lazy(() =>
 const WorkspaceCanvasPage = lazy(() =>
   import("./pages/WorkspaceCanvasPage").then((m) => ({ default: m.WorkspaceCanvasPage })),
 );
+// Wave B — admin usage dashboard. Only loaded on /admin/usage; the
+// recharts payload stays out of the chat-only entry bundle.
+const AdminUsagePage = lazy(() => import("./pages/AdminUsagePage"));
 
 // Shared route-level fallback — matches Studio's auth-loading spinner.
 function WorkspaceRouteFallback() {
@@ -175,6 +178,20 @@ export default function App() {
   // their own TopDock + chrome. The default (`/` and everything else)
   // falls through to the legacy chat/canvas mode below.
   const path = currentPath;
+  // Admin usage dashboard — gated server-side via ADMIN_USER_IDS allowlist.
+  // The page renders the 403/error itself when the API rejects, so we don't
+  // need a client-side allowlist here.
+  if (path === '/admin/usage' || path === '/admin/usage/') {
+    return (
+      <ErrorBoundary>
+        <ThemeProvider>
+          <Suspense fallback={<WorkspaceRouteFallback />}>
+            <AdminUsagePage />
+          </Suspense>
+        </ThemeProvider>
+      </ErrorBoundary>
+    );
+  }
   if (isWorkspacesList(path)) {
     return (
       <ErrorBoundary>
