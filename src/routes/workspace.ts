@@ -41,7 +41,7 @@ import { supabaseAdmin } from '../services/supabaseAdminClient.js';
 import { getUserIdFromRequest, isValidUuid } from '../services/auth.js';
 import {
   callOpenRouter,
-  streamOpenRouter,
+  extractJsonObject,
   type OpenRouterMessage,
 } from '../services/openRouterDirect.js';
 import { firePeajeIngest } from '../services/peajeClient.js';
@@ -788,10 +788,9 @@ workspaceRouter.post('/:id/transform', async (req: Request, res: Response) => {
     res.status(400).json({ ok: false, error: 'instruction_required' });
     return;
   }
-  if (!process.env.OPENROUTER_API_KEY) {
-    res.status(500).json({ ok: false, error: 'openrouter_not_configured' });
-    return;
-  }
+
+  // LLM calls are routed via Cerebro (`SWARM_API_URL`/v1/llm/invoke),
+  // not OpenRouter directly — no per-handler key check needed here.
 
   // Env vars (all have defaults so deploys never block on config):
   //   TRANSFORM_MODEL        — default model for rewrite/shorten/summarize/polish/custom
@@ -821,6 +820,8 @@ workspaceRouter.post('/:id/transform', async (req: Request, res: Response) => {
       max_tokens: 1500,
       temperature: action === 'expand' ? 0.6 : 0.3,
       timeoutMs: 30_000,
+      tenant: 'shift',
+      trace_label: `studio.workspace.transform.${action}`,
     });
 
     if (!text) {
@@ -896,9 +897,8 @@ interface ArchitectResult {
  *  Studio's canvas viewport is narrower).
  */
 async function runArchitect(workspaceId: string, prompt: string): Promise<ArchitectResult> {
-  if (!process.env.OPENROUTER_API_KEY) {
-    throw new Error('openrouter_not_configured');
-  }
+  // LLM calls are routed via Cerebro (`SWARM_API_URL`/v1/llm/invoke); no
+  // per-call OpenRouter key check is needed here.
   if (!supabaseAdmin) {
     throw new Error('database_unavailable');
   }
@@ -948,29 +948,38 @@ async function runArchitect(workspaceId: string, prompt: string): Promise<Archit
     0,
   );
 
-  // Call OpenRouter in JSON mode.
+  // Call Cerebro (which routes to the architect model). Cerebro's
+  // /v1/llm/invoke does not expose `response_format`, so we append a
+  // strict-JSON instruction to the system prompt and parse defensively
+  // via extractJsonObject below.
+  const JSON_STRICT_SUFFIX =
+    '\n\nReturn ONLY valid JSON matching the schema. No prose, no code fences, no preamble. Start your response with `{` and end with `}`.';
   const t0 = Date.now();
   const model = process.env.ARCHITECT_MODEL ?? 'google/gemini-2.5-flash';
   const raw = await callOpenRouter({
     model,
     messages: [
-      { role: 'system', content: ARCHITECT_SYSTEM + canvasContext },
+      { role: 'system', content: ARCHITECT_SYSTEM + canvasContext + JSON_STRICT_SUFFIX },
       { role: 'user', content: prompt },
     ],
     max_tokens: 16_000,
     temperature: 0.4,
-    response_format: { type: 'json_object' },
     timeoutMs: 60_000,
+    tenant: 'shift',
+    trace_label: 'studio.workspace.architect',
   });
 
   let parsed: { hojas?: Array<Record<string, unknown>>; summary?: string };
   try {
-    parsed = JSON.parse(raw);
+    parsed = JSON.parse(extractJsonObject(raw));
   } catch {
-    // Fallback: extract JSON from a code fence if the model misbehaved.
-    const m = raw.match(/```(?:json)?\s*([\s\S]+?)\s*```/);
-    if (!m) throw new Error('architect_invalid_json');
-    parsed = JSON.parse(m[1]);
+    // Last-ditch: try the raw string as-is in case extractJsonObject
+    // over-trimmed (it shouldn't, but be defensive).
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error('architect_invalid_json');
+    }
   }
 
   if (!Array.isArray(parsed.hojas) || parsed.hojas.length === 0) {
@@ -1138,10 +1147,9 @@ workspaceRouter.post('/:id/turn', async (req: Request, res: Response) => {
     return;
   }
   if (!(await ownedWorkspace(userId, id, res))) return;
-  if (!process.env.OPENROUTER_API_KEY) {
-    res.status(500).json({ ok: false, error: 'openrouter_not_configured' });
-    return;
-  }
+
+  // LLM calls are routed via Cerebro (`SWARM_API_URL`/v1/llm/invoke);
+  // no per-handler OPENROUTER_API_KEY check is needed.
 
   const query: string = String(req.body?.query ?? '').trim();
   const mode: string = String(req.body?.mode ?? 'auto');
@@ -1222,7 +1230,9 @@ Decision rules:
 - "edit_by_match" = a reference to a hoja by title ("update the timeline", "expand the executive summary") — set target_node_id to the best-matching hoja id
 
 If confidence < 0.7, return intent="chat" anyway.
-Do NOT include prose. Return only the JSON object.`;
+Do NOT include prose. Return only the JSON object.
+
+Return ONLY valid JSON matching the schema. No prose, no code fences, no preamble. Start your response with \`{\` and end with \`}\`.`;
 
     const classifierUser = [
       `Message: "${query}"`,
@@ -1246,10 +1256,11 @@ Do NOT include prose. Return only the JSON object.`;
         ],
         max_tokens: 2000,
         temperature: 0.1,
-        response_format: { type: 'json_object' },
         timeoutMs: 15_000,
+        tenant: 'shift',
+        trace_label: 'studio.workspace.turn.classifier',
       });
-      const clfParsed = JSON.parse(clfRaw || '{}') as {
+      const clfParsed = JSON.parse(extractJsonObject(clfRaw) || '{}') as {
         intent?: TurnIntent;
         target_node_id?: string | null;
         confidence?: number;
@@ -1270,14 +1281,12 @@ Do NOT include prose. Return only the JSON object.`;
 
   // ── Step 2: dispatch ────────────────────────────────────────────
 
-  // ── chat: SSE-stream a direct OpenRouter call ──
+  // ── chat: one-shot JSON call routed via Cerebro ──
   if (intent === 'chat') {
     // Wire client-disconnect → upstream abort. If the user closes the
-    // tab mid-stream, OpenRouter would otherwise keep generating (paid
-    // tokens) and res.write would keep firing on a half-closed socket
-    // (~90s of ERR_STREAM_WRITE_AFTER_END warnings). The controller
-    // signal is threaded into streamOpenRouter, where combineSignals
-    // merges it with the timeout signal.
+    // tab mid-stream, Cerebro/OpenRouter would otherwise keep generating
+    // (paid tokens). The controller signal is threaded into
+    // callOpenRouter, where combineSignals merges it with the timeout.
     const abortController = new AbortController();
     req.on('close', () => abortController.abort());
 
@@ -1452,6 +1461,8 @@ Do NOT include prose. Return only the JSON object.`;
         max_tokens: 4_000,
         timeoutMs: 55_000, // < Vercel maxDuration of 60s
         signal: abortController.signal,
+        tenant: 'shift',
+        trace_label: 'studio.workspace.turn.chat',
       });
       console.log(
         `[workspace/turn] chat ok chars=${assembled.length} model=${TURN_CHAT_MODEL} ws=${id}`,
@@ -1474,12 +1485,12 @@ Do NOT include prose. Return only the JSON object.`;
         // Hint for the user — common causes the diagnostic should call out.
         hint:
           upstreamError.code === 402
-            ? 'OpenRouter sin créditos. Recarga en https://openrouter.ai/credits.'
+            ? 'OpenRouter sin créditos (en Cerebro). Recarga en https://openrouter.ai/credits.'
             : upstreamError.code === 401
-              ? 'OPENROUTER_API_KEY inválida o revocada.'
+              ? 'OPENROUTER_API_KEY inválida o revocada en Cerebro.'
               : upstreamError.code === 429
                 ? 'Rate limit alcanzado. Espera un momento y vuelve a intentar.'
-                : 'Error desde OpenRouter — ver detail.',
+                : 'Error desde Cerebro/OpenRouter — ver detail.',
       });
       return;
     }
@@ -1585,6 +1596,8 @@ Do NOT include prose. Return only the JSON object.`;
         max_tokens: 1500,
         temperature: 0.3,
         timeoutMs: 30_000,
+        tenant: 'shift',
+        trace_label: 'studio.workspace.turn.edit_selected',
       });
 
       await supabaseAdmin!
@@ -1653,6 +1666,8 @@ Do NOT include prose. Return only the JSON object.`;
         max_tokens: 1500,
         temperature: 0.3,
         timeoutMs: 30_000,
+        tenant: 'shift',
+        trace_label: 'studio.workspace.turn.edit_by_match',
       });
 
       await supabaseAdmin!

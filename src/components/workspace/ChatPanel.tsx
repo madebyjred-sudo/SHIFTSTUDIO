@@ -28,7 +28,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
 } from 'react';
 import {
-  ArrowUp, BookOpen, Loader2, Sparkles, StopCircle,
+  ArrowUp, BookOpen, Loader2, Sparkles, StopCircle, Trash2,
 } from 'lucide-react';
 import { marked } from 'marked';
 import { cn } from '@/lib/utils';
@@ -51,6 +51,74 @@ interface ChatMessage {
 }
 
 const HISTORY_CAP = 30;
+/** Cap persisted messages per workspace to defend against localStorage
+ *  bloat (5MB browser quota is shared across keys + Studio also stashes
+ *  the main chat). FIFO eviction. */
+const STORAGE_MESSAGES_CAP = 50;
+/** localStorage key prefix. Each workspace gets its own slot so the
+ *  chat history is scoped to the canvas the user is viewing. */
+const STORAGE_KEY_PREFIX = 'studio_workspace_chat_';
+
+function storageKeyFor(workspaceId: string): string {
+  return `${STORAGE_KEY_PREFIX}${workspaceId}`;
+}
+
+/**
+ * Read persisted messages for a workspace. Returns [] on any failure
+ * (private mode, corrupt JSON, missing window in SSR-style envs).
+ */
+function loadMessages(workspaceId: string): ChatMessage[] {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = window.localStorage.getItem(storageKeyFor(workspaceId));
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    // Defensive: filter out anything that doesn't look like a ChatMessage.
+    return parsed.filter(
+      (m): m is ChatMessage =>
+        !!m &&
+        typeof m === 'object' &&
+        typeof (m as { id?: unknown }).id === 'string' &&
+        typeof (m as { content?: unknown }).content === 'string' &&
+        ((m as { role?: unknown }).role === 'user' ||
+          (m as { role?: unknown }).role === 'assistant' ||
+          (m as { role?: unknown }).role === 'system'),
+    );
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Persist messages for a workspace. Caps to STORAGE_MESSAGES_CAP newest.
+ * Silent on quota / private-mode failures — never break the UI.
+ */
+function saveMessages(workspaceId: string, messages: ChatMessage[]): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const capped =
+      messages.length > STORAGE_MESSAGES_CAP
+        ? messages.slice(messages.length - STORAGE_MESSAGES_CAP)
+        : messages;
+    window.localStorage.setItem(
+      storageKeyFor(workspaceId),
+      JSON.stringify(capped),
+    );
+  } catch {
+    // Quota exceeded / private browsing / disabled storage. Drop the
+    // write — chat still works in-session, just won't survive reload.
+  }
+}
+
+function clearStoredMessages(workspaceId: string): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.removeItem(storageKeyFor(workspaceId));
+  } catch {
+    // Same as saveMessages — degrade silently.
+  }
+}
 
 interface ChatPanelProps {
   workspaceId: string;
@@ -83,7 +151,14 @@ export function ChatPanel({
   hojaTitles,
   onWorkspaceAction,
 }: ChatPanelProps) {
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  // Hydrate synchronously from localStorage so the initial render shows
+  // the previous conversation immediately (no flicker). The lazy
+  // initializer runs once per mount; the workspaceId-change effect
+  // below handles re-hydration when the user navigates between
+  // workspaces without unmounting.
+  const [messages, setMessages] = useState<ChatMessage[]>(() =>
+    loadMessages(workspaceId),
+  );
   const [input, setInput] = useState('');
   const [streaming, setStreaming] = useState(false);
   const [streamingText, setStreamingText] = useState('');
@@ -104,6 +179,57 @@ export function ChatPanel({
     pendingTimers.current.forEach((t) => clearTimeout(t));
     pendingTimers.current.clear();
   }, []);
+
+  // ── Re-hydrate when workspaceId changes (defense-in-depth). ───────
+  // The parent (WorkspaceCanvasPage) currently keeps the same component
+  // instance across navigations because the route param simply changes
+  // the prop. Without this effect, switching workspaces would show the
+  // previous workspace's chat until the next message. Skip the FIRST
+  // run because the lazy useState initializer already loaded for the
+  // initial workspaceId.
+  const didHydrateRef = useRef(false);
+  useEffect(() => {
+    if (!didHydrateRef.current) {
+      didHydrateRef.current = true;
+      return;
+    }
+    setMessages(loadMessages(workspaceId));
+    // Reset transient streaming UI too — a half-streamed response from
+    // the previous workspace shouldn't bleed into the new one.
+    abortRef.current?.abort();
+    abortRef.current = null;
+    streamingTextRef.current = '';
+    setStreamingText('');
+    setStreaming(false);
+    setStreamingIntent(null);
+    setError(null);
+  }, [workspaceId]);
+
+  // ── Persist on every messages change. ─────────────────────────────
+  // Cheap because localStorage is sync but tiny — the cap keeps the
+  // serialized payload bounded. Silent on quota errors.
+  useEffect(() => {
+    saveMessages(workspaceId, messages);
+  }, [workspaceId, messages]);
+
+  // ── Clear-history affordance ──────────────────────────────────────
+  const handleClearHistory = useCallback(() => {
+    if (typeof window !== 'undefined') {
+      const ok = window.confirm(
+        '¿Borrar la conversación de este workspace? Esta acción no se puede deshacer.',
+      );
+      if (!ok) return;
+    }
+    abortRef.current?.abort();
+    abortRef.current = null;
+    streamingTextRef.current = '';
+    setStreamingText('');
+    setStreaming(false);
+    setStreamingIntent(null);
+    setError(null);
+    setMessages([]);
+    clearStoredMessages(workspaceId);
+  }, [workspaceId]);
 
   // ── Smooth scroll-to-bottom on new content ────────────────────────
   useEffect(() => {
@@ -322,6 +448,26 @@ export function ChatPanel({
               Conversa, analiza y construye hojas
             </p>
           </div>
+          {/* Clear-history: ghost button, low-prominence. Disabled
+              when there's nothing to clear so the icon doesn't sit
+              there inviting clicks on an already-empty panel. */}
+          <button
+            type="button"
+            onClick={handleClearHistory}
+            disabled={messages.length === 0 && !streaming}
+            aria-label="Limpiar conversación"
+            title="Limpiar conversación"
+            className={cn(
+              'shrink-0 inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium transition-colors',
+              'text-[#0e1745]/55 hover:text-red-600 hover:bg-red-50/70',
+              'dark:text-white/55 dark:hover:text-red-300 dark:hover:bg-red-950/30',
+              'disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-[#0e1745]/55',
+              'dark:disabled:hover:text-white/55',
+            )}
+          >
+            <Trash2 className="w-3 h-3" aria-hidden />
+            <span className="hidden xl:inline">Limpiar</span>
+          </button>
         </div>
 
         {/* ── Selected hoja chip ──────────────────────────────── */}
