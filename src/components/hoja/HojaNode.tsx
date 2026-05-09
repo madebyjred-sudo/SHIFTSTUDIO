@@ -365,6 +365,28 @@ function HojaNodeImpl({
     }, 800);
   }, [workspaceId, id, onUpdate]);
 
+  // ── Auto-save helper (content variant) ───────────────────────────
+  // Variant of scheduleSave for editor-content updates. The expensive
+  // htmlToMarkdown walk runs INSIDE the debounce, not in onUpdate, so a
+  // burst of keystrokes coalesces into a single serialization at flush
+  // time instead of one walk per transaction. The `compute` closure
+  // reads the latest editor HTML when the timer fires.
+  const scheduleContentSave = useCallback((compute: () => UpdateNodePatch) => {
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    setSaveState('saving');
+    saveTimer.current = setTimeout(async () => {
+      try {
+        const patch = compute();
+        await updateNode(workspaceId, id, patch);
+        setSaveState('saved');
+        setLastSavedAt(Date.now());
+        onUpdate?.(id, patch as Partial<WorkspaceNode>);
+      } catch {
+        setSaveState('error');
+      }
+    }, 800);
+  }, [workspaceId, id, onUpdate]);
+
   // ── Slash extension ──────────────────────────────────────────────
   // Memoized so we don't re-instantiate the suggestion plugin on every
   // render (would tear down/rebuild the ProseMirror plugin chain).
@@ -405,10 +427,13 @@ function HojaNodeImpl({
       },
     },
     onUpdate: ({ editor }) => {
-      // Serialize HTML → md so the wire contract stays markdown.
-      // Whitespace is normalized inside htmlToMarkdown.
-      const md = htmlToMarkdown(editor.getHTML());
-      scheduleSave({ content: { md } });
+      // Defer the HTML → md walk into the debounced save callback. Doing
+      // it here would re-walk the DOM on every keystroke; instead the
+      // closure reads the latest editor HTML right before PATCHing. We
+      // capture the editor reference so the closure does not depend on
+      // the outer `editor` variable (which may not be stable here).
+      const ed = editor;
+      scheduleContentSave(() => ({ content: { md: htmlToMarkdown(ed.getHTML()) } }));
     },
   });
 
@@ -462,12 +487,18 @@ function HojaNodeImpl({
     };
   }, [lastSavedAt]);
 
-  // ── Cleanup all timers on unmount (T6 quality patterns reapplied) ─
+  // ── Cleanup all timers + editor on unmount ───────────────────────
+  // CRITICAL: useEditor returns an instance whose lifecycle the consumer
+  // owns. Without editor.destroy() each unmounted hoja leaks its
+  // ProseMirror state + plugin chain (~1MB+ per hoja on long sessions).
+  // Effect depends on `editor` so the destroy call captures the latest
+  // instance.
   useEffect(() => () => {
     if (saveTimer.current) clearTimeout(saveTimer.current);
     if (fadeTimer.current) clearTimeout(fadeTimer.current);
     if (tickInterval.current) clearInterval(tickInterval.current);
-  }, []);
+    editor?.destroy();
+  }, [editor]);
 
   // ── Click / select handlers ──────────────────────────────────────
   const handleClick = useCallback(() => {
