@@ -12,12 +12,26 @@
  * and a future chat-tool dispatcher would need to call this exporter — so
  * it lives outside both.
  *
- * Contract:
- *   - Verify the workspace exists and belongs to userId.
- *   - If !force AND last_pptx is < 1h old (and options match), return cached.
- *   - Else: compose markdown from hojas, call Gamma generateAndWait, persist
- *     last_pptx, return the result.
- *   - Errors propagate as GammaApiError so callers can map to HTTP / UI.
+ * ──────────────────────────────────────────────────────────────────────
+ * SPLIT FLOW (Phase 3.F — Vercel maxDuration fix)
+ * ──────────────────────────────────────────────────────────────────────
+ * The original `runWorkspacePptxExport` blocked on Gamma's pollUntilComplete
+ * (up to 5min) inside a single HTTP request. On Vercel that's a guaranteed
+ * 504: function maxDuration caps at 60s (Pro) / 10s (Hobby). Works in dev
+ * because Express has no default timeout.
+ *
+ * Fix: split into two stages.
+ *   • `startGeneration` — kick off the deck via Gamma's POST /generations
+ *     and return immediately with the generationId. Honors the 1h cache
+ *     (returns the cached deck without burning Gamma credits).
+ *   • `checkGeneration` — single status check (no polling). Persists
+ *     last_pptx when the deck completes, so the cache is warmed.
+ *
+ * Frontend polls the status endpoint every 5s.
+ *
+ * The legacy `runWorkspacePptxExport` is intentionally removed — every
+ * caller must move to start+check. Keeping it as a re-export would only
+ * resurrect the timeout on the next refactor.
  *
  * Ported from CL2's apps/api/src/services/workspacePptxExport.ts. Critical
  * differences from the source:
@@ -33,10 +47,15 @@
  *   - textOptions.tone goes from "professional, legislative" to
  *     "professional". Language stays 'es-419' (Studio is Spanish LATAM).
  *   - logger.* calls become console.* (Studio doesn't ship a logger).
+ *   - Phase 3.F: split create/poll into two functions for Vercel.
  */
 
 import { supabaseAdmin } from './supabaseAdminClient.js';
-import { generateAndWait } from './gammaApi.js';
+import {
+  createGeneration,
+  getGenerationStatus,
+  GammaApiError,
+} from './gammaApi.js';
 
 export interface WorkspacePptxResult {
   generationId: string;
@@ -90,6 +109,27 @@ interface RunOpts {
 }
 
 /**
+ * Outcome of `startGeneration`.
+ *
+ * Two terminal shapes:
+ *   • cached deck (status='complete', everything filled in) — when the
+ *     last_pptx row is fresh enough to reuse.
+ *   • freshly-kicked-off generation (status='pending', generationId only)
+ *     — caller polls /pptx-status to learn when it's ready.
+ */
+export type StartGenerationResult =
+  | { status: 'complete'; result: WorkspacePptxResult }
+  | { status: 'pending'; generationId: string; filename: string };
+
+/**
+ * Outcome of `checkGeneration`. Mirrors the HTTP shape the route returns.
+ */
+export type CheckGenerationResult =
+  | { status: 'complete'; result: WorkspacePptxResult }
+  | { status: 'pending'; generationId: string }
+  | { status: 'failed'; generationId: string; error: string };
+
+/**
  * Compose the Gamma `additionalInstructions` payload from user options +
  * sane neutral defaults. Pure — no DB. Easy to unit test.
  */
@@ -110,31 +150,58 @@ function buildAdditionalInstructions(opts: PptxOptions | undefined): string {
   return parts.join(' ');
 }
 
+// Stable stringify so {tono, audiencia} and {audiencia, tono} hash the same.
+// Default JSON.stringify preserves insertion order, which means a different
+// client-side form mount order would silently bust the cache and burn
+// Gamma credits.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function stableStringify(o: any): string {
+  if (o == null) return 'null';
+  if (typeof o !== 'object') return JSON.stringify(o);
+  if (Array.isArray(o)) return `[${o.map(stableStringify).join(',')}]`;
+  const keys = Object.keys(o).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(o[k])}`).join(',')}}`;
+}
+
+type WsRow = {
+  id: string;
+  title: string;
+  description: string | null;
+  last_pptx?:
+    | (WorkspacePptxResult & { creditsUsed?: number; options?: PptxOptions })
+    | null;
+};
+
+function safeFilenameFromTitle(title: string | null | undefined): string {
+  return (
+    (title ?? 'workspace')
+      .replace(/[^\w\s-]/g, '')
+      .trim()
+      .replace(/\s+/g, '_') || 'workspace'
+  );
+}
+
 /**
- * Run the full pptx export flow. Returns either the cached or freshly-
- * generated deck metadata. Throws WorkspaceNotFoundError if the workspace
- * doesn't exist or doesn't belong to userId, or GammaApiError on Gamma
- * failures.
+ * Stage 1 — kick off (or reuse cached) Gamma generation.
+ *
+ * Returns immediately:
+ *   • { status: 'complete', result } if the cached last_pptx is fresh and
+ *     the requested options haven't changed.
+ *   • { status: 'pending', generationId, filename } otherwise. Caller is
+ *     expected to poll `checkGeneration` (or the HTTP /pptx-status route).
+ *
+ * Throws WorkspaceNotFoundError if the workspace doesn't exist or doesn't
+ * belong to userId, or GammaApiError on Gamma create failures.
  */
-export async function runWorkspacePptxExport(
+export async function startGeneration(
   opts: RunOpts,
-): Promise<WorkspacePptxResult> {
+): Promise<StartGenerationResult> {
   const { workspaceId, userId, force = false } = opts;
-  if (!userId) throw new Error('user_id required for runWorkspacePptxExport');
+  if (!userId) throw new Error('user_id required for startGeneration');
   if (!supabaseAdmin)
-    throw new Error('supabase admin client not configured for runWorkspacePptxExport');
+    throw new Error('supabase admin client not configured for startGeneration');
 
   // ── Load workspace ────────────────────────────────────────────────
-  // Studio's migration 0003 guarantees last_pptx exists, so no fallback
-  // retry needed (CL2 had to support pre-migration envs).
-  type WsRow = {
-    id: string;
-    title: string;
-    description: string | null;
-    last_pptx?:
-      | (WorkspacePptxResult & { creditsUsed?: number; options?: PptxOptions })
-      | null;
-  };
   const { data: ws, error: wsErr } = await supabaseAdmin
     .from('studio_workspaces')
     .select('id, title, description, last_pptx')
@@ -144,11 +211,8 @@ export async function runWorkspacePptxExport(
   if (wsErr || !ws) throw new WorkspaceNotFoundError();
   const workspace = ws as unknown as WsRow;
 
-  const safeName =
-    (workspace.title ?? 'workspace')
-      .replace(/[^\w\s-]/g, '')
-      .trim()
-      .replace(/\s+/g, '_') || 'workspace';
+  const safeName = safeFilenameFromTitle(workspace.title);
+  const filename = `${safeName}.pptx`;
 
   // ── Cache reuse ────────────────────────────────────────────────────
   // Cache returns the prior deck when:
@@ -162,18 +226,6 @@ export async function runWorkspacePptxExport(
   if (!force && cache?.generatedAt && cache.exportUrl && cache.gammaUrl) {
     const ageMs = Date.now() - new Date(cache.generatedAt).getTime();
     const oneHour = 60 * 60 * 1000;
-    // Stable stringify so {tono, audiencia} and {audiencia, tono} hash
-    // the same. Default JSON.stringify preserves insertion order, which
-    // means a different client-side form mount order would silently bust
-    // the cache and burn Gamma credits.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const stableStringify = (o: any): string => {
-      if (o == null) return 'null';
-      if (typeof o !== 'object') return JSON.stringify(o);
-      if (Array.isArray(o)) return `[${o.map(stableStringify).join(',')}]`;
-      const keys = Object.keys(o).sort();
-      return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(o[k])}`).join(',')}}`;
-    };
     const optionsChanged = opts.options
       ? stableStringify(opts.options) !== stableStringify(cache.options ?? null)
       : false;
@@ -182,12 +234,15 @@ export async function runWorkspacePptxExport(
         `[workspace_pptx] cache hit workspaceId=${workspaceId} ageMs=${ageMs} generationId=${cache.generationId}`,
       );
       return {
-        generationId: cache.generationId,
-        gammaUrl: cache.gammaUrl,
-        exportUrl: cache.exportUrl,
-        filename: `${safeName}.pptx`,
-        cached: true,
-        generatedAt: cache.generatedAt,
+        status: 'complete',
+        result: {
+          generationId: cache.generationId,
+          gammaUrl: cache.gammaUrl,
+          exportUrl: cache.exportUrl,
+          filename,
+          cached: true,
+          generatedAt: cache.generatedAt,
+        },
       };
     }
   }
@@ -226,38 +281,161 @@ export async function runWorkspacePptxExport(
 
   const inputText = lines.join('\n').slice(0, 400_000);
 
-  // ── Call Gamma ────────────────────────────────────────────────────
-  const gen = await generateAndWait(
-    {
-      inputText,
-      format: 'presentation',
-      exportAs: 'pptx',
-      cardSplit: 'inputTextBreaks',
-      textMode: 'preserve',
-      textOptions: { language: 'es-419', tone: 'professional' },
-      imageOptions: { source: 'aiGenerated' },
-      cardOptions: { dimensions: '16x9' },
-      additionalInstructions: buildAdditionalInstructions(
-        // Use explicit options when caller passed them, else fall back to
-        // whatever the user saved last time on this workspace, else nothing.
-        opts.options ?? workspace.last_pptx?.options ?? undefined,
-      ),
-    },
-    { maxDurationMs: 5 * 60 * 1000 },
-  );
-  const generatedAt = new Date().toISOString();
+  // ── Persist the in-flight options into last_pptx so checkGeneration
+  //    has them for cache write-back, AND so a future call from another
+  //    tab can resolve the same deck. We stash a partial payload (no
+  //    URLs yet) — checkGeneration overwrites it once the deck completes.
+  const inflightOptions = opts.options ?? workspace.last_pptx?.options ?? undefined;
 
-  // ── Persist cache (best-effort) ───────────────────────────────────
-  // Stash the options we used too — next time the user opens the modal
-  // it pre-populates with their last choices, so they're not re-typing
-  // "tono ejecutivo" every time.
-  const cachePayload = {
-    generationId: gen.generationId,
-    gammaUrl: gen.gammaUrl,
-    exportUrl: gen.exportUrl,
-    generatedAt,
-    options: opts.options ?? workspace.last_pptx?.options ?? undefined,
+  // ── Call Gamma — create only, do NOT poll ─────────────────────────
+  const created = await createGeneration({
+    inputText,
+    format: 'presentation',
+    exportAs: 'pptx',
+    cardSplit: 'inputTextBreaks',
+    textMode: 'preserve',
+    textOptions: { language: 'es-419', tone: 'professional' },
+    imageOptions: { source: 'aiGenerated' },
+    cardOptions: { dimensions: '16x9' },
+    additionalInstructions: buildAdditionalInstructions(inflightOptions),
+  });
+
+  console.log(
+    `[workspace_pptx] generation kicked off workspaceId=${workspaceId} hojas=${ordered.length} generationId=${created.generationId} chars=${inputText.length}`,
+  );
+
+  // Store the options we used (best-effort) so checkGeneration can
+  // pick them up when the deck completes and write the final cache row.
+  // We don't write URLs yet — those come from checkGeneration.
+  try {
+    const inflightPayload = {
+      generationId: created.generationId,
+      options: inflightOptions,
+      // Sentinel: a pending row has no exportUrl/gammaUrl. We keep any
+      // existing fresh cache entry around if it exists, but only when
+      // we're not about to invalidate it (force or options changed).
+      // Here we know we're starting a new generation, so it's safe to
+      // null URLs out — but to keep the contract simple we just overlay
+      // the generationId + options on top of whatever was there.
+    };
+    const merged = {
+      ...(workspace.last_pptx ?? {}),
+      ...inflightPayload,
+    };
+    const { error: upErr } = await supabaseAdmin
+      .from('studio_workspaces')
+      .update({ last_pptx: merged })
+      .eq('id', workspaceId)
+      .eq('user_id', userId);
+    if (upErr)
+      console.warn(
+        `[workspace_pptx] inflight write failed workspaceId=${workspaceId} error=${upErr.message}`,
+      );
+  } catch (err) {
+    console.warn(
+      `[workspace_pptx] inflight write threw workspaceId=${workspaceId} error=${(err as Error).message}`,
+    );
+  }
+
+  return {
+    status: 'pending',
+    generationId: created.generationId,
+    filename,
   };
+}
+
+/**
+ * Stage 2 — single-shot status check on a pending generation.
+ *
+ * No polling. The frontend (or an external worker) is responsible for
+ * calling this on a cadence until status !== 'pending'. The full call,
+ * including the DB write on completion, fits well under Vercel's 10s
+ * Hobby cap.
+ *
+ * On 'complete' we persist the final cache row (generationId, urls,
+ * generatedAt, options) so the next startGeneration call within the
+ * 1h window short-circuits without burning Gamma credits.
+ *
+ * Throws WorkspaceNotFoundError if the workspace doesn't exist or doesn't
+ * belong to userId. Other errors propagate as GammaApiError.
+ */
+export async function checkGeneration(
+  generationId: string,
+  workspaceId: string,
+  userId: string | null,
+): Promise<CheckGenerationResult> {
+  if (!userId) throw new Error('user_id required for checkGeneration');
+  if (!supabaseAdmin)
+    throw new Error('supabase admin client not configured for checkGeneration');
+
+  // Verify ownership + load workspace title for the filename.
+  const { data: ws, error: wsErr } = await supabaseAdmin
+    .from('studio_workspaces')
+    .select('id, title, description, last_pptx')
+    .eq('id', workspaceId)
+    .eq('user_id', userId)
+    .maybeSingle();
+  if (wsErr || !ws) throw new WorkspaceNotFoundError();
+  const workspace = ws as unknown as WsRow;
+
+  const safeName = safeFilenameFromTitle(workspace.title);
+  const filename = `${safeName}.pptx`;
+
+  // One status hit. No retry / no poll loop here — Vercel will time out
+  // mid-poll, and the frontend already polls.
+  let status;
+  try {
+    status = await getGenerationStatus(generationId);
+  } catch (err) {
+    // Surface failed generations as a typed status to the route layer
+    // rather than throwing — the caller wants to render a friendly error
+    // in the modal, not crash to a 500.
+    if (err instanceof GammaApiError && err.code === 'failed') {
+      return {
+        status: 'failed',
+        generationId,
+        error: err.message,
+      };
+    }
+    throw err;
+  }
+
+  if (status.status === 'failed') {
+    return {
+      status: 'failed',
+      generationId,
+      error: status.error?.message ?? 'gamma:generation failed',
+    };
+  }
+
+  if (status.status !== 'completed') {
+    // 'pending' covers Gamma's 'pending' | 'running' (and anything we
+    // don't recognize as terminal). The frontend polls again in 5s.
+    return {
+      status: 'pending',
+      generationId,
+    };
+  }
+
+  if (!status.exportUrl) {
+    return {
+      status: 'failed',
+      generationId,
+      error: `gamma:generation ${generationId} completed but no exportUrl present`,
+    };
+  }
+
+  // ── Complete — persist cache + return result ──────────────────────
+  const generatedAt = new Date().toISOString();
+  const cachePayload = {
+    generationId: status.generationId,
+    gammaUrl: status.gammaUrl ?? '',
+    exportUrl: status.exportUrl,
+    generatedAt,
+    // Preserve whatever options were stashed at startGeneration time.
+    options: workspace.last_pptx?.options ?? undefined,
+  };
+
   try {
     const { error: upErr } = await supabaseAdmin
       .from('studio_workspaces')
@@ -275,15 +453,18 @@ export async function runWorkspacePptxExport(
   }
 
   console.log(
-    `[workspace_pptx] generated workspaceId=${workspaceId} hojas=${ordered.length} generationId=${gen.generationId} chars=${inputText.length}`,
+    `[workspace_pptx] generation complete workspaceId=${workspaceId} generationId=${generationId} credits_used=${status.credits?.used ?? '?'} credits_remaining=${status.credits?.remaining ?? '?'}`,
   );
 
   return {
-    generationId: gen.generationId,
-    gammaUrl: gen.gammaUrl ?? '',
-    exportUrl: gen.exportUrl,
-    filename: `${safeName}.pptx`,
-    cached: false,
-    generatedAt,
+    status: 'complete',
+    result: {
+      generationId: status.generationId,
+      gammaUrl: status.gammaUrl ?? '',
+      exportUrl: status.exportUrl,
+      filename,
+      cached: false,
+      generatedAt,
+    },
   };
 }

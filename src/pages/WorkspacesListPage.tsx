@@ -89,6 +89,13 @@ function WorkspaceCard({
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const [pptxResult, setPptxResult] = useState<PptxExportResult | null>(null);
+  // Phase 3.F: when the server returns status='pending', we hand the
+  // generationId to PptxResultModal so it can poll and surface progress.
+  // At most one of pptxResult/pptxPending is non-null at a time.
+  const [pptxPending, setPptxPending] = useState<{
+    generationId: string;
+    filename: string;
+  } | null>(null);
   const [pptxError, setPptxError] = useState<string | null>(null);
 
   const commitRename = () => {
@@ -101,11 +108,18 @@ function WorkspaceCard({
     setExporting(format);
     try {
       if (format === 'pptx') {
-        const result = await exportWorkspace(ws.id, 'pptx', {
+        // Phase 3.F: returns immediately. Either cached complete or pending.
+        const start = await exportWorkspace(ws.id, 'pptx', {
           workspaceTitle: ws.title,
           options: {} as PptxOptions,
         });
-        setPptxResult(result);
+        if (start.status === 'complete') {
+          setPptxPending(null);
+          setPptxResult(start.result);
+        } else {
+          setPptxResult(null);
+          setPptxPending({ generationId: start.generationId, filename: start.filename });
+        }
       } else if (format === 'docx') {
         await exportWorkspace(ws.id, 'docx', { workspaceTitle: ws.title });
       } else {
@@ -305,15 +319,24 @@ function WorkspaceCard({
         </div>
       </div>
 
-      {/* Pptx result — uses the polished shared PptxResultModal (T9). */}
+      {/* Pptx result — uses the polished shared PptxResultModal (T9).
+          Phase 3.F: also handles the polling state when the server kicked
+          off a fresh generation rather than returning a cache hit. */}
       <PptxResultModal
-        open={Boolean(pptxResult)}
-        onClose={() => setPptxResult(null)}
+        open={Boolean(pptxResult) || Boolean(pptxPending)}
+        onClose={() => {
+          setPptxResult(null);
+          setPptxPending(null);
+        }}
         result={pptxResult}
+        generationId={pptxPending?.generationId ?? null}
+        workspaceId={ws.id}
+        filename={pptxPending?.filename}
         onRegenerate={() => {
           // From the list view we don't pre-fill — just trigger a fresh
           // export. Keeps behavior identical to before T10.
           setPptxResult(null);
+          setPptxPending(null);
           void handleExport('pptx');
         }}
         workspaceTitle={ws.title}
@@ -378,6 +401,12 @@ export function WorkspacesListPage() {
   const [search, setSearch] = useState('');
   const [sortKey, setSortKey] = useState<SortKey>('updated');
 
+  // Idempotency guard for handleCreate. A second click while the first
+  // request is in flight (network slow / double-tap on mobile) used to
+  // create two workspaces back-to-back. The ref short-circuits the
+  // re-entry; `creating` state still drives the disabled visuals.
+  const submitRef = useRef(false);
+
   const load = useCallback(async () => {
     setLoading(true);
     try {
@@ -393,30 +422,68 @@ export function WorkspacesListPage() {
   useEffect(() => { void load(); }, [load]);
 
   const handleCreate = async () => {
+    if (submitRef.current) return;
+    submitRef.current = true;
     setCreating(true);
     try {
       const ws = await createWorkspace({ title: 'Mi workspace' });
       navigate(`/workspaces/${ws.id}`);
     } catch (err) {
-      setError((err as Error).message);
+      setError(`No se pudo crear workspace: ${err instanceof Error ? err.message : 'error desconocido'}`);
+    } finally {
+      submitRef.current = false;
       setCreating(false);
     }
   };
 
   const handleRename = async (id: string, title: string) => {
-    await updateWorkspace(id, { title }).catch(() => null);
+    // Optimistic update — apply immediately so the card reflects the new
+    // title without waiting for the server. If the request fails, revert
+    // and surface the error in the existing banner.
+    const prevTitle = workspaces.find((w) => w.id === id)?.title;
     setWorkspaces((prev) => prev.map((w) => w.id === id ? { ...w, title } : w));
+    try {
+      await updateWorkspace(id, { title });
+    } catch (err) {
+      if (typeof prevTitle === 'string') {
+        setWorkspaces((prev) => prev.map((w) => w.id === id ? { ...w, title: prevTitle } : w));
+      }
+      setError(`No se pudo renombrar: ${err instanceof Error ? err.message : 'error desconocido'}`);
+    }
   };
 
   const handleArchive = async (id: string, archived: boolean) => {
-    await updateWorkspace(id, { archived }).catch(() => null);
-    if (!showArchived) setWorkspaces((prev) => prev.filter((w) => w.id !== id));
-    else setWorkspaces((prev) => prev.map((w) => w.id === id ? { ...w, archived } : w));
+    // Snapshot the current row in case we need to revert on failure.
+    const prev = workspaces.find((w) => w.id === id);
+    if (!showArchived) setWorkspaces((cur) => cur.filter((w) => w.id !== id));
+    else setWorkspaces((cur) => cur.map((w) => w.id === id ? { ...w, archived } : w));
+    try {
+      await updateWorkspace(id, { archived });
+    } catch (err) {
+      if (prev) {
+        // Re-insert / re-restore on failure so the user sees the row
+        // come back instead of silently disappearing.
+        setWorkspaces((cur) => {
+          const exists = cur.some((w) => w.id === id);
+          if (exists) return cur.map((w) => w.id === id ? { ...w, archived: prev.archived } : w);
+          return [...cur, prev];
+        });
+      }
+      setError(`No se pudo ${archived ? 'archivar' : 'restaurar'}: ${err instanceof Error ? err.message : 'error desconocido'}`);
+    }
   };
 
   const handleDelete = async (id: string) => {
-    await deleteWorkspace(id).catch(() => null);
-    setWorkspaces((prev) => prev.filter((w) => w.id !== id));
+    const prev = workspaces.find((w) => w.id === id);
+    setWorkspaces((cur) => cur.filter((w) => w.id !== id));
+    try {
+      await deleteWorkspace(id);
+    } catch (err) {
+      if (prev) {
+        setWorkspaces((cur) => (cur.some((w) => w.id === id) ? cur : [...cur, prev]));
+      }
+      setError(`No se pudo eliminar: ${err instanceof Error ? err.message : 'error desconocido'}`);
+    }
   };
 
   const filtered = useMemo(() => {

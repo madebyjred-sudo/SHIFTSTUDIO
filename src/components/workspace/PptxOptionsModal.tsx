@@ -37,6 +37,18 @@ import {
 } from '@/services/workspaceApi';
 import { cn } from '@/lib/utils';
 
+// ─── Submit payload ───────────────────────────────────────────────────
+//
+// Phase 3.F split flow: the modal no longer waits for the full deck
+// before closing. It hands the parent either:
+//   - `{ status: 'pending', generationId, filename }` → parent shows
+//     PptxResultModal in polling state, modal closes immediately.
+//   - `{ status: 'complete', result }`               → cache hit, no
+//     polling needed; parent renders the result modal as before.
+export type PptxOptionsSubmit =
+  | { status: 'pending'; generationId: string; filename: string }
+  | { status: 'complete'; result: PptxExportResult };
+
 // ─── Tono presets ─────────────────────────────────────────────────────
 
 const TONOS: Array<{ value: string; label: string }> = [
@@ -57,8 +69,12 @@ interface Props {
   workspaceTitle?: string;
   /** Pre-fill from cached options (e.g. a previous submission). */
   initial?: PptxOptions;
-  /** Fired when generation finishes. Parent caches opts + opens result modal. */
-  onSubmit: (opts: PptxOptions, result: PptxExportResult) => void;
+  /**
+   * Fired when the request to start the generation succeeds. Parent
+   * caches opts + opens the result modal in either polling or
+   * cache-hit state. Modal closes itself after this returns.
+   */
+  onSubmit: (opts: PptxOptions, submit: PptxOptionsSubmit) => void;
 }
 
 // ─── Component ────────────────────────────────────────────────────────
@@ -138,12 +154,23 @@ export function PptxOptionsModal({
     setError(null);
 
     try {
-      const result = await exportWorkspace(workspaceId, 'pptx', {
+      // Phase 3.F: this returns FAST. Either status='pending' (Gamma
+      // started, frontend polls) or status='complete' (cache hit). No
+      // multi-minute server-side block — that always 504'd on Vercel.
+      const start = await exportWorkspace(workspaceId, 'pptx', {
         workspaceTitle,
         options: opts,
       });
       if (ac.signal.aborted) return;
-      onSubmit(opts, result);
+      if (start.status === 'pending') {
+        onSubmit(opts, {
+          status: 'pending',
+          generationId: start.generationId,
+          filename: start.filename,
+        });
+      } else {
+        onSubmit(opts, { status: 'complete', result: start.result });
+      }
       onClose();
     } catch (err) {
       if (ac.signal.aborted) return;
@@ -334,10 +361,10 @@ export function PptxOptionsModal({
                 <Loader2 className="w-4 h-4 text-[#1534dc] dark:text-[#8b5cf6] animate-spin" />
                 <div className="flex-1 min-w-0">
                   <div className="text-[12px] font-medium text-[#0e1745] dark:text-white">
-                    Generando presentación…
+                    Encolando presentación…
                   </div>
                   <div className="text-[10.5px] text-[#0e1745]/55 dark:text-white/50">
-                    Toma 30-60 segundos · Gamma diseña y exporta el .pptx
+                    Iniciando deck en Gamma · seguís el progreso en la siguiente ventana
                   </div>
                 </div>
                 <button
