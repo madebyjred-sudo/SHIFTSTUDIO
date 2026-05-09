@@ -864,7 +864,7 @@ function CanvasInner({
                 className="flex items-center gap-2 px-3 py-2.5 rounded-xl bg-white/80 dark:bg-[#0c1230]/85 backdrop-blur-xl border border-white/60 dark:border-white/10 shadow-sm text-[13px] font-medium text-[#1534dc] dark:text-[#8b5cf6] hover:bg-white dark:hover:bg-[#0c1230] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1534dc]/45 dark:focus-visible:ring-[#8b5cf6]/45"
               >
                 <Sparkles className="w-4 h-4" aria-hidden />
-                <span className="hidden md:inline">Arquitecta</span>
+                <span className="hidden sm:inline">Arquitecta</span>
               </button>
 
               {/* Upload */}
@@ -875,7 +875,7 @@ function CanvasInner({
                 className="flex items-center gap-2 px-3 py-2.5 rounded-xl bg-white/80 dark:bg-[#0c1230]/85 backdrop-blur-xl border border-white/60 dark:border-white/10 shadow-sm text-[13px] font-medium text-[#0e1745] dark:text-white hover:bg-white dark:hover:bg-[#0c1230] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1534dc]/45 dark:focus-visible:ring-[#8b5cf6]/45"
               >
                 <Upload className="w-4 h-4" aria-hidden />
-                <span className="hidden md:inline">Subir</span>
+                <span className="hidden sm:inline">Subir</span>
               </button>
 
               {/* Export */}
@@ -891,7 +891,7 @@ function CanvasInner({
                   className="flex items-center gap-2 px-3 py-2.5 rounded-xl bg-white/80 dark:bg-[#0c1230]/85 backdrop-blur-xl border border-white/60 dark:border-white/10 shadow-sm text-[13px] font-medium text-[#7A3B47] hover:bg-white dark:hover:bg-[#0c1230] transition-colors disabled:opacity-60 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1534dc]/45 dark:focus-visible:ring-[#8b5cf6]/45"
                 >
                   {exporting ? <Loader2 className="w-4 h-4 animate-spin" aria-hidden /> : <Download className="w-4 h-4" aria-hidden />}
-                  <span className="hidden md:inline">{exporting ? 'Exportando…' : 'Exportar'}</span>
+                  <span className="hidden sm:inline">{exporting ? 'Exportando…' : 'Exportar'}</span>
                 </button>
                 {exportMenuOpen && (
                   <div
@@ -927,11 +927,12 @@ function CanvasInner({
               {/* Add hoja */}
               <button
                 onClick={() => void handleAddHoja()}
+                title="Agregar nueva hoja (N)"
                 aria-label="Agregar nueva hoja al canvas"
                 className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-[#1534dc] dark:bg-[#8b5cf6] text-white text-[13px] font-semibold hover:bg-[#1230c0] dark:hover:bg-[#7a4cf2] transition-colors shadow-sm shadow-[#1534dc]/25 dark:shadow-[#8b5cf6]/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/60 focus-visible:ring-offset-2 focus-visible:ring-offset-[#f8f9fc] dark:focus-visible:ring-offset-[#080d1a]"
               >
                 <Plus className="w-4 h-4" aria-hidden />
-                <span className="hidden md:inline">Nueva hoja</span>
+                <span className="hidden sm:inline">Nueva hoja</span>
               </button>
             </div>
           </Panel>
@@ -970,6 +971,19 @@ function CanvasInner({
                     <Sparkles className="w-3.5 h-3.5" aria-hidden /> Genera con Atlas
                   </button>
                 </div>
+              </div>
+            </Panel>
+          )}
+
+          {/* Persistent onboarding tip — shows after first hoja(s) until
+              the user has created 3, by which point the affordance is
+              internalised. Mentions the `n` keyboard shortcut so power-
+              user paths get surfaced too. Sits unobtrusively bottom-left
+              so it doesn't fight the toolbar in top-right. */}
+          {nodes.length > 0 && nodes.length < 3 && !loading && (
+            <Panel position="bottom-left" className="mb-4 ml-4">
+              <div className="max-w-xs text-[11.5px] text-[#0e1745]/65 dark:text-white/60 bg-white/80 dark:bg-black/40 backdrop-blur rounded-lg px-3 py-2 border border-white/60 dark:border-white/10 shadow-sm">
+                <span aria-hidden>💡</span> Doble clic en el lienzo para nueva hoja, o pulsá <kbd className="px-1 py-0.5 rounded bg-black/8 dark:bg-white/10 text-[10.5px] font-mono">N</kbd>
               </div>
             </Panel>
           )}
