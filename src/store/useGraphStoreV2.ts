@@ -81,8 +81,17 @@ type AppState = {
   // The implementation lives in the create() body below; the type is
   // declared here so consumers can read it via useActiveGraphStore.
   isExecuting: boolean;
+  /** Set by `executeGraph` once the server assigns an id; cleared on
+   *  graph:done / cancel / error. The Cancelar button uses this to call
+   *  `cancelExecution(id)` against the gateway. Null while idle. */
+  currentExecutionId: string | null;
   executeGraph: () => Promise<void>;
+  /** Cancel the in-flight graph execution. No-op when idle. */
+  cancelExecution: () => Promise<void>;
   updateNodeStatus: (id: string, status: 'IDLE' | 'RUNNING' | 'COMPLETED' | 'FAILED') => void;
+  /** Stream a token chunk onto a node's `outputText`. Used by the SSE
+   *  client's `onNodeToken` handler for live token-by-token output. */
+  appendNodeOutput: (id: string, delta: string) => void;
 
   // V2 Specific UI state
   hitlState: { pauseId: string, prompt: string, status: 'paused' | 'expired' } | null;
@@ -113,9 +122,22 @@ const initialNodes: AppNode[] = [];
 const initialEdges: Edge[] = [];
 
 import { generateGraph as fetchGenerateGraph, resumeGraph as fetchResumeGraph } from '../services/graphApi';
-import { GraphSSEClient, AnyGraphSSEEvent } from '../services/sseClient';
+import {
+  startExecution as startGraphExecution,
+  subscribeToExecution,
+  cancelExecution as cancelGraphExecution,
+  toBranchSections,
+  type GraphExecutionNode,
+  type GraphExecutionEdge,
+} from '../services/graphExecutionApi';
 
-let globalSseClient: GraphSSEClient | null = null;
+/**
+ * Active SSE unsubscribe handle for the current graph execution. Held in
+ * module scope (not state) because it's a non-serializable disposer
+ * function — zustand state should stay JSON-friendly for devtools/SSR.
+ * Cleared on graph:done, cancel, or connection error.
+ */
+let activeUnsubscribe: (() => void) | null = null;
 
 /**
  * Coerce an unknown raw `data.format` value into a known ExportFormat.
@@ -194,6 +216,7 @@ export const useGraphStoreV2 = create<AppState>((set, get) => ({
   edges: initialEdges,
   activeMode: 'chat',
   isExecuting: false,
+  currentExecutionId: null,
   history: { past: [], future: [] },
   snapshots: [],
   activeSnapshotId: null,
@@ -241,7 +264,23 @@ export const useGraphStoreV2 = create<AppState>((set, get) => ({
 
     const data = (node.data ?? {}) as Record<string, unknown>;
     const format = normalizeExportFormat(data.format);
-    const sections = buildSectionsForExportNode(exportNodeId, nodes, edges);
+    // Prefer sections pushed onto the node by the SSE `graph:done` event
+    // — those carry the Cerebro-synthesized output verbatim. Fall back
+    // to the predecessor-walk for manual export triggers (user clicks
+    // run on the export node without an upstream graph run).
+    const presetSections = Array.isArray(data.presetSections)
+      ? (data.presetSections as BranchSection[]).filter(
+          (s) =>
+            s &&
+            typeof s.title === 'string' &&
+            typeof s.content === 'string' &&
+            s.content.trim().length > 0,
+        )
+      : [];
+    const sections =
+      presetSections.length > 0
+        ? presetSections
+        : buildSectionsForExportNode(exportNodeId, nodes, edges);
     if (sections.length === 0) {
       updateNodeStatus(exportNodeId, 'FAILED');
       updateNodeData(exportNodeId, {
@@ -363,90 +402,202 @@ export const useGraphStoreV2 = create<AppState>((set, get) => ({
     }
   },
 
+  /**
+   * Kick off graph execution against the Cerebro `/v1/graph/execute` SSE
+   * endpoint (or the in-process mock when `VITE_MOCK_GRAPH_EXEC=true`).
+   * Calling while already executing is a no-op — use `cancelExecution()`
+   * to stop. The DETENER button on the canvas calls cancelExecution
+   * directly; this method only handles the kickoff path.
+   *
+   * Wave E2 (2026-05-10): replaces the legacy `GraphSSEClient` POST→stream
+   * flow with the new contract `POST /v1/graph/execute` → SSE `GET
+   * /v1/graph/execute/:id/events`. Node lifecycle and export trigger map
+   * 1:1 with the contracted events. `graph:done.sections` is fed into the
+   * terminal export node's data so `runExportNode` can use them directly
+   * (skipping the predecessor-walk fallback for this run).
+   */
   executeGraph: async () => {
-    // T1.3 Ejecución SSE real - Wires to sseClient
-    if (get().isExecuting) {
-      if (globalSseClient) {
-        globalSseClient.stop();
-        globalSseClient = null;
+    if (get().isExecuting) return;
+
+    // Tear down any stray subscription from a previous failed run.
+    if (activeUnsubscribe) {
+      try {
+        activeUnsubscribe();
+      } catch {
+        /* noop */
       }
-      set({ isExecuting: false, currentNarration: null });
+      activeUnsubscribe = null;
+    }
+
+    set({
+      isExecuting: true,
+      currentNarration: 'Iniciando ejecución…',
+      currentExecutionId: null,
+    });
+    get().nodes.forEach((n) => get().updateNodeStatus(n.id, 'IDLE'));
+
+    const { nodes, edges, workspaceId } = get();
+    const wireNodes: GraphExecutionNode[] = nodes.map((n) => ({
+      id: n.id,
+      type: n.type,
+      data: (n.data ?? {}) as Record<string, unknown>,
+    }));
+    const wireEdges: GraphExecutionEdge[] = edges.map((e) => ({
+      id: e.id,
+      source: e.source,
+      target: e.target,
+    }));
+
+    let executionId: string;
+    let sseUrl: string;
+    try {
+      const started = await startGraphExecution(
+        workspaceId,
+        wireNodes,
+        wireEdges,
+        'studio:graph:exec',
+      );
+      executionId = started.executionId;
+      sseUrl = started.sseUrl;
+    } catch (err) {
+      console.error('[executeGraph] startExecution failed:', err);
+      set({
+        isExecuting: false,
+        currentExecutionId: null,
+        currentNarration: 'No se pudo iniciar la ejecución.',
+      });
       return;
     }
 
-    set({ isExecuting: true, currentNarration: "Inicializando workflow..." });
-    get().nodes.forEach(n => get().updateNodeStatus(n.id, 'IDLE'));
+    set({ currentExecutionId: executionId });
 
-    globalSseClient = new GraphSSEClient();
-    
-    const payload = {
-        graph: { nodes: get().nodes, edges: get().edges },
-        tenant_id: 'shift', // Default tenant for alpha
-        model: 'Claude 3.5 Sonnet'
-    };
-
-    await globalSseClient.execute(payload, {
-      onEvent: (event: AnyGraphSSEEvent) => {
-        // Handle visual node states based on SSE
-        if (event.event === 'node_start') {
-           get().updateNodeStatus(event.node_id, 'RUNNING');
-           set({ currentNarration: event.content });
-        } else if (event.event === 'node_complete') {
-           get().updateNodeStatus(event.node_id, 'COMPLETED');
-           get().updateNodeData(event.node_id, { outputText: event.content });
-        } else if (event.event === 'synthesis') {
-           set({ currentNarration: event.content });
-        } else if (event.event === 'hitl_pause') {
-           set({ hitlState: { pauseId: event.pause_id, prompt: event.content, status: 'paused' } });
-        } else if (event.event === 'hitl_approved' || event.event === 'hitl_rejected') {
-           set({ currentNarration: event.content });
-        } else if (event.event === 'hitl_timeout') {
-           set({ currentNarration: event.content });
-           const hs = get().hitlState;
-           if (hs) set({ hitlState: { ...hs, status: 'expired' } });
-        } else if (event.event === 'delivery') {
-           // Wave C: the orchestrator emits `delivery` when the export
-           // node is the terminal of the DAG. The client owns the export
-           // call now (it has the JWT + the in-memory node graph that
-           // produced the sections), so we route the trigger through
-           // runExportNode rather than just downloading whatever
-           // document_url the backend may or may not have produced.
-           //
-           // Back-compat: if the server still ships a `document_url`
-           // alongside (legacy stub flow), we honor it as a fallback —
-           // useful for ad-hoc backend-driven exports where the client
-           // didn't build the sections.
-           const targetNode = get().nodes.find((n) => n.id === event.node_id);
-           if (targetNode?.type === 'export') {
-              void get().runExportNode(event.node_id);
-           } else {
-              try {
-                 const deliveryData = JSON.parse(event.content);
-                 if (deliveryData.document_url) {
-                    const a = document.createElement('a');
-                    a.href = deliveryData.document_url;
-                    a.download = '';
-                    document.body.appendChild(a);
-                    a.click();
-                    document.body.removeChild(a);
-                 }
-              } catch (e) {
-                 console.error("Delivery JSON parse err", e);
-              }
-           }
-        } else if (event.event === 'error') {
-           get().updateNodeStatus(event.node_id, 'FAILED');
-           set({ currentNarration: event.content });
+    activeUnsubscribe = subscribeToExecution(executionId, sseUrl, {
+      onNodeStart: ({ node_id }) => {
+        get().updateNodeStatus(node_id, 'RUNNING');
+        // Reset previous output so token streaming starts clean. Safe
+        // even if onNodeToken is never called — onNodeComplete writes
+        // the final output unconditionally.
+        get().updateNodeData(node_id, { outputText: '' });
+      },
+      onNodeToken: ({ node_id, delta }) => {
+        get().appendNodeOutput(node_id, delta);
+      },
+      onNodeComplete: ({ node_id, output, tokens, cost_usd }) => {
+        get().updateNodeData(node_id, {
+          outputText: output,
+          tokens,
+          costUsd: cost_usd,
+        });
+        get().updateNodeStatus(node_id, 'COMPLETED');
+      },
+      onNodeError: ({ node_id, error }) => {
+        get().updateNodeData(node_id, { errorMsg: error });
+        get().updateNodeStatus(node_id, 'FAILED');
+      },
+      onGraphDone: ({ sections, total_cost_usd }) => {
+        // If the graph terminates in an export node, push the
+        // server-built sections onto its data and trigger the export.
+        // Falls back to the predecessor-walk in `runExportNode` if no
+        // sections were emitted (e.g. graph without an export node).
+        const exportNode = get().nodes.find((n) => n.type === 'export');
+        if (exportNode) {
+          const branchSections = toBranchSections(sections);
+          if (branchSections.length > 0) {
+            get().updateNodeData(exportNode.id, {
+              presetSections: branchSections,
+            });
+          }
+          void get().runExportNode(exportNode.id);
+        }
+        const costNote =
+          typeof total_cost_usd === 'number'
+            ? ` (US$${total_cost_usd.toFixed(4)})`
+            : '';
+        set({
+          isExecuting: false,
+          currentExecutionId: null,
+          currentNarration: `Ejecución finalizada${costNote}.`,
+        });
+        if (activeUnsubscribe) {
+          try {
+            activeUnsubscribe();
+          } catch {
+            /* noop */
+          }
+          activeUnsubscribe = null;
         }
       },
-      onError: (err) => {
-        console.error("SSE Error:", err);
-        set({ isExecuting: false, currentNarration: "Error de conexión." });
+      onConnectionError: (err) => {
+        console.error('[executeGraph] SSE connection error:', err);
+        set({
+          isExecuting: false,
+          currentExecutionId: null,
+          currentNarration: 'Error de conexión con la ejecución.',
+        });
+        if (activeUnsubscribe) {
+          try {
+            activeUnsubscribe();
+          } catch {
+            /* noop */
+          }
+          activeUnsubscribe = null;
+        }
       },
-      onComplete: () => {
-        set({ isExecuting: false, currentNarration: "Ejecución finalizada." });
+    });
+  },
+
+  cancelExecution: async () => {
+    const { currentExecutionId, isExecuting } = get();
+    if (!isExecuting) return;
+
+    // Close the SSE channel immediately so no further events apply.
+    if (activeUnsubscribe) {
+      try {
+        activeUnsubscribe();
+      } catch {
+        /* noop */
+      }
+      activeUnsubscribe = null;
+    }
+
+    // Mark any still-running nodes as FAILED — the server may also emit
+    // node:error for them, but the channel is closed so we won't see it.
+    get().nodes.forEach((n) => {
+      const status = (n.data as { status?: string } | undefined)?.status;
+      if (status === 'RUNNING') {
+        get().updateNodeStatus(n.id, 'FAILED');
+        get().updateNodeData(n.id, { errorMsg: 'Cancelado por el usuario.' });
       }
     });
+
+    set({
+      isExecuting: false,
+      currentExecutionId: null,
+      currentNarration: 'Ejecución cancelada.',
+    });
+
+    // Best-effort server-side cancel. Errors are logged but not surfaced
+    // — the local state is already clean.
+    if (currentExecutionId) {
+      try {
+        await cancelGraphExecution(currentExecutionId);
+      } catch (err) {
+        console.warn('[cancelExecution] server cancel failed:', err);
+      }
+    }
+  },
+
+  appendNodeOutput: (id, delta) => {
+    set((state) => ({
+      nodes: state.nodes.map((n) => {
+        if (n.id !== id) return n;
+        const prev =
+          typeof (n.data as { outputText?: unknown })?.outputText === 'string'
+            ? ((n.data as { outputText: string }).outputText)
+            : '';
+        return { ...n, data: { ...n.data, outputText: prev + delta } };
+      }),
+    }));
   },
 
   onNodesChange: (changes: NodeChange<AppNode>[]) => {
