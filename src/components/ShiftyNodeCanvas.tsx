@@ -10,6 +10,8 @@ import {
   ReactFlowProvider,
   type Connection,
   type Viewport,
+  type OnConnectStart,
+  type OnConnectEnd,
 } from '@xyflow/react';
 import { Play, Square, LayoutGrid, Loader2, Check, AlertCircle, CloudOff } from 'lucide-react';
 import '@xyflow/react/dist/style.css';
@@ -27,6 +29,12 @@ import { ShareWorkflowModal } from './ShareWorkflowModal';
 import { Share2 } from 'lucide-react';
 import { getLayoutedElements } from '../utils/layoutGraph';
 import { getGraph, saveGraph } from '../services/workspaceApi';
+import {
+  ConnectionDragContext,
+  INITIAL_CONNECTION_DRAG_STATE,
+  type ConnectionDragState,
+} from '../lib/connection-drag-context';
+import { validateConnection } from '../lib/graph-rules';
 
 const nodeTypes = {
   context: ContextNode,
@@ -42,16 +50,11 @@ const edgeTypes = {
   animated: AnimatedEdge,
 };
 
-/** Allowed connections: contexto→agente, agente→agente, agente→revision, agente→entrega, revision→agente, revision→entrega */
-const VALID_CONNECTIONS: Record<string, string[]> = {
-  context: ['specialist', 'agente'],
-  contexto: ['specialist', 'agente'],
-  specialist: ['specialist', 'export', 'agente', 'entrega', 'revision'],
-  agente: ['specialist', 'export', 'agente', 'entrega', 'revision'],
-  revision: ['specialist', 'agente', 'export', 'entrega'],
-  export: [],
-  entrega: [],
-};
+/**
+ * Connection validation rules live in `src/lib/graph-rules.ts` as a pure
+ * function — reused here for ReactFlow's isValidConnection and by every
+ * node component to drive its handle-highlight state during a drag.
+ */
 
 // ─── Autosave plumbing ───────────────────────────────────────────────
 //
@@ -374,17 +377,172 @@ function ShiftyNodeCanvasInner() {
     setMenu(null);
   }, []);
 
-  // Connection validation — prevent invalid edge types
-  const isValidConnection = useCallback((connection: Connection) => {
+  // Connection validation — prevent invalid edge types. Delegates to
+  // the pure rule in `lib/graph-rules` so tooltip + handle highlight
+  // + the actual drop guard agree byte-for-byte.
+  const isValidConnection = useCallback((connection: Connection | { source: string | null; target: string | null }) => {
     const sourceNode = nodes.find(n => n.id === connection.source);
     if (!sourceNode) return false;
-    const sourceType = (sourceNode.type || 'specialist') as string;
     const targetNode = nodes.find(n => n.id === connection.target);
     if (!targetNode) return false;
+    const sourceType = (sourceNode.type || 'specialist') as string;
     const targetType = (targetNode.type || 'specialist') as string;
-    const allowed = VALID_CONNECTIONS[sourceType] || [];
-    return allowed.includes(targetType);
+    return validateConnection(sourceType, targetType).valid;
   }, [nodes]);
+
+  // ─── Connection drag feedback (F2) ──────────────────────────────────
+  //
+  // While the user is dragging a connection (between onConnectStart and
+  // onConnectEnd), we publish the source node-id + type via context so
+  // every node can self-style its handles (valid → glow, invalid →
+  // attenuate). We also track cursor position to position the floating
+  // tooltip, and the current hover target (if any) to decide what
+  // message to show.
+  const [dragState, setDragState] = useState<ConnectionDragState>(INITIAL_CONNECTION_DRAG_STATE);
+  const [tooltip, setTooltip] = useState<{ x: number; y: number; reason: string; variant: 'error' | 'info' } | null>(null);
+  // Persistent error tooltip after a failed drop. Cleared on next user
+  // action (drag start, click, ...) or after 2s.
+  const persistentTooltipTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Shake state — keyed by node id so we can re-trigger the same node
+  // by remounting the className.
+  const [shakeKey, setShakeKey] = useState<{ nodeId: string; n: number } | null>(null);
+
+  const clearPersistentTooltip = useCallback(() => {
+    if (persistentTooltipTimerRef.current) {
+      clearTimeout(persistentTooltipTimerRef.current);
+      persistentTooltipTimerRef.current = null;
+    }
+  }, []);
+
+  const onConnectStart = useCallback<OnConnectStart>(
+    (_event, { nodeId, handleType }) => {
+      // We only track outbound drags (source handle). Target-handle
+      // drags aren't part of our spec.
+      if (!nodeId || handleType !== 'source') return;
+      const node = nodes.find(n => n.id === nodeId);
+      if (!node) return;
+      const sourceNodeType = (node.type || 'specialist') as string;
+      clearPersistentTooltip();
+      setTooltip(null);
+      setDragState({ active: true, sourceNodeId: nodeId, sourceNodeType });
+    },
+    [nodes, clearPersistentTooltip],
+  );
+
+  // Cursor-tracking while dragging — keeps the tooltip near the pointer
+  // and updates the message based on what's hovered. We only attach the
+  // listener while `dragState.active` is true so the canvas stays cheap
+  // when idle.
+  useEffect(() => {
+    if (!dragState.active) return;
+    const handleMove = (event: MouseEvent) => {
+      // Walk up from the event target to find a node element; xyflow
+      // tags each node wrapper with `.react-flow__node-<type>`.
+      const target = event.target as HTMLElement | null;
+      const nodeEl = target?.closest('.react-flow__node') as HTMLElement | null;
+      const hoverNodeId = nodeEl?.getAttribute('data-id') ?? null;
+
+      if (!hoverNodeId || hoverNodeId === dragState.sourceNodeId) {
+        // Over the pane (or back over source) — no tooltip yet.
+        setTooltip(null);
+        return;
+      }
+      const hoverNode = nodes.find(n => n.id === hoverNodeId);
+      if (!hoverNode) {
+        setTooltip(null);
+        return;
+      }
+      const targetType = (hoverNode.type || 'specialist') as string;
+      const result = validateConnection(dragState.sourceNodeType, targetType);
+      if (result.valid) {
+        // Valid hover — no tooltip needed, the green glow on the handle
+        // is the affordance. Avoids visual clutter.
+        setTooltip(null);
+        return;
+      }
+      setTooltip({
+        x: event.clientX,
+        y: event.clientY,
+        reason: result.reason ?? 'No se puede conectar.',
+        variant: 'error',
+      });
+    };
+    window.addEventListener('mousemove', handleMove);
+    return () => window.removeEventListener('mousemove', handleMove);
+  }, [dragState, nodes]);
+
+  const onConnectEnd = useCallback<OnConnectEnd>(
+    (event, connectionState) => {
+      // Capture the resolved drag before clearing the local state, then
+      // decide whether to show the failure UX.
+      const finalSourceNodeId = dragState.sourceNodeId;
+      const finalSourceType = dragState.sourceNodeType;
+      const wasActive = dragState.active;
+      setDragState(INITIAL_CONNECTION_DRAG_STATE);
+      if (!wasActive || !finalSourceNodeId) return;
+
+      // xyflow's FinalConnectionState exposes `toHandle`/`toNode` when
+      // the drop landed on a handle. We compute the target type from
+      // those when available; otherwise the drop was on the pane and we
+      // skip the failure animation (xyflow handles pane-drop as no-op).
+      const cs = connectionState as unknown as { toNode?: { type?: string; id?: string } | null; toHandle?: { nodeId?: string } | null };
+      const toType = cs.toNode?.type;
+      const toNodeId = cs.toNode?.id;
+
+      // No drop target → not a "failed" attempt, just an abandoned drag.
+      if (!toType || !toNodeId || toNodeId === finalSourceNodeId) return;
+
+      const result = validateConnection(finalSourceType, toType);
+      if (result.valid) return; // Successful drop — xyflow already wired the edge.
+
+      // Failed drop: shake the source card, surface the reason for 2s.
+      setShakeKey({ nodeId: finalSourceNodeId, n: Date.now() });
+      // Position the persistent tooltip near the release point so the
+      // user sees it where they let go. Handle both Mouse and Touch.
+      let px = window.innerWidth / 2;
+      let py = window.innerHeight / 2;
+      const me = event as MouseEvent;
+      if (typeof me.clientX === 'number' && typeof me.clientY === 'number') {
+        px = me.clientX;
+        py = me.clientY;
+      } else {
+        const te = event as TouchEvent;
+        const touch = te.changedTouches?.[0];
+        if (touch) {
+          px = touch.clientX;
+          py = touch.clientY;
+        }
+      }
+      setTooltip({ x: px, y: py, reason: result.reason ?? 'No se puede conectar.', variant: 'error' });
+      clearPersistentTooltip();
+      persistentTooltipTimerRef.current = setTimeout(() => {
+        setTooltip(null);
+        persistentTooltipTimerRef.current = null;
+      }, 2000);
+    },
+    [dragState, clearPersistentTooltip],
+  );
+
+  // Apply shake class to the source node briefly — we modify the
+  // node entry in `nodes` to add a className that the React Flow node
+  // wrapper exposes. Cleared after 250ms (animation is 200ms).
+  useEffect(() => {
+    if (!shakeKey) return;
+    const t = setTimeout(() => setShakeKey(null), 250);
+    return () => clearTimeout(t);
+  }, [shakeKey]);
+
+  // xyflow puts the className from `node.className` on the wrapper div.
+  // We synthesize that here without mutating the store — pure derived.
+  const flowNodes = useMemo(() => {
+    if (!shakeKey) return nodes;
+    return nodes.map(n => n.id === shakeKey.nodeId
+      ? { ...n, className: [n.className, 'shifty-connection-shake'].filter(Boolean).join(' ') }
+      : n);
+  }, [nodes, shakeKey]);
+
+  // Cleanup persistent tooltip on unmount.
+  useEffect(() => () => clearPersistentTooltip(), [clearPersistentTooltip]);
 
   // Auto-focus on the currently executing node
   useEffect(() => {
@@ -434,14 +592,17 @@ function ShiftyNodeCanvasInner() {
   );
 
   return (
+    <ConnectionDragContext.Provider value={dragState}>
     <div className="w-full h-full flex flex-col">
       <div className="flex-1 w-full bg-white dark:bg-transparent rounded-2xl border border-gray-200 dark:border-white/5 shadow-sm overflow-hidden relative">
         <ReactFlow
-          nodes={nodes}
+          nodes={flowNodes}
           edges={styledEdges}
           onNodesChange={onNodesChange}
           onEdgesChange={onEdgesChange}
           onConnect={onConnect}
+          onConnectStart={onConnectStart}
+          onConnectEnd={onConnectEnd}
           onMoveEnd={onMoveEnd}
           nodeTypes={nodeTypes}
           edgeTypes={edgeTypes}
@@ -529,7 +690,24 @@ function ShiftyNodeCanvasInner() {
 
       <ShareWorkflowModal isOpen={showShareModal} onClose={() => setShowShareModal(false)} />
       <HITLModal />
+
+      {/* Floating connection-validation tooltip. role="status" + aria-live
+          for screen readers; pointer-events:none in CSS so it never
+          intercepts the drag. */}
+      {tooltip && (
+        <div
+          id="shifty-connection-tooltip"
+          className="shifty-connection-tooltip"
+          data-variant={tooltip.variant === 'error' ? 'error' : 'info'}
+          role="status"
+          aria-live="polite"
+          style={{ left: tooltip.x, top: tooltip.y }}
+        >
+          {tooltip.reason}
+        </div>
+      )}
     </div>
+    </ConnectionDragContext.Provider>
   );
 }
 

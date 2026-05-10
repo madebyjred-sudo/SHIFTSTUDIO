@@ -1,7 +1,8 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useMemo } from 'react';
 import { Handle, Position } from '@xyflow/react';
 import { FileText, Paperclip, Loader2, CheckCircle2 } from 'lucide-react';
 import { useActiveGraphStore } from '../../store';
+import { useConnectionDrag } from '../../lib/connection-drag-context';
 
 export function ContextNode({ id, data }: any) {
   const [text, setText] = useState(data.text || '');
@@ -15,6 +16,22 @@ export function ContextNode({ id, data }: any) {
   }, [id, updateNodeData]);
 
   const ringClass = status === 'RUNNING' ? 'ring-2 ring-blue-500 ring-offset-2 dark:ring-offset-[#1A1A1A] animate-pulse duration-1000' : status === 'COMPLETED' ? 'ring-2 ring-emerald-500 ring-offset-2 dark:ring-offset-[#1A1A1A]' : '';
+
+  // ─── Connection feedback (F2) ───
+  // During a drag, decide whether THIS node's source handle is a valid
+  // origin (only relevant when it IS the source) or whether attenuation
+  // applies because the user is dragging from another node and this
+  // node has no relevant target handle.
+  const drag = useConnectionDrag();
+  const isSource = drag.active && drag.sourceNodeId === id;
+  // ContextNode has no target handle — when another node is dragging,
+  // this node's source handle is irrelevant (atenuar).
+  const sourceHandleState = useMemo(() => {
+    if (!drag.active) return 'none';
+    if (isSource) return 'source';
+    // Another node is the source — ContextNode source can never be a target.
+    return 'invalid';
+  }, [drag.active, isSource]);
 
   return (
     <div className={`bg-white dark:bg-[#1A1A1A] border border-blue-200 dark:border-blue-900 shadow-sm rounded-xl w-72 overflow-hidden transition-all hover:shadow-md ${ringClass}`}>
@@ -44,7 +61,15 @@ export function ContextNode({ id, data }: any) {
         </button>
       </div>
 
-      <Handle type="source" position={Position.Bottom} className="w-3 h-3 bg-blue-500 border-2 border-white dark:border-[#1A1A1A]" />
+      <Handle
+        id={`${id}-source`}
+        type="source"
+        position={Position.Bottom}
+        className="shifty-handle w-3 h-3 bg-blue-500 border-2 border-white dark:border-[#1A1A1A]"
+        data-connection-role={isSource ? 'source' : undefined}
+        data-connection-target={sourceHandleState === 'invalid' ? 'invalid' : undefined}
+        aria-describedby={drag.active ? `shifty-connection-tooltip` : undefined}
+      />
     </div>
   );
 }
