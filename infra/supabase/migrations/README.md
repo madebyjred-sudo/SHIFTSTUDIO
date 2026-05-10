@@ -38,6 +38,7 @@ checks), so reruns are safe.
 | 0007 | `0007_studio_workspace_citations_dedup_per_workspace.sql`  | Adds `workspace_id` column and tightens citation dedup to `(user_id, workspace_id, chunk_id)`                       |
 | 0008 | `0008_studio_ai_call_log.sql`                              | Creates `studio_ai_call_log` for per-LLM-call cost + token telemetry (Phase 3.B Studio-side cost attribution)        |
 | 0009 | `0009_architect_advisory_lock.sql`                         | Adds `studio_architect_insert_with_offset()` — advisory-lock helper that serializes concurrent `/architect` runs on the same workspace |
+| 0010 | `0010_studio_workspace_graphs.sql`                         | Creates `studio_workspace_graphs` for "modo nodos" persistence (ReactFlow nodes + edges + viewport, one blob per workspace, owner-only RLS) |
 
 ## Tables created
 
@@ -46,6 +47,7 @@ checks), so reruns are safe.
 - **`studio_workspace_citations`** — chunks/snippets pinned from chat or external sources, optionally attached to a node and a workspace. Owner-only RLS.
 - **`studio_workspace_chat_messages`** — persistent chat history per workspace + user. Owner-only RLS.
 - **`studio_ai_call_log`** — per-LLM-call telemetry (model, tokens, cost, latency, status) written fire-and-forget from `callOpenRouter`. Service-role only; no end-user direct access.
+- **`studio_workspace_graphs`** — ReactFlow / @xyflow node-edge graph for "modo nodos", one row per workspace. JSONB columns for `nodes`, `edges`, `viewport`. Owner-only RLS via parent workspace subquery.
 
 Plus:
 
@@ -81,6 +83,7 @@ psql "$SUPABASE_DB_URL" -f 0006_studio_workspace_chat_messages_fk_userid.sql
 psql "$SUPABASE_DB_URL" -f 0007_studio_workspace_citations_dedup_per_workspace.sql
 psql "$SUPABASE_DB_URL" -f 0008_studio_ai_call_log.sql
 psql "$SUPABASE_DB_URL" -f 0009_architect_advisory_lock.sql
+psql "$SUPABASE_DB_URL" -f 0010_studio_workspace_graphs.sql
 ```
 
 ### Option C — Supabase Studio SQL editor (one-shot)
@@ -113,8 +116,8 @@ You can rerun any migration without producing duplicates or errors.
 Each file ends with a commented `-- DOWN ROLLBACK` block listing the exact
 DROP statements needed. To roll back:
 
-1. **Run DOWN sections in reverse order** (0009 first, then 0008 → 0007 →
-   0006 → 0005 → 0004 → 0003 → 0002 → 0001).
+1. **Run DOWN sections in reverse order** (0010 first, then 0009 → 0008 →
+   0007 → 0006 → 0005 → 0004 → 0003 → 0002 → 0001).
 2. Uncomment the statements inside the `-- DOWN ROLLBACK` block of the file
    you want to revert.
 3. Execute via psql or the Supabase SQL editor.

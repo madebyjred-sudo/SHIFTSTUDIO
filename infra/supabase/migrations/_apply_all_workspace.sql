@@ -12,6 +12,7 @@
 --   0007_studio_workspace_citations_dedup_per_workspace.sql  (per-workspace citation dedup)
 --   0008_studio_ai_call_log.sql                              (per-LLM-call cost + token telemetry)
 --   0009_architect_advisory_lock.sql                         (advisory-lock helper for /architect concurrency)
+--   0010_studio_workspace_graphs.sql                         (modo nodos graph persistence: nodes + edges + viewport)
 --
 -- Idempotent: every statement uses CREATE IF NOT EXISTS / DROP IF EXISTS /
 -- ON CONFLICT DO NOTHING / pg_policies guards. Safe to re-run.
@@ -427,6 +428,39 @@ begin
 
   return;
 end $$;
+
+-- ════════════════════════════════════════════════════════════════════
+-- 0010_studio_workspace_graphs.sql
+-- ════════════════════════════════════════════════════════════════════
+-- Persistence for "modo nodos" — ReactFlow node-edge graph that lives
+-- next to the workspace TipTap canvas. ONE row per workspace holds the
+-- whole graph as opaque JSONB (nodes, edges, viewport). Owner-only RLS
+-- via parent-workspace subquery; trigger reuses studio_touch_updated_at().
+
+create table if not exists studio_workspace_graphs (
+  workspace_id uuid primary key
+               references studio_workspaces(id) on delete cascade,
+  nodes        jsonb not null default '[]'::jsonb,
+  edges        jsonb not null default '[]'::jsonb,
+  viewport     jsonb,
+  updated_at   timestamptz not null default now()
+);
+
+alter table studio_workspace_graphs enable row level security;
+
+drop policy if exists "studio_wsg_owner" on studio_workspace_graphs;
+create policy "studio_wsg_owner" on studio_workspace_graphs
+  for all
+  using (
+    auth.uid() = (select user_id from studio_workspaces where id = workspace_id)
+  )
+  with check (
+    auth.uid() = (select user_id from studio_workspaces where id = workspace_id)
+  );
+
+drop trigger if exists studio_wsg_touch on studio_workspace_graphs;
+create trigger studio_wsg_touch before update on studio_workspace_graphs
+  for each row execute function studio_touch_updated_at();
 
 -- ════════════════════════════════════════════════════════════════════
 -- END.  Verify in Supabase Studio → Table Editor / Storage that the

@@ -66,6 +66,26 @@ test.describe('Production smoke', () => {
     });
   }
 
+  // ─── Modo nodos graph persistence (T-A1) ─────────────────────────
+  // GET should 401 (read gate alive). PUT should 401 (write gate alive,
+  // body validation runs AFTER auth so no body is needed). 404 = route
+  // not deployed; 500 = handler crash on missing auth — both regressions.
+  test(`auth gate alive: GET /api/workspace/${FAKE_UUID}/graph`, async ({ request }) => {
+    const res = await request.get(`${PROD}/api/workspace/${FAKE_UUID}/graph`);
+    expect(res.status()).toBe(401);
+    const body = await res.json();
+    expect(body).toEqual({ ok: false, error: 'auth_required' });
+  });
+
+  test(`auth gate alive: PUT /api/workspace/${FAKE_UUID}/graph`, async ({ request }) => {
+    const res = await request.fetch(`${PROD}/api/workspace/${FAKE_UUID}/graph`, {
+      method: 'PUT',
+      data: { nodes: [], edges: [], viewport: null },
+      headers: { 'Content-Type': 'application/json' },
+    });
+    expect(res.status()).toBe(401);
+  });
+
   test('legacy /api/chat alive (Cerebro proxy)', async ({ request }) => {
     // Empty body → Cerebro returns validation error (200 bypass not expected).
     // Either 200 (Cerebro responded) or 422 (validation) — NOT 404 (route gone)
