@@ -76,7 +76,7 @@ function getApp(): express.Express {
     if (origin && (allowed.includes(origin) || process.env.NODE_ENV === 'development')) {
       res.setHeader('Access-Control-Allow-Origin', origin);
     }
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
     // x-user-id is intentionally OMITTED from the allow-list in production:
     // the auth helper rejects it as a spoofing vector, and exposing it via
     // CORS would let a browser-side attacker pre-flight-spoof the header

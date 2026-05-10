@@ -33,6 +33,8 @@
  *   DELETE /:id/nodes/:nodeId         delete one node
  *   GET    /:id/attach-context        ordered hoja markdown for chat context
  *   POST   /citations                 save chunk to user inbox / pinned to node
+ *   GET    /:id/graph                 fetch ReactFlow graph (modo nodos)
+ *   PUT    /:id/graph                 upsert ReactFlow graph (modo nodos)
  */
 import crypto from 'node:crypto';
 import { Router, type NextFunction, type Request, type Response } from 'express';
@@ -748,6 +750,174 @@ workspaceRouter.post('/citations', async (req: Request, res: Response) => {
   } catch (err) {
     reqLog(req).error('workspace.citation.save.failed', { message: (err as Error).message });
     res.status(500).json({ ok: false, error: 'citation_save_failed' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// GRAPH — "modo nodos" persistence (ReactFlow / @xyflow node-edge graph)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Studio's "modo nodos" canvas is separate from the workspace TipTap-hojas
+// canvas. Until now its state lived only in zustand (in-memory) and a
+// browser refresh wiped the graph. Migration 0010 added
+// `studio_workspace_graphs` (one row per workspace, JSONB blobs for nodes
+// + edges + viewport). These two endpoints expose it.
+//
+// Body cap: the parent app (server.ts and api/workspace.ts) mounts
+// `express.json({ limit: '5mb' })`, so a payload over 5MB is rejected by
+// Express with a 413 BEFORE it reaches this handler. The Express PayloadTooLarge
+// error returns the standard 413; we don't need an extra check here.
+//
+// Validation: nodes/edges shapes are app-defined (xyflow accepts a wide
+// range of `data` payloads), so the server only enforces the *envelope*
+// (must be arrays of objects; viewport is null or a {x,y,zoom} object).
+// Content of `data` / labels / handles is treated as opaque.
+
+/** Cheap structural validator for an array of plain-object items. */
+function isObjectArray(v: unknown): v is Record<string, unknown>[] {
+  if (!Array.isArray(v)) return false;
+  for (const item of v) {
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) return false;
+  }
+  return true;
+}
+
+/** Viewport is either null/undefined or a {x:number, y:number, zoom:number}. */
+function isValidViewport(v: unknown): boolean {
+  if (v === null || v === undefined) return true;
+  if (typeof v !== 'object' || Array.isArray(v)) return false;
+  const vp = v as Record<string, unknown>;
+  return (
+    typeof vp.x === 'number' && Number.isFinite(vp.x) &&
+    typeof vp.y === 'number' && Number.isFinite(vp.y) &&
+    typeof vp.zoom === 'number' && Number.isFinite(vp.zoom)
+  );
+}
+
+// GET /api/workspace/:id/graph — fetch the persisted graph for a workspace.
+//
+// Returns the row if present, or a synthesized empty graph
+// ({nodes:[], edges:[], viewport:null}) if no row exists yet — saves the
+// frontend from having to handle a separate 404 path. The "exists" signal
+// is implicit in `updated_at` being present.
+workspaceRouter.get('/:id/graph', async (req: Request, res: Response) => {
+  if (!dbReady(res)) return;
+  const userId = await requireUser(req, res);
+  if (!userId) return;
+  const { id } = req.params;
+  if (!isValidUuid(id)) {
+    res.status(400).json({ ok: false, error: 'invalid_uuid' });
+    return;
+  }
+  if (!(await ownedWorkspace(userId, id, res))) return;
+
+  try {
+    const { data, error } = await supabaseAdmin!
+      .from('studio_workspace_graphs')
+      .select('nodes, edges, viewport, updated_at')
+      .eq('workspace_id', id)
+      .maybeSingle();
+    if (error) throw new Error(error.message);
+
+    if (!data) {
+      // No row yet — return a valid empty graph so the client can render.
+      res.json({ ok: true, nodes: [], edges: [], viewport: null, updated_at: null });
+      return;
+    }
+    res.json({
+      ok: true,
+      nodes: data.nodes ?? [],
+      edges: data.edges ?? [],
+      viewport: data.viewport ?? null,
+      updated_at: data.updated_at,
+    });
+  } catch (err) {
+    reqLog(req).error('workspace.graph.fetch.failed', {
+      workspaceId: id,
+      message: (err as Error).message,
+    });
+    res.status(500).json({ ok: false, error: 'graph_fetch_failed' });
+  }
+});
+
+// PUT /api/workspace/:id/graph — upsert the persisted graph for a workspace.
+//
+// Body: { nodes: object[], edges: object[], viewport: null | {x,y,zoom} }.
+// All three are required (clearing the graph means sending empty arrays;
+// "don't change" is not a supported semantic — the client always knows
+// the full state at save time).
+//
+// The client-side autosave debounces saves (~800ms) so this hits multiple
+// times during a drag; same idempotency contract as PATCH /:id/nodes/:nodeId
+// (same body twice = same DB state). Express `express.json({ limit: '5mb' })`
+// rejects oversized bodies with 413 before this handler runs.
+workspaceRouter.put('/:id/graph', async (req: Request, res: Response) => {
+  if (!dbReady(res)) return;
+  const userId = await requireUser(req, res);
+  if (!userId) return;
+  const { id } = req.params;
+  if (!isValidUuid(id)) {
+    res.status(400).json({ ok: false, error: 'invalid_uuid' });
+    return;
+  }
+  if (!(await ownedWorkspace(userId, id, res))) return;
+
+  const body = (req.body ?? {}) as Record<string, unknown>;
+
+  if (!isObjectArray(body.nodes)) {
+    res.status(400).json({ ok: false, error: 'nodes_must_be_object_array' });
+    return;
+  }
+  if (!isObjectArray(body.edges)) {
+    res.status(400).json({ ok: false, error: 'edges_must_be_object_array' });
+    return;
+  }
+  if (!isValidViewport(body.viewport)) {
+    res.status(400).json({
+      ok: false,
+      error: 'viewport_must_be_null_or_xyzoom',
+    });
+    return;
+  }
+
+  // Normalize undefined → null so the JSONB column gets a stable shape.
+  const viewport = body.viewport === undefined ? null : body.viewport;
+
+  try {
+    const { data, error } = await supabaseAdmin!
+      .from('studio_workspace_graphs')
+      .upsert(
+        {
+          workspace_id: id,
+          nodes: body.nodes,
+          edges: body.edges,
+          viewport,
+          // Force updated_at to advance even when nothing changed — the
+          // before-update trigger only fires on UPDATE, and on a no-op
+          // upsert (same payload) Postgres won't write the row, so the
+          // trigger wouldn't fire. Explicit updated_at guarantees the
+          // client always sees a fresh timestamp.
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: 'workspace_id' },
+      )
+      .select('nodes, edges, viewport, updated_at')
+      .single();
+    if (error) throw new Error(error.message);
+
+    res.json({
+      ok: true,
+      nodes: data.nodes ?? [],
+      edges: data.edges ?? [],
+      viewport: data.viewport ?? null,
+      updated_at: data.updated_at,
+    });
+  } catch (err) {
+    reqLog(req).error('workspace.graph.upsert.failed', {
+      workspaceId: id,
+      message: (err as Error).message,
+    });
+    res.status(500).json({ ok: false, error: 'graph_upsert_failed' });
   }
 });
 

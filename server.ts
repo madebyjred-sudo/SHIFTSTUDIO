@@ -35,7 +35,10 @@ async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3001;
 
-  app.use(express.json());
+  // 5MB cap matches api/workspace.ts (Vercel side). Default 100kb is too
+  // tight for graph upserts (modo nodos PUT /api/workspace/:id/graph) and
+  // for transform/architect bodies that bundle large hoja contexts.
+  app.use(express.json({ limit: '5mb' }));
 
   // Per-request correlation: every handler downstream can read
   // req.requestId / req.log. Mounted globally (not just under
@@ -55,7 +58,7 @@ async function startServer() {
     if (origin && (allowedOrigins.includes(origin) || process.env.NODE_ENV === 'development')) {
       res.setHeader('Access-Control-Allow-Origin', origin);
     }
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
     // Workspace export endpoints stream the filename via Content-Disposition;
     // browsers strip non-safelisted response headers from cross-origin reads
