@@ -270,40 +270,10 @@ async function startServer() {
     }
   });
 
-  // API Export Endpoint: THE PYTHON BRIDGE for Document Generation
-  app.post("/api/export", async (req, res) => {
-    try {
-      const payload = req.body;
-      console.log(`[Express Gateway] Exporting document: format=${payload.format}`);
-
-      const swarmResponse = await fetchWithTimeout(`${SWARM_API_URL}/export/document`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      }, 90000); // Exporting can take longer (90s)
-
-      if (!swarmResponse.ok) {
-        const errorText = await swarmResponse.text();
-        console.error(`[Swarm Export Error] ${swarmResponse.status} - ${errorText}`);
-        return res.status(swarmResponse.status).json({ error: "Export Failed", details: errorText });
-      }
-
-      const data = await swarmResponse.json();
-
-      // Make URL absolute if needed
-      if (data.url && data.url.startsWith('/')) {
-        data.url = `${SWARM_API_URL}${data.url}`;
-      }
-
-      return res.json(data);
-    } catch (error: any) {
-      console.error("[Express Gateway Export Error]:", error);
-      if (error.name === 'AbortError') {
-        return res.status(504).json({ error: "Gateway Timeout: La exportación tardó demasiado en responder." });
-      }
-      res.status(500).json({ error: "Internal gateway error", details: String(error) });
-    }
-  });
+  // LEGACY: /api/export (proxy a ${SWARM_API_URL}/export/document) eliminado
+  // en chore/d2-remove-legacy-export. Modo nodos V2 usa /api/workspace/:id/export
+  // con sections (Wave C). Si V1 store sigue importado y dispara este path,
+  // recibirá 404 — V1 está deprecated, ver Wave D1.
 
   // API Nodes Execution Endpoint: THE PYTHON BRIDGE for Graph Builder
   app.post("/api/peaje/nodes", async (req, res) => {
