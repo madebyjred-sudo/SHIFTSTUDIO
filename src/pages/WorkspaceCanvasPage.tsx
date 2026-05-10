@@ -1142,6 +1142,7 @@ function PageModeTabs({
         ref={hojasRef}
         type="button"
         role="tab"
+        data-testid="page-mode-tab-hojas"
         aria-selected={mode === 'hojas'}
         aria-pressed={mode === 'hojas'}
         tabIndex={mode === 'hojas' ? 0 : -1}
@@ -1162,6 +1163,7 @@ function PageModeTabs({
         ref={nodosRef}
         type="button"
         role="tab"
+        data-testid="page-mode-tab-nodos"
         aria-selected={mode === 'nodos'}
         aria-pressed={mode === 'nodos'}
         tabIndex={mode === 'nodos' ? 0 : -1}
