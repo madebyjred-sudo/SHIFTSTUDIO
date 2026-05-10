@@ -1,3 +1,14 @@
+/**
+ * @file useGraphStoreV2.ts
+ * @description Single source of truth for the modo-nodos graph store
+ *   since D1 (2026-05-10). V1 (`useGraphStore.ts`) was deleted in the
+ *   same pass — every consumer routes through `useActiveGraphStore`
+ *   re-exported from `src/store/index.ts`.
+ *
+ *   The "V2" suffix is kept for git-archeology purposes (Wave C and
+ *   earlier docs reference it) but the store no longer lives behind a
+ *   feature flag. Adding new actions here is the only path forward.
+ */
 import { create } from 'zustand';
 import {
   Connection,
@@ -126,8 +137,9 @@ function isAsyncExportFormat(f: ExportFormat): boolean {
 
 /**
  * Build the modo-nodos `sections[]` payload from the immediate predecessors
- * of an export node. Mirrors V1's branch-isolation rule (cf.
- * useGraphStore.ts lines 237-260): each direct predecessor produces one
+ * of an export node. Mirrors the original V1 branch-isolation rule
+ * (`useGraphStore.ts` was deleted in D1 — see git history for the
+ * pre-Wave-C export path): each direct predecessor produces one
  * section, with the specialist's `outputText` as content (or the
  * context's text). Tabular data attached as `data: TableData` rides
  * through unchanged so the xlsx exporter can pivot on it.

@@ -1,8 +1,10 @@
 /**
  * Export format identifiers used by the node-graph `export` node.
  *
- * The values are sent verbatim to `/api/export` (see `useGraphStore.ts`),
- * so wave B (backend) must accept these exact strings:
+ * The values are sent verbatim to `/api/workspace/:id/export` (Wave C
+ * wired the V2 `runExportNode` runner; pre-D1 V1 hit the legacy
+ * `/api/export` path before being deleted), so the backend exporter must
+ * accept these exact strings:
  *   - `pptx`     → Presentación
  *   - `carousel` → Carrusel social (Gamma cards)
  *   - `docx`     → Word

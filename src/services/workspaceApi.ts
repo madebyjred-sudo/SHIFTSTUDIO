@@ -376,6 +376,107 @@ export async function deleteNode(workspaceId: string, nodeId: string): Promise<v
   await handleJson<{ ok: boolean }>(res);
 }
 
+// ─── Graph persistence (modo nodos) ──────────────────────────────────
+//
+// The "modo nodos" graph state (ReactFlow nodes + edges + viewport) lives
+// in zustand for instant interaction; these endpoints are the durable
+// store. Wave A1 added `studio_workspace_graphs` (one row per workspace,
+// JSONB blobs) and the GET/PUT routes; D3 (2026-05-10) wires the
+// debounced autosave in `ShiftyNodeCanvas`.
+//
+// Body shape on PUT mirrors what GET returns: { nodes, edges, viewport }.
+// `viewport` is `null` when the canvas hasn't been panned/zoomed yet.
+
+/** Generic xyflow-style graph payload — opaque arrays + an optional viewport. */
+export interface GraphViewport {
+  x: number;
+  y: number;
+  zoom: number;
+}
+
+export interface GraphState {
+  nodes: Record<string, unknown>[];
+  edges: Record<string, unknown>[];
+  viewport: GraphViewport | null;
+  /** ISO 8601 from the server; null if no row has been written yet. */
+  updated_at: string | null;
+}
+
+/**
+ * Fetch the persisted graph for a workspace. Returns an empty graph
+ * (`{nodes:[], edges:[], viewport:null, updated_at:null}`) when the
+ * workspace has never been saved — the caller can hydrate unconditionally.
+ */
+export async function getGraph(workspaceId: string, signal?: AbortSignal): Promise<GraphState> {
+  return retryIdempotent(async () => {
+    const res = await fetch(`/api/workspace/${workspaceId}/graph`, {
+      headers: await authedHeaders(),
+      signal,
+    });
+    const body = await handleJson<{
+      ok: boolean;
+      nodes: Record<string, unknown>[];
+      edges: Record<string, unknown>[];
+      viewport: GraphViewport | null;
+      updated_at: string | null;
+    }>(res);
+    return {
+      nodes: body.nodes ?? [],
+      edges: body.edges ?? [],
+      viewport: body.viewport ?? null,
+      updated_at: body.updated_at ?? null,
+    };
+  }, { signal });
+}
+
+/**
+ * Upsert the graph for a workspace. The server enforces idempotency by
+ * upserting on `workspace_id`. Returns the persisted shape (incl. fresh
+ * `updated_at`) so the client can render "guardado · hace N s".
+ *
+ * `viewport` may be omitted; we coerce undefined → null on the wire so
+ * the JSONB column has a stable shape.
+ */
+export async function saveGraph(
+  workspaceId: string,
+  body: {
+    nodes: Record<string, unknown>[];
+    edges: Record<string, unknown>[];
+    viewport?: GraphViewport | null;
+  },
+  signal?: AbortSignal,
+): Promise<GraphState> {
+  const payload = {
+    nodes: body.nodes,
+    edges: body.edges,
+    viewport: body.viewport ?? null,
+  };
+  // Mutating call — never auto-retried (risk of double-applying). The
+  // caller (ShiftyNodeCanvas autosave) implements its own backoff because
+  // the retry semantics are user-visible: while a save is failing the
+  // status badge shows "no guardó" and the queued state stays as
+  // "unsaved".
+  const res = await fetch(`/api/workspace/${workspaceId}/graph`, {
+    method: 'PUT',
+    headers: await authedHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(payload),
+    signal,
+  });
+  const json = await handleJson<{
+    ok: boolean;
+    nodes: Record<string, unknown>[];
+    edges: Record<string, unknown>[];
+    viewport: GraphViewport | null;
+    updated_at: string | null;
+  }>(res);
+  return {
+    nodes: json.nodes ?? [],
+    edges: json.edges ?? [],
+    viewport: json.viewport ?? null,
+    updated_at: json.updated_at ?? null,
+  };
+}
+
 // ─── Asset import (direct-to-storage) ─────────────────────────────────
 //
 // Why not multipart-to-BFF?
