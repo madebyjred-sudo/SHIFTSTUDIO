@@ -112,6 +112,7 @@ function ShiftyNodeCanvasInner() {
     onConnect,
     isExecuting,
     executeGraph,
+    cancelExecution,
     undo,
     redo,
     setNodes,
@@ -664,7 +665,7 @@ function ShiftyNodeCanvasInner() {
               )}
 
               <button
-                onClick={executeGraph}
+                onClick={isExecuting ? () => { void cancelExecution(); } : () => { void executeGraph(); }}
                 className={`flex items-center gap-2 min-h-9 px-4 py-2 text-[12px] font-bold rounded-xl shadow-lg border-2 transition-all ${isExecuting
                     ? 'bg-red-500 hover:bg-red-600 text-white border-red-600'
                     : 'bg-indigo-600 hover:bg-indigo-700 text-white border-indigo-700'
