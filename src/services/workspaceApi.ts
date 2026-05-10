@@ -18,6 +18,7 @@
  * exporter.
  */
 import { supabase } from './supabaseClient';
+import type { BranchSection, ExportFormat } from '../types/export';
 
 // ─── Types ────────────────────────────────────────────────────────────
 
@@ -629,41 +630,108 @@ export async function attachContext(workspaceId: string): Promise<{
 // ─── Export (md/docx/pptx) ────────────────────────────────────────────
 
 /**
+ * Common shape used by sections-driven (modo nodos) callers. All fields
+ * are optional and additive on top of the existing format-specific
+ * options. When `sections` is set, the server skips the workspace-hojas
+ * fetch entirely and renders directly from the provided units.
+ */
+export interface ExportSectionsOptions {
+  /** Override the deck/document title independently of the workspace row. */
+  title?: string;
+  /** Override the deck dek / document subtitle. */
+  subtitle?: string;
+  /** Consolidated specialist outputs from the modo nodos graph runner. */
+  sections?: BranchSection[];
+}
+
+/**
+ * Phase 3.F-ish blob result for the in-process formats (md / docx / xlsx).
+ * The caller can use this when it wants to skip the auto-download (we
+ * still trigger one by default for back-compat) and re-handle the blob
+ * (e.g. preview, alternate filename, telemetry hooks). The default path
+ * is fire-and-forget: callers don't read the return value.
+ */
+export interface BlobExportResult<F extends 'md' | 'docx' | 'xlsx'> {
+  format: F;
+  blob: Blob;
+  filename: string;
+}
+
+/**
  * Export a workspace.
  *
- * - md/docx → server returns a binary blob; we trigger a download and
- *   resolve to `{ format }`. The caller doesn't need a return value but
- *   we return one for telemetry hooks.
- * - pptx → server kicks off the Gamma generation and returns immediately.
- *   See `PptxStartResult` — caller either gets a cached `complete` deck
- *   right away, or a `pending` generationId to poll via `pollPptxStatus`.
- *   Phase 3.F split: the previous "block until done" shape always 504'd
- *   on Vercel because Gamma takes longer than the function maxDuration.
+ * - md/docx/xlsx → server returns a binary blob; we trigger a download
+ *   and resolve to `{ format, blob, filename }`. Most callers ignore
+ *   the return; tests and future preview UIs use the blob directly.
+ * - pptx/pdf/carousel → server kicks off the Gamma generation and
+ *   returns immediately. See `PptxStartResult` — the caller either gets
+ *   a cached `complete` deck right away (pptx without `sections` only)
+ *   or a `pending` generationId to poll via `pollPptxStatus` (which
+ *   honors `?format=` for pdf/carousel).
+ *
+ * Phase 3.F split: the previous "block until done" shape always 504'd
+ * on Vercel because Gamma takes longer than the function maxDuration.
+ *
+ * Wave C extension: accepts the modo-nodos `sections`/`title`/`subtitle`
+ * overrides on top of the original surface. When sections is present
+ * the server uses them as the source of truth; without sections the
+ * legacy workspace-canvas behavior is preserved for every format.
  */
 export async function exportWorkspace(
   workspaceId: string,
   format: 'md',
-  opts?: { workspaceTitle?: string },
-): Promise<{ format: 'md' }>;
+  opts?: { workspaceTitle?: string } & ExportSectionsOptions,
+): Promise<BlobExportResult<'md'>>;
 export async function exportWorkspace(
   workspaceId: string,
   format: 'docx',
-  opts?: { workspaceTitle?: string },
-): Promise<{ format: 'docx' }>;
+  opts?: { workspaceTitle?: string } & ExportSectionsOptions,
+): Promise<BlobExportResult<'docx'>>;
+export async function exportWorkspace(
+  workspaceId: string,
+  format: 'xlsx',
+  opts?: { workspaceTitle?: string } & ExportSectionsOptions,
+): Promise<BlobExportResult<'xlsx'>>;
 export async function exportWorkspace(
   workspaceId: string,
   format: 'pptx',
-  opts?: { workspaceTitle?: string; force?: boolean; options?: PptxOptions },
+  opts?: { workspaceTitle?: string; force?: boolean; options?: PptxOptions } & ExportSectionsOptions,
 ): Promise<PptxStartResult>;
 export async function exportWorkspace(
   workspaceId: string,
-  format: 'md' | 'docx' | 'pptx',
-  opts: { workspaceTitle?: string; force?: boolean; options?: PptxOptions } = {},
-): Promise<PptxStartResult | { format: 'md' | 'docx' }> {
+  format: 'pdf',
+  opts?: { workspaceTitle?: string; force?: boolean; options?: PptxOptions } & ExportSectionsOptions,
+): Promise<PptxStartResult>;
+export async function exportWorkspace(
+  workspaceId: string,
+  format: 'carousel',
+  opts?: { workspaceTitle?: string; force?: boolean; options?: PptxOptions } & ExportSectionsOptions,
+): Promise<PptxStartResult>;
+export async function exportWorkspace(
+  workspaceId: string,
+  format: ExportFormat | 'md',
+  opts: {
+    workspaceTitle?: string;
+    force?: boolean;
+    options?: PptxOptions;
+  } & ExportSectionsOptions = {},
+): Promise<PptxStartResult | BlobExportResult<'md' | 'docx' | 'xlsx'>> {
   const body: Record<string, unknown> = { format };
-  if (format === 'pptx') {
+  // Gamma-driven formats accept the cache-bust + Gamma options switches.
+  if (format === 'pptx' || format === 'pdf' || format === 'carousel') {
     if (opts.force) body.force = true;
     if (opts.options) body.options = opts.options;
+  }
+  // Modo nodos overrides — independent of format. The server validates
+  // sections shape and rejects empty arrays / >200 entries with a 400.
+  if (opts.sections && opts.sections.length > 0) {
+    body.sections = opts.sections;
+  }
+  if (typeof opts.title === 'string' && opts.title.trim()) {
+    body.title = opts.title.trim();
+  }
+  if (typeof opts.subtitle === 'string' && opts.subtitle.trim()) {
+    body.subtitle = opts.subtitle.trim();
   }
 
   const res = await fetch(`/api/workspace/${workspaceId}/export`, {
@@ -672,7 +740,7 @@ export async function exportWorkspace(
     body: JSON.stringify(body),
   });
 
-  if (format === 'pptx') {
+  if (format === 'pptx' || format === 'pdf' || format === 'carousel') {
     const json = await handleJson<
       | {
           ok: boolean;
@@ -714,7 +782,7 @@ export async function exportWorkspace(
     };
   }
 
-  // md / docx — binary blob download
+  // md / docx / xlsx — binary blob download (in-process server response).
   if (!res.ok) {
     if (res.status === 401 && typeof window !== 'undefined') {
       window.dispatchEvent(new CustomEvent('workspace:unauthorized'));
@@ -732,12 +800,16 @@ export async function exportWorkspace(
 
   const blob = await res.blob();
   const cd = res.headers.get('content-disposition') ?? '';
-  const safeTitle = (opts.workspaceTitle ?? 'workspace').replace(/[^\w.\-]/g, '_').slice(0, 80) || 'workspace';
+  const safeTitle =
+    (opts.workspaceTitle ?? opts.title ?? 'workspace')
+      .replace(/[^\w.\-]/g, '_')
+      .slice(0, 80) || 'workspace';
   const m = cd.match(/filename="?([^";]+)"?/i);
-  const fallbackExt = format === 'docx' ? 'docx' : 'md';
+  const fallbackExt =
+    format === 'docx' ? 'docx' : format === 'xlsx' ? 'xlsx' : 'md';
   const filename = m?.[1] ?? `${safeTitle}.${fallbackExt}`;
   triggerBlobDownload(blob, filename);
-  return { format };
+  return { format: format as 'md' | 'docx' | 'xlsx', blob, filename };
 }
 
 /**
@@ -751,8 +823,17 @@ export async function getPptxStatus(
   workspaceId: string,
   generationId: string,
   signal?: AbortSignal,
+  /**
+   * Optional format hint — required when the caller is polling a
+   * pdf/carousel generation kicked off via the modo-nodos sections path.
+   * Defaults to `pptx` (legacy workspace-canvas flow that writes back to
+   * `last_pptx`). Anything else routes to the generic Gamma checker.
+   */
+  format?: 'pptx' | 'pdf' | 'carousel',
 ): Promise<PptxStatusResult> {
-  const url = `/api/workspace/${workspaceId}/export/pptx-status?generation_id=${encodeURIComponent(generationId)}`;
+  const params = new URLSearchParams({ generation_id: generationId });
+  if (format && format !== 'pptx') params.set('format', format);
+  const url = `/api/workspace/${workspaceId}/export/pptx-status?${params.toString()}`;
   const res = await fetch(url, {
     method: 'GET',
     headers: await authedHeaders(),
@@ -830,6 +911,12 @@ export async function pollPptxStatus(
     timeoutMs?: number;
     signal?: AbortSignal;
     onProgress?: (elapsedMs: number) => void;
+    /**
+     * Format hint forwarded to the status endpoint. Required for pdf /
+     * carousel generations (modo nodos); defaults to pptx for the legacy
+     * workspace-canvas flow.
+     */
+    format?: 'pptx' | 'pdf' | 'carousel';
   } = {},
 ): Promise<PptxExportResult> {
   const intervalMs = opts.intervalMs ?? 5_000;
@@ -851,7 +938,12 @@ export async function pollPptxStatus(
       throw new Error('pptx_poll_timeout');
     }
 
-    const tick = await getPptxStatus(workspaceId, generationId, opts.signal);
+    const tick = await getPptxStatus(
+      workspaceId,
+      generationId,
+      opts.signal,
+      opts.format,
+    );
     if (tick.status === 'complete') {
       return tick.result;
     }

@@ -13,6 +13,14 @@ import {
   applyEdgeChanges,
 } from '@xyflow/react';
 import { getLayoutedElements } from '../utils/layoutGraph';
+import {
+  DEFAULT_EXPORT_FORMAT,
+  EXPORT_FORMATS,
+  type BranchSection,
+  type ExportFormat,
+  type TableData,
+} from '../types/export';
+import { exportWorkspace, pollPptxStatus } from '../services/workspaceApi';
 
 export type AppNode = Node;
 
@@ -37,9 +45,34 @@ type AppState = {
   activeMode: 'chat' | 'canvas';
   setActiveMode: (mode: 'chat' | 'canvas') => void;
 
+  // Wave C: workspace association for the modo nodos export pipeline.
+  // The active workspace id is set by `WorkspaceCanvasPage` on mount and
+  // cleared on unmount; export nodes route through `exportWorkspace(id,
+  // format, …)` which needs this scope. Null while no workspace is
+  // mounted (e.g. on the workspaces list or during early boot).
+  workspaceId: string | null;
+  setWorkspaceId: (id: string | null) => void;
+  /**
+   * Trigger a client-driven export for the given export node. Builds
+   * sections from immediate predecessors, calls /api/workspace/:id/export,
+   * polls Gamma for async formats, and writes status/exportUrl/errorMsg
+   * back into the node's data so the ExportNode UI can render the right
+   * visual state. Resolves once the export settles (success, failure or
+   * blob download). Safe to call multiple times — each call sets status
+   * RUNNING → COMPLETED|FAILED.
+   */
+  runExportNode: (exportNodeId: string) => Promise<void>;
+
   // New V2 Execution concepts
   generateGraph: (userMessage: string, chatHistory: any[], tenantId: string) => Promise<{ mode: string, narrative?: string, message?: string }>;
-  
+
+  // SSE-driven graph execution (mirrors V1's executeGraph surface).
+  // The implementation lives in the create() body below; the type is
+  // declared here so consumers can read it via useActiveGraphStore.
+  isExecuting: boolean;
+  executeGraph: () => Promise<void>;
+  updateNodeStatus: (id: string, status: 'IDLE' | 'RUNNING' | 'COMPLETED' | 'FAILED') => void;
+
   // V2 Specific UI state
   hitlState: { pauseId: string, prompt: string, status: 'paused' | 'expired' } | null;
   setHitlState: (state: AppState['hitlState']) => void;
@@ -73,6 +106,77 @@ import { GraphSSEClient, AnyGraphSSEEvent } from '../services/sseClient';
 
 let globalSseClient: GraphSSEClient | null = null;
 
+/**
+ * Coerce an unknown raw `data.format` value into a known ExportFormat.
+ * Mirrors the normalizer in `src/components/nodes/ExportNode.tsx` so the
+ * runner and the visual stay in lockstep.
+ */
+function normalizeExportFormat(raw: unknown): ExportFormat {
+  if (typeof raw !== 'string') return DEFAULT_EXPORT_FORMAT;
+  const lower = raw.toLowerCase();
+  return (EXPORT_FORMATS as readonly string[]).includes(lower)
+    ? (lower as ExportFormat)
+    : DEFAULT_EXPORT_FORMAT;
+}
+
+/** True when the format goes through Gamma (async kickoff + polling). */
+function isAsyncExportFormat(f: ExportFormat): boolean {
+  return f === 'pptx' || f === 'pdf' || f === 'carousel';
+}
+
+/**
+ * Build the modo-nodos `sections[]` payload from the immediate predecessors
+ * of an export node. Mirrors V1's branch-isolation rule (cf.
+ * useGraphStore.ts lines 237-260): each direct predecessor produces one
+ * section, with the specialist's `outputText` as content (or the
+ * context's text). Tabular data attached as `data: TableData` rides
+ * through unchanged so the xlsx exporter can pivot on it.
+ */
+function buildSectionsForExportNode(
+  exportNodeId: string,
+  nodes: AppNode[],
+  edges: Edge[],
+): BranchSection[] {
+  const predecessorIds = edges
+    .filter((e) => e.target === exportNodeId)
+    .map((e) => e.source);
+  const sections: BranchSection[] = [];
+  for (const pid of predecessorIds) {
+    const pred = nodes.find((n) => n.id === pid);
+    if (!pred) continue;
+    const data = (pred.data ?? {}) as Record<string, unknown>;
+    // Specialist nodes carry their LLM output in `outputText`; context
+    // nodes carry the user-typed brief in `text`. Fallback to label/title
+    // when neither is set so an empty branch still surfaces a heading
+    // (the server rejects empty-string content with a 400).
+    let content = '';
+    if (typeof data.outputText === 'string' && data.outputText.trim()) {
+      content = data.outputText;
+    } else if (typeof data.text === 'string' && data.text.trim()) {
+      content = data.text;
+    }
+    if (!content) continue;
+    const labelRaw =
+      (typeof data.label === 'string' && data.label) ||
+      (typeof data.title === 'string' && data.title) ||
+      (typeof data.agent === 'string' && data.agent) ||
+      pred.type ||
+      'Section';
+    const title =
+      String(labelRaw).charAt(0).toUpperCase() + String(labelRaw).slice(1);
+    const tableData = data.data as TableData | undefined;
+    sections.push({
+      title,
+      content,
+      sourceNodeId: pred.id,
+      ...(tableData && Array.isArray(tableData.headers) && Array.isArray(tableData.rows)
+        ? { data: tableData }
+        : {}),
+    });
+  }
+  return sections;
+}
+
 export const useGraphStoreV2 = create<AppState>((set, get) => ({
   nodes: initialNodes,
   edges: initialEdges,
@@ -83,9 +187,11 @@ export const useGraphStoreV2 = create<AppState>((set, get) => ({
   activeSnapshotId: null,
   hitlState: null,
   currentNarration: null,
+  workspaceId: null,
 
   setHitlState: (state) => set({ hitlState: state }),
   setCurrentNarration: (text) => set({ currentNarration: text }),
+  setWorkspaceId: (id) => set({ workspaceId: id }),
 
   resumeHitl: async (decision: 'approve' | 'reject') => {
     const { hitlState } = get();
@@ -100,6 +206,96 @@ export const useGraphStoreV2 = create<AppState>((set, get) => ({
   },
 
   setActiveMode: (mode) => set({ activeMode: mode }),
+
+  runExportNode: async (exportNodeId: string) => {
+    const { nodes, edges, workspaceId, updateNodeData, updateNodeStatus } =
+      get();
+    const node = nodes.find((n) => n.id === exportNodeId);
+    if (!node) {
+      console.warn('[runExportNode] node not found:', exportNodeId);
+      return;
+    }
+    if (!workspaceId) {
+      // No workspace mounted — surface the error on the node so the UI
+      // gives the user a real reason rather than a silent no-op. The
+      // backend would have rejected with 401/404 anyway.
+      updateNodeStatus(exportNodeId, 'FAILED');
+      updateNodeData(exportNodeId, {
+        errorMsg:
+          'No hay workspace activo — abrí un workspace antes de exportar.',
+      });
+      return;
+    }
+
+    const data = (node.data ?? {}) as Record<string, unknown>;
+    const format = normalizeExportFormat(data.format);
+    const sections = buildSectionsForExportNode(exportNodeId, nodes, edges);
+    if (sections.length === 0) {
+      updateNodeStatus(exportNodeId, 'FAILED');
+      updateNodeData(exportNodeId, {
+        errorMsg:
+          'El exportador no recibió contenido — conectá un especialista o un contexto al nodo.',
+      });
+      return;
+    }
+
+    // Mark as in-flight + clear stale download/error state so the UI
+    // re-renders cleanly when the user retries.
+    updateNodeStatus(exportNodeId, 'RUNNING');
+    updateNodeData(exportNodeId, { exportUrl: undefined, errorMsg: undefined });
+
+    const titleOverride =
+      (typeof data.title === 'string' && data.title.trim()) ||
+      'Exportación · Modo Nodos';
+    const subtitleOverride = 'Generado vía modo nodos';
+
+    try {
+      if (isAsyncExportFormat(format)) {
+        // pptx / pdf / carousel — kick off + poll.
+        const start = await exportWorkspace(workspaceId, format as 'pptx', {
+          sections,
+          title: titleOverride,
+          subtitle: subtitleOverride,
+        });
+        if (start.status === 'complete') {
+          updateNodeData(exportNodeId, {
+            exportUrl: start.result.exportUrl,
+            gammaUrl: start.result.gammaUrl,
+            generationId: start.result.generationId,
+          });
+          updateNodeStatus(exportNodeId, 'COMPLETED');
+          return;
+        }
+        const result = await pollPptxStatus(workspaceId, start.generationId, {
+          format: format as 'pptx' | 'pdf' | 'carousel',
+        });
+        updateNodeData(exportNodeId, {
+          exportUrl: result.exportUrl,
+          gammaUrl: result.gammaUrl,
+          generationId: result.generationId,
+        });
+        updateNodeStatus(exportNodeId, 'COMPLETED');
+      } else {
+        // md / docx / xlsx — in-process blob (the call also auto-triggers
+        // the browser download). We mark complete once the bytes land;
+        // there's no shareable url for these, but ExportNode renders the
+        // "complete" badge regardless and skips the link button when
+        // `exportUrl` is undefined.
+        await exportWorkspace(workspaceId, format as 'docx', {
+          sections,
+          title: titleOverride,
+          subtitle: subtitleOverride,
+          workspaceTitle: titleOverride,
+        });
+        updateNodeStatus(exportNodeId, 'COMPLETED');
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Error al exportar';
+      console.error('[runExportNode] export failed:', err);
+      updateNodeData(exportNodeId, { errorMsg: msg });
+      updateNodeStatus(exportNodeId, 'FAILED');
+    }
+  },
 
   updateNodeStatus: (id, status) => {
     set({
@@ -197,20 +393,34 @@ export const useGraphStoreV2 = create<AppState>((set, get) => ({
            const hs = get().hitlState;
            if (hs) set({ hitlState: { ...hs, status: 'expired' } });
         } else if (event.event === 'delivery') {
-           // event.content will be JSON. Assuming doc is exported
-           try {
-              const deliveryData = JSON.parse(event.content);
-              if (deliveryData.document_url) {
-                 // Trigger download automatically
-                 const a = document.createElement('a');
-                 a.href = deliveryData.document_url;
-                 a.download = '';
-                 document.body.appendChild(a);
-                 a.click();
-                 document.body.removeChild(a);
+           // Wave C: the orchestrator emits `delivery` when the export
+           // node is the terminal of the DAG. The client owns the export
+           // call now (it has the JWT + the in-memory node graph that
+           // produced the sections), so we route the trigger through
+           // runExportNode rather than just downloading whatever
+           // document_url the backend may or may not have produced.
+           //
+           // Back-compat: if the server still ships a `document_url`
+           // alongside (legacy stub flow), we honor it as a fallback —
+           // useful for ad-hoc backend-driven exports where the client
+           // didn't build the sections.
+           const targetNode = get().nodes.find((n) => n.id === event.node_id);
+           if (targetNode?.type === 'export') {
+              void get().runExportNode(event.node_id);
+           } else {
+              try {
+                 const deliveryData = JSON.parse(event.content);
+                 if (deliveryData.document_url) {
+                    const a = document.createElement('a');
+                    a.href = deliveryData.document_url;
+                    a.download = '';
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                 }
+              } catch (e) {
+                 console.error("Delivery JSON parse err", e);
               }
-           } catch (e) {
-              console.error("Delivery JSON parse err", e);
            }
         } else if (event.event === 'error') {
            get().updateNodeStatus(event.node_id, 'FAILED');

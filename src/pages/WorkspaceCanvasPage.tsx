@@ -55,6 +55,7 @@ import type { WorkspaceActionPayload } from '@/services/workspaceTurnStream';
 import {
   emitWorkspaceEvent, listenWorkspaceEvents,
 } from '@/lib/workspace-broadcast';
+import { useGraphStoreV2 } from '@/store/useGraphStoreV2';
 
 // ─── Node type registration ───────────────────────────────────────────
 const NODE_TYPES = {
@@ -1049,6 +1050,20 @@ function CanvasInner({
 // ─── Page wrapper (provides ReactFlow context + workspace meta) ───────
 export function WorkspaceCanvasPage({ workspaceId }: { workspaceId: string }) {
   const [title, setTitle] = useState('Cargando…');
+
+  // Wave C — inject the active workspace id into the V2 graph store so
+  // the modo-nodos export pipeline (`runExportNode`) can hit
+  // /api/workspace/:id/export with the correct scope. Cleared on unmount
+  // so a stale id never leaks into the next workspace's export.
+  // Done outside of the V2 feature flag because the setter is a no-op
+  // when V2 is off — the V1 store has its own (unused) state shape and
+  // this setter only writes to V2.
+  useEffect(() => {
+    useGraphStoreV2.getState().setWorkspaceId(workspaceId);
+    return () => {
+      useGraphStoreV2.getState().setWorkspaceId(null);
+    };
+  }, [workspaceId]);
 
   useEffect(() => {
     let alive = true;
