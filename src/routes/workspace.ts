@@ -1656,7 +1656,7 @@ Return ONLY valid JSON matching the schema. No prose, no code fences, no preambl
 
     // Pull approved RAG from Punto Medio. Soft-fail: if null, just skip.
     const RAG_BLOCK_MAX_CHARS = 3_000;
-    let ragBlock = '';
+    let puntoMedioRagBlock = '';
     try {
       const rag = await getApprovedRag(tenantId);
       if (rag && rag.combined_rag && rag.combined_rag.trim().length > 0) {
@@ -1665,7 +1665,7 @@ Return ONLY valid JSON matching the schema. No prose, no code fences, no preambl
           trimmed.length > RAG_BLOCK_MAX_CHARS
             ? trimmed.slice(0, RAG_BLOCK_MAX_CHARS) + '\n[…]'
             : trimmed;
-        ragBlock = `[Punto Medio — directrices del tenant]\n${sliced}`;
+        puntoMedioRagBlock = `[Punto Medio — directrices del tenant]\n${sliced}`;
       }
     } catch {
       // already soft-failed inside getApprovedRag, but be defensive.
@@ -1677,33 +1677,69 @@ Return ONLY valid JSON matching the schema. No prose, no code fences, no preambl
         ? `You are Atlas, a constructor-style strategic assistant for Shifty Studio. You build and refine structured artifacts. In a chat turn, give a concise, useful answer; if the user wants to construct something, suggest they switch to build mode.`
         : `You are Lexa, a thoughtful creative and strategic assistant for Shifty Studio. You help the user think through ideas, draft text, and reason about the content on their canvas. Be concise, specific, and direct.`;
 
-    const scopeSystemPrompt = [
-      ragBlock,
-      agentPersona,
-      ws ? `[Current workspace] "${ws.title}"${ws.description ? ` — ${ws.description}` : ''}` : '',
-      canvasReadingRules,
-      selNode
-        ? `[Selected hoja] "${(selNode as Record<string, unknown>).title}":\n${selBody ?? '(no textual content — may be an image, audio, or unindexed document)'}`
-        : '',
-      ...hojaBlocks,
-      ...assetBlocks,
-      hojaTitles.length > hojaBlocks.length + (selNode ? 1 : 0)
-        ? `[Additional hojas in workspace, not included above] ${hojaTitles
-            .filter(
-              (h) =>
-                h.id !== selectedNodeId &&
-                !hojaBlocks.some((b) => b.includes(`"${h.title}"`)),
-            )
-            .map((h) => `"${h.title}"`)
-            .join(', ')}`
-        : '',
-    ]
-      .filter(Boolean)
-      .join('\n\n');
+    // ── Cerebro Change 1: cache-aware system_blocks ─────────────────
+    // Stable blocks (cacheable=true) — agent persona, canvas reading
+    // rules, workspace meta, Punto Medio RAG. Volatile context
+    // (selected hoja body, hoja blocks, asset blocks, additional-hojas
+    // hint) collapses into a single dynamic, non-cacheable trailing
+    // block so a one-character canvas edit doesn't bust the cache for
+    // the >1024-token stable prefix.
+    //
+    // Verified on Cerebro 2026-05-09: ~2200 cacheable tokens drives a
+    // 90.9% input-cost reduction on cache hit. Anthropic requires
+    // ≥1024 cumulative cacheable tokens for any cache write; the four
+    // blocks below clear that comfortably for any non-empty workspace.
+    const workspaceMetaBlock = ws
+      ? `[Current workspace] "${ws.title}"${ws.description ? ` — ${ws.description}` : ''}`
+      : '';
 
-    // Build OpenRouter messages: system + safe history + current user query.
+    const dynamicContextParts: string[] = [];
+    if (selNode) {
+      dynamicContextParts.push(
+        `[Selected hoja] "${(selNode as Record<string, unknown>).title}":\n${
+          selBody ?? '(no textual content — may be an image, audio, or unindexed document)'
+        }`,
+      );
+    }
+    if (hojaBlocks.length > 0) dynamicContextParts.push(...hojaBlocks);
+    if (assetBlocks.length > 0) dynamicContextParts.push(...assetBlocks);
+    if (hojaTitles.length > hojaBlocks.length + (selNode ? 1 : 0)) {
+      dynamicContextParts.push(
+        `[Additional hojas in workspace, not included above] ${hojaTitles
+          .filter(
+            (h) =>
+              h.id !== selectedNodeId &&
+              !hojaBlocks.some((b) => b.includes(`"${h.title}"`)),
+          )
+          .map((h) => `"${h.title}"`)
+          .join(', ')}`,
+      );
+    }
+    const dynamicContext = dynamicContextParts.join('\n\n');
+
+    // Order matters: Anthropic prompt-cache hits the LONGEST common
+    // prefix, so put the most stable blocks first. Empty blocks are
+    // dropped — sending {text: '', cacheable: true} would force a
+    // tiny entry that yields no cache benefit.
+    const systemBlocks: Array<{ text: string; cacheable: boolean }> = [];
+    systemBlocks.push({ text: agentPersona, cacheable: true });
+    if (canvasReadingRules) {
+      systemBlocks.push({ text: canvasReadingRules, cacheable: true });
+    }
+    if (workspaceMetaBlock) {
+      systemBlocks.push({ text: workspaceMetaBlock, cacheable: true });
+    }
+    if (puntoMedioRagBlock) {
+      systemBlocks.push({ text: puntoMedioRagBlock, cacheable: true });
+    }
+    if (dynamicContext) {
+      systemBlocks.push({ text: dynamicContext, cacheable: false });
+    }
+
+    // History + current user query — sent through `messages`, NOT
+    // flattened into a `prompt`. Cerebro discards any role:'system'
+    // entries here (system context lives in systemBlocks).
     const orMessages: OpenRouterMessage[] = [
-      { role: 'system', content: scopeSystemPrompt },
       ...safeHistory.map<OpenRouterMessage>((m) => ({ role: m.role, content: m.content })),
       { role: 'user', content: query },
     ];
@@ -1720,6 +1756,7 @@ Return ONLY valid JSON matching the schema. No prose, no code fences, no preambl
     try {
       assembled = await callOpenRouter({
         model: TURN_CHAT_MODEL,
+        systemBlocks,
         messages: orMessages,
         temperature: 0.5,
         max_tokens: 4_000,
