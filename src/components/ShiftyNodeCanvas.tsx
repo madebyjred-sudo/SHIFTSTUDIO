@@ -337,6 +337,25 @@ function ShiftyNodeCanvasInner() {
     };
   }, []);
 
+  // F3 — E2E hook: when the URL carries `?e2e=1`, expose the V2 graph
+  // store on `window.__studioGraphStore` so Playwright specs can inject
+  // nodes/edges directly via `page.evaluate` (drag&drop is flake-prone
+  // in xyflow). The hook is a no-op in production (the query param is
+  // never set there) and is removed on unmount.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('e2e') !== '1') return;
+    (window as unknown as { __studioGraphStore?: typeof useGraphStoreV2 }).__studioGraphStore = useGraphStoreV2;
+    return () => {
+      try {
+        delete (window as unknown as { __studioGraphStore?: typeof useGraphStoreV2 }).__studioGraphStore;
+      } catch {
+        /* ignore */
+      }
+    };
+  }, []);
+
   // Keyboard shortcuts (Ctrl+Z / Cmd+Z)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -665,6 +684,8 @@ function ShiftyNodeCanvasInner() {
               )}
 
               <button
+                data-testid="graph-run-button"
+                aria-label={isExecuting ? 'Detener ejecución del grafo' : 'Ejecutar grafo'}
                 onClick={isExecuting ? () => { void cancelExecution(); } : () => { void executeGraph(); }}
                 className={`flex items-center gap-2 min-h-9 px-4 py-2 text-[12px] font-bold rounded-xl shadow-lg border-2 transition-all ${isExecuting
                     ? 'bg-red-500 hover:bg-red-600 text-white border-red-600'
@@ -698,6 +719,7 @@ function ShiftyNodeCanvasInner() {
       {tooltip && (
         <div
           id="shifty-connection-tooltip"
+          data-testid="connection-tooltip"
           className="shifty-connection-tooltip"
           data-variant={tooltip.variant === 'error' ? 'error' : 'info'}
           role="status"
@@ -745,6 +767,8 @@ function GraphSaveBadge({ status, lastSavedAt, hasWorkspace }: GraphSaveBadgePro
   if (!hasWorkspace) {
     return (
       <span
+        data-testid="graph-save-badge"
+        data-state="no-workspace"
         className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-gray-100 dark:bg-white/5 text-[11px] font-medium text-gray-500 dark:text-white/50 border border-gray-200 dark:border-white/10 backdrop-blur-md"
         title="Modo nodos global — para activar autoguardado, abrí un workspace."
         role="status"
@@ -758,6 +782,8 @@ function GraphSaveBadge({ status, lastSavedAt, hasWorkspace }: GraphSaveBadgePro
   if (status === 'saving') {
     return (
       <span
+        data-testid="graph-save-badge"
+        data-state="saving"
         className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-[#1534dc]/[0.06] dark:bg-[#8b5cf6]/[0.10] text-[11px] font-semibold text-[#1534dc]/85 dark:text-[#8b5cf6]/90 border border-[#1534dc]/15 dark:border-[#8b5cf6]/25 backdrop-blur-md"
         role="status"
         aria-live="polite"
@@ -770,6 +796,8 @@ function GraphSaveBadge({ status, lastSavedAt, hasWorkspace }: GraphSaveBadgePro
   if (status === 'unsaved') {
     return (
       <span
+        data-testid="graph-save-badge"
+        data-state="unsaved"
         className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-amber-50 dark:bg-amber-900/20 text-[11px] font-semibold text-amber-700 dark:text-amber-300 border border-amber-200 dark:border-amber-700/40 backdrop-blur-md"
         role="status"
         aria-live="polite"
@@ -782,6 +810,8 @@ function GraphSaveBadge({ status, lastSavedAt, hasWorkspace }: GraphSaveBadgePro
   if (status === 'error') {
     return (
       <span
+        data-testid="graph-save-badge"
+        data-state="error"
         className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-rose-50 dark:bg-rose-900/20 text-[11px] font-semibold text-rose-700 dark:text-rose-300 border border-rose-200 dark:border-rose-700/40 backdrop-blur-md"
         title="No se pudo guardar — reintentando con backoff exponencial. Tu estado local está intacto."
         role="alert"
@@ -795,6 +825,8 @@ function GraphSaveBadge({ status, lastSavedAt, hasWorkspace }: GraphSaveBadgePro
   if (status === 'saved' && lastSavedAt !== null) {
     return (
       <span
+        data-testid="graph-save-badge"
+        data-state="saved"
         className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-emerald-50 dark:bg-emerald-900/15 text-[11px] font-semibold text-emerald-700/90 dark:text-emerald-300/90 border border-emerald-200/70 dark:border-emerald-700/30 backdrop-blur-md"
         title={`Última escritura: ${new Date(lastSavedAt).toLocaleString('es')}`}
         role="status"

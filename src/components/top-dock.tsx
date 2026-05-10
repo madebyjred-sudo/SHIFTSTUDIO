@@ -50,6 +50,7 @@ export function TopDock({ onOpenHistory, onToggleHistory, isHistoryOpen }: TopDo
             Chat
           </button>
           <button
+            data-testid="topdock-mode-nodes"
             className={cn(
               "h-9 px-4 rounded-lg text-xs font-semibold transition-all flex items-center gap-1.5",
               activeMode === 'canvas'
