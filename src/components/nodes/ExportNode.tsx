@@ -20,6 +20,8 @@ import {
   DEFAULT_EXPORT_FORMAT,
   type ExportFormat,
 } from '../../types/export';
+import { useConnectionDrag } from '../../lib/connection-drag-context';
+import { validateConnection } from '../../lib/graph-rules';
 
 /**
  * Visual status used by ExportNode UI. Maps from the store-level status:
@@ -112,6 +114,16 @@ export function ExportNode({ id, data }: any) {
 
   const accentVar = `var(${meta.cssVar})`;
 
+  // ─── Connection feedback (F2) ───
+  // Export is target-only. During a drag from another node, decide
+  // whether the dragged source type → 'export' is valid.
+  const drag = useConnectionDrag();
+  const targetHandleState = useMemo<'valid' | 'invalid' | 'none'>(() => {
+    if (!drag.active) return 'none';
+    const { valid } = validateConnection(drag.sourceNodeType, 'export');
+    return valid ? 'valid' : 'invalid';
+  }, [drag.active, drag.sourceNodeType]);
+
   return (
     <div
       className={`bg-white dark:bg-[#1A1A1A] border shadow-sm rounded-xl w-72 overflow-hidden transition-all hover:shadow-md ${
@@ -130,10 +142,13 @@ export function ExportNode({ id, data }: any) {
       }}
     >
       <Handle
+        id={`${id}-target`}
         type="target"
         position={Position.Top}
-        className="w-3 h-3 border-2 border-white dark:border-[#1A1A1A]"
+        className="shifty-handle w-3 h-3 border-2 border-white dark:border-[#1A1A1A]"
         style={{ background: handleColorVar }}
+        data-connection-target={targetHandleState === 'none' ? undefined : targetHandleState}
+        aria-describedby={drag.active ? `shifty-connection-tooltip` : undefined}
       />
 
       {/* Header */}

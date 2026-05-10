@@ -1,7 +1,9 @@
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useMemo } from 'react';
 import { Handle, Position } from '@xyflow/react';
 import { Bot, Settings2, Loader2, CheckCircle2, AlertTriangle, ChevronDown, ChevronUp } from 'lucide-react';
 import { useActiveGraphStore } from '../../store';
+import { useConnectionDrag } from '../../lib/connection-drag-context';
+import { validateConnection } from '../../lib/graph-rules';
 
 const AGENTS = [
   { id: 'shiftai', name: 'Shifty (General)' },
@@ -57,9 +59,26 @@ export function SpecialistNode({ id, data }: any) {
   const iconBgClass = status === 'FAILED' ? 'bg-red-100 dark:bg-red-800 text-red-600 dark:text-red-300' : 'bg-indigo-100 dark:bg-indigo-800 text-indigo-600 dark:text-indigo-300';
   const titleClass = status === 'FAILED' ? 'text-red-900 dark:text-red-100' : 'text-indigo-900 dark:text-indigo-100';
 
+  // ─── Connection feedback (F2) ───
+  const drag = useConnectionDrag();
+  const isSource = drag.active && drag.sourceNodeId === id;
+  // Target-handle validity = can drag.sourceNodeType connect to specialist?
+  const targetHandleState = useMemo<'valid' | 'invalid' | 'none'>(() => {
+    if (!drag.active || isSource) return 'none';
+    const { valid } = validateConnection(drag.sourceNodeType, 'specialist');
+    return valid ? 'valid' : 'invalid';
+  }, [drag.active, drag.sourceNodeType, isSource]);
+
   return (
     <div className={`bg-white dark:bg-[#1A1A1A] border border-indigo-200 dark:border-indigo-900 shadow-sm rounded-xl w-80 transition-all hover:shadow-md ${ringClass}`}>
-      <Handle type="target" position={Position.Top} className="w-3 h-3 bg-indigo-500 border-2 border-white dark:border-[#1A1A1A]" />
+      <Handle
+        id={`${id}-target`}
+        type="target"
+        position={Position.Top}
+        className="shifty-handle w-3 h-3 bg-indigo-500 border-2 border-white dark:border-[#1A1A1A]"
+        data-connection-target={targetHandleState === 'none' ? undefined : targetHandleState}
+        aria-describedby={drag.active && !isSource ? `shifty-connection-tooltip` : undefined}
+      />
 
       <div className={`${headerBgClass} px-4 py-2 flex items-center justify-between`}>
         <div className="flex items-center gap-2">
@@ -134,7 +153,14 @@ export function SpecialistNode({ id, data }: any) {
         )}
       </div>
 
-      <Handle type="source" position={Position.Bottom} className="w-3 h-3 bg-indigo-500 border-2 border-white dark:border-[#1A1A1A]" />
+      <Handle
+        id={`${id}-source`}
+        type="source"
+        position={Position.Bottom}
+        className="shifty-handle w-3 h-3 bg-indigo-500 border-2 border-white dark:border-[#1A1A1A]"
+        data-connection-role={isSource ? 'source' : undefined}
+        aria-describedby={isSource ? `shifty-connection-tooltip` : undefined}
+      />
     </div>
   );
 }

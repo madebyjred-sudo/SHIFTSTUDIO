@@ -519,4 +519,81 @@ button {
 .hoja-prose.chat-md code { font-size: 0.85em; }
 .hoja-prose.chat-md blockquote { padding-left: 0.7em; margin: 0.4em 0; }
 .hoja-prose.chat-md > *:first-child { margin-top: 0; }
+
+/* ═══════════════════════════════════════════════════════════════════
+   Modo nodos — connection validation feedback (F2)
+   While the user drags a handle, every node publishes its validity
+   via `data-connection-target` (valid|invalid|none). The handle styling
+   below uses those attributes, so we avoid re-rendering every node on
+   each pointer move; only the data-attribute flip is needed.
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* Source handle (the one the user grabbed) — sits at the origin. */
+.shifty-handle[data-connection-role="source"] {
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-shift-status-running) 35%, transparent);
+    transition: box-shadow 150ms ease-out;
+}
+
+/* Valid drop target — green glow. */
+.shifty-handle[data-connection-target="valid"] {
+    border-color: var(--color-shift-status-completed) !important;
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-shift-status-completed) 45%, transparent),
+        0 0 12px color-mix(in srgb, var(--color-shift-status-completed) 55%, transparent);
+    transition: box-shadow 150ms ease-out, border-color 150ms ease-out;
+}
+
+/* Invalid drop target — attenuated. */
+.shifty-handle[data-connection-target="invalid"] {
+    opacity: 0.4;
+    transition: opacity 150ms ease-out;
+}
+
+/* Shake animation for failed-drop feedback on the SOURCE node card.
+   200ms total, three quick lateral oscillations. Respects reduced-motion. */
+@keyframes shifty-shake {
+    0%   { transform: translateX(0); }
+    20%  { transform: translateX(-4px); }
+    40%  { transform: translateX(4px); }
+    60%  { transform: translateX(-3px); }
+    80%  { transform: translateX(3px); }
+    100% { transform: translateX(0); }
+}
+
+.shifty-connection-shake {
+    animation: shifty-shake 200ms ease-in-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .shifty-connection-shake {
+        animation: none;
+    }
+    .shifty-handle[data-connection-target="valid"],
+    .shifty-handle[data-connection-target="invalid"],
+    .shifty-handle[data-connection-role="source"] {
+        transition: none;
+    }
+}
+
+/* Floating tooltip following the cursor during invalid drag.
+   Position is set inline (left/top); this only owns visual shell. */
+.shifty-connection-tooltip {
+    position: fixed;
+    z-index: 1000;
+    pointer-events: none;
+    padding: 6px 10px;
+    border-radius: 8px;
+    font-size: 11.5px;
+    font-weight: 600;
+    line-height: 1.35;
+    max-width: 260px;
+    background: color-mix(in srgb, var(--color-shift-status-failed) 92%, black 8%);
+    color: white;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+    border: 1px solid color-mix(in srgb, var(--color-shift-status-failed) 70%, black 30%);
+    transform: translate(12px, 12px);
+}
+.shifty-connection-tooltip[data-variant="info"] {
+    background: color-mix(in srgb, var(--color-shift-status-running) 92%, black 8%);
+    border-color: color-mix(in srgb, var(--color-shift-status-running) 70%, black 30%);
+}
 .hoja-prose.chat-md > *:last-child { margin-bottom: 0; }
