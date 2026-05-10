@@ -14,6 +14,19 @@ likes/dislikes per-message.
 - Express BFF (`server.ts`) — proxy al SWARM_API_URL (Cerebro)
 - Vercel functions paralelas (`api/chat.ts`, `api/debate.ts`) para deploy serverless
 
+## Workspace — dos canvases
+
+Cada `studio_workspace` tiene dos modos de canvas. El usuario alterna con
+la pestaña Hojas | Nodos en el top-center.
+
+- **Hojas** — TipTap document-style nodes con auto-save y chat de
+  workspace lateral. Es el flujo editorial por defecto.
+- **Nodos** — grafo ReactFlow (`context → specialist → export`) con
+  ejecución SSE contra Cerebro, autosave persistente y export a 5
+  formatos (`pptx`, `pdf`, `docx`, `xlsx`, `carousel`). Ver
+  [docs/modo-nodos.md](./docs/modo-nodos.md) para arquitectura,
+  contrato del SSE, variables de entorno y troubleshooting.
+
 ## Run local
 
 ```bash
