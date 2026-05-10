@@ -21,9 +21,12 @@ const ShiftAIEmbed = lazy(() =>
   import("./components/ShiftAIEmbed").then((m) => ({ default: m.ShiftAIEmbed })),
 );
 const AdminDashboard = lazy(() => import("./components/admin/AdminDashboard"));
-const ShiftyNodeCanvas = lazy(() =>
-  import("./components/ShiftyNodeCanvas").then((m) => ({ default: m.ShiftyNodeCanvas })),
-);
+// F1 (2026-05-10): the root-level "canvas" mode (no workspace bound) was
+// only ever an exploration surface — the V2 graph store can't autosave
+// without a workspaceId. Modo nodos now lives INSIDE a workspace via the
+// Hojas/Nodos toggle in WorkspaceCanvasPage. Setting `activeMode='canvas'`
+// at the root-level redirects to `/workspaces` so the user lands somewhere
+// the graph actually persists. We no longer import ShiftyNodeCanvas here.
 import { useActiveGraphStore } from "./store";
 import { useAuthStore } from "./store/useAuthStore";
 import { supabase } from "./services/supabaseClient";
@@ -61,6 +64,7 @@ function WorkspaceRouteFallback() {
 
 export default function App() {
   const activeMode = useActiveGraphStore((state) => state.activeMode);
+  const setActiveMode = useActiveGraphStore((state) => state.setActiveMode);
   const currentPath = useRoute();
   const [isEmbedMode, setIsEmbedMode] = useState(false);
   const [isCerebroMode, setIsCerebroMode] = useState(false);
@@ -126,6 +130,21 @@ export default function App() {
     window.addEventListener('workspace:unauthorized', handler);
     return () => window.removeEventListener('workspace:unauthorized', handler);
   }, [bypassAuth]);
+
+  // F1 (2026-05-10): the root-level "canvas" mode is gone. The TopDock
+  // toggle still flips activeMode (kept for backwards-compat with the
+  // existing TopDock UI), but at the root path we redirect into the
+  // workspaces list and reset the mode so the user lands somewhere modo
+  // nodos can actually persist (workspace-scoped, via the Hojas/Nodos
+  // tabs inside WorkspaceCanvasPage). Workspace pages own their own
+  // pageMode and ignore activeMode entirely, so this never fires there.
+  useEffect(() => {
+    if (activeMode !== 'canvas') return;
+    if (currentPath.startsWith('/workspaces')) return;
+    if (currentPath.startsWith('/admin')) return;
+    setActiveMode('chat');
+    navigate('/workspaces');
+  }, [activeMode, currentPath, setActiveMode]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -218,7 +237,13 @@ export default function App() {
     );
   }
 
-  const isCanvas = activeMode === 'canvas';
+  // F1 (2026-05-10): the root-level layout is now chat-only. If the
+  // user clicks "Nodes" in TopDock the redirect-effect above hands them
+  // off to /workspaces; we render a brief loading-style fallback while
+  // the navigation flushes so we don't flash the chat layout.
+  if (activeMode === 'canvas') {
+    return <WorkspaceRouteFallback />;
+  }
 
   return (
     <ErrorBoundary>
@@ -230,7 +255,6 @@ export default function App() {
             <div
               className={cn(
                 "absolute inset-0 z-0 pointer-events-none opacity-10 dark:opacity-[0.08] transition-opacity duration-500",
-                isCanvas && "opacity-5 dark:opacity-[0.04]"
               )}
               style={{
                 backgroundImage: `url("data:image/svg+xml,%3Csvg width='40' height='40' viewBox='0 0 40 40' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M0 0h40v40H0V0zm20 20h20v20H20V20zM0 20h20v20H0V20z' fill='currentColor' fill-opacity='0.1' fill-rule='evenodd'/%3E%3C/svg%3E")`,
@@ -252,85 +276,44 @@ export default function App() {
             />
 
             {/* ═══════════════════════════════════════════
-                 MAIN WORKSPACE — flex row with retractable panels
+                 MAIN WORKSPACE — chat-only at the root path. Modo nodos
+                 lives inside WorkspaceCanvasPage via the Hojas/Nodos tabs.
                  ═══════════════════════════════════════════ */}
             <main className="relative z-20 flex-1 min-h-0 flex gap-0 md:gap-6 p-4 sm:p-5 md:p-6 md:pb-6">
+              {/* Retractable history panel (left) */}
+              <div
+                className={cn(
+                  "hidden lg:flex flex-col min-h-0 transition-all duration-500 ease-out overflow-hidden shrink-0",
+                  isHistoryOpen ? "w-[280px] opacity-100" : "w-0 opacity-0"
+                )}
+              >
+                <Sidebar variant="panel" mode="chat" side="left" />
+              </div>
 
-              {/* ── CHAT MODE ── */}
-              {!isCanvas && (
-                <>
-                  {/* Retractable history panel (left) */}
-                  <div
-                    className={cn(
-                      "hidden lg:flex flex-col min-h-0 transition-all duration-500 ease-out overflow-hidden shrink-0",
-                      isHistoryOpen ? "w-[280px] opacity-100" : "w-0 opacity-0"
-                    )}
-                  >
-                    <Sidebar variant="panel" mode="chat" side="left" />
-                  </div>
-
-                  {/* Chat workspace */}
-                  <section className="flex-1 min-h-0 min-w-0 bg-white/70 dark:bg-white/5 backdrop-blur-2xl border border-white/50 dark:border-white/10 rounded-2xl shadow-[0_8px_35px_rgba(0,0,0,0.08)] dark:shadow-[0_8px_35px_rgba(0,0,0,0.3)] overflow-hidden relative">
-                    {/* Workspaces nav — minimal entry; floats top-right
-                        of the chat surface so it stays out of the way of
-                        the AnimatedAiInput chrome. */}
-                    <button
-                      onClick={() => navigate('/workspaces')}
-                      title="Abrir mis workspaces"
-                      className="absolute top-3 right-3 z-30 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-white/85 dark:bg-white/10 backdrop-blur-xl border border-white/60 dark:border-white/15 text-[11.5px] font-semibold text-[#0e1745]/75 dark:text-white/75 hover:text-[#0e1745] dark:hover:text-white shadow-sm transition-colors"
-                    >
-                      <LayoutGrid className="w-3.5 h-3.5" />
-                      Workspaces
-                    </button>
-                    <AnimatedAiInput onOpenHistory={openMobileDrawer} />
-                  </section>
-                </>
-              )}
-
-              {/* ── CANVAS / NODES MODE ── */}
-              {isCanvas && (
-                <>
-                  {/* Left: compact chat panel */}
-                  <div className="hidden lg:flex flex-col min-h-0 w-[340px] shrink-0">
-                    <section className="h-full bg-white/70 dark:bg-white/5 backdrop-blur-2xl border border-white/50 dark:border-white/10 rounded-2xl shadow-[0_8px_35px_rgba(0,0,0,0.08)] dark:shadow-[0_8px_35px_rgba(0,0,0,0.3)] overflow-hidden">
-                      <AnimatedAiInput compact />
-                    </section>
-                  </div>
-
-                  {/* Center: canvas */}
-                  <div className="flex-1 min-h-0 min-w-0 flex flex-col gap-3">
-                    <div className="min-h-0 flex-1 bg-white/55 dark:bg-black/20 border border-white/60 dark:border-white/10 rounded-2xl overflow-hidden shadow-[0_8px_35px_rgba(0,0,0,0.08)] dark:shadow-[0_8px_35px_rgba(0,0,0,0.3)]">
-                      <Suspense fallback={<WorkspaceRouteFallback />}>
-                        <ShiftyNodeCanvas />
-                      </Suspense>
-                    </div>
-
-                    {/* Mobile: compact chat below canvas */}
-                    <div className="lg:hidden h-[42svh] bg-white/70 dark:bg-white/5 backdrop-blur-2xl border border-white/50 dark:border-white/10 rounded-2xl shadow-[0_8px_35px_rgba(0,0,0,0.08)] dark:shadow-[0_8px_35px_rgba(0,0,0,0.3)] overflow-hidden">
-                      <AnimatedAiInput compact onOpenHistory={openMobileDrawer} />
-                    </div>
-                  </div>
-
-                  {/* Right: retractable history panel */}
-                  <div
-                    className={cn(
-                      "hidden lg:flex flex-col min-h-0 transition-all duration-500 ease-out overflow-hidden shrink-0",
-                      isHistoryOpen ? "w-[280px] opacity-100" : "w-0 opacity-0"
-                    )}
-                  >
-                    <Sidebar variant="panel" mode="canvas" side="right" />
-                  </div>
-                </>
-              )}
+              {/* Chat workspace */}
+              <section className="flex-1 min-h-0 min-w-0 bg-white/70 dark:bg-white/5 backdrop-blur-2xl border border-white/50 dark:border-white/10 rounded-2xl shadow-[0_8px_35px_rgba(0,0,0,0.08)] dark:shadow-[0_8px_35px_rgba(0,0,0,0.3)] overflow-hidden relative">
+                {/* Workspaces nav — minimal entry; floats top-right
+                    of the chat surface so it stays out of the way of
+                    the AnimatedAiInput chrome. */}
+                <button
+                  onClick={() => navigate('/workspaces')}
+                  title="Abrir mis workspaces"
+                  className="absolute top-3 right-3 z-30 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-white/85 dark:bg-white/10 backdrop-blur-xl border border-white/60 dark:border-white/15 text-[11.5px] font-semibold text-[#0e1745]/75 dark:text-white/75 hover:text-[#0e1745] dark:hover:text-white shadow-sm transition-colors"
+                >
+                  <LayoutGrid className="w-3.5 h-3.5" />
+                  Workspaces
+                </button>
+                <AnimatedAiInput onOpenHistory={openMobileDrawer} />
+              </section>
             </main>
 
             {/* Mobile history drawer */}
             <Sidebar
               open={isMobileDrawerOpen}
               onClose={closeMobileDrawer}
-              mode={isCanvas ? "canvas" : "chat"}
+              mode="chat"
               variant="drawer"
-              side={isCanvas ? "right" : "left"}
+              side="left"
               className="lg:hidden"
             />
           </div>

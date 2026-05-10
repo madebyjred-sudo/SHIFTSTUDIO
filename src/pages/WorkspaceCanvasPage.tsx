@@ -24,7 +24,7 @@
  * document-level capture-phase context-menu hack (no Studio context-menu
  * lib yet). T7-T10 will reintroduce Studio versions.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ReactFlow, Background, BackgroundVariant, Controls, MiniMap, Panel,
   ReactFlowProvider, useNodesState, useReactFlow,
@@ -34,6 +34,7 @@ import '@xyflow/react/dist/style.css';
 import {
   ArrowLeft, Plus, Layers, Sparkles, Upload, ZoomIn, Presentation,
   FileDown, FileText, Download, Loader2, MessageSquareText, X,
+  Network,
 } from 'lucide-react';
 import { TopDock } from '@/components/top-dock';
 import { ChatPanel } from '@/components/workspace/ChatPanel';
@@ -56,6 +57,45 @@ import {
   emitWorkspaceEvent, listenWorkspaceEvents,
 } from '@/lib/workspace-broadcast';
 import { useGraphStoreV2 } from '@/store/useGraphStoreV2';
+
+// F1 — modo nodos lives inside the workspace as an alternate "page mode".
+// Lazy-loaded so the default hojas-only entry doesn't pay for the
+// ReactFlow autosave plumbing + node components until the user opts in.
+const ShiftyNodeCanvas = lazy(() =>
+  import('@/components/ShiftyNodeCanvas').then((m) => ({ default: m.ShiftyNodeCanvas })),
+);
+
+// ─── Page mode (hojas vs nodos) ───────────────────────────────────────
+//
+// F1 (2026-05-10): the workspace canvas now hosts TWO modes:
+//   • 'hojas' — default, the TipTap-based document canvas (CanvasInner).
+//   • 'nodos' — the agent-graph builder (ShiftyNodeCanvas).
+//
+// We persist the last chosen mode per-workspace in localStorage so that
+// returning to the same workspace lands on the same view. Reading is
+// guarded against SSR + corrupted entries.
+type PageMode = 'hojas' | 'nodos';
+
+const PAGE_MODE_STORAGE_PREFIX = 'studio-workspace-mode-';
+
+function readStoredPageMode(workspaceId: string): PageMode {
+  if (typeof window === 'undefined') return 'hojas';
+  try {
+    const v = window.localStorage.getItem(`${PAGE_MODE_STORAGE_PREFIX}${workspaceId}`);
+    return v === 'nodos' ? 'nodos' : 'hojas';
+  } catch {
+    return 'hojas';
+  }
+}
+
+function writeStoredPageMode(workspaceId: string, mode: PageMode): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(`${PAGE_MODE_STORAGE_PREFIX}${workspaceId}`, mode);
+  } catch {
+    /* quota exceeded / disabled — non-fatal */
+  }
+}
 
 // ─── Node type registration ───────────────────────────────────────────
 const NODE_TYPES = {
@@ -112,10 +152,13 @@ function CanvasInner({
   workspaceId,
   title,
   onTitleChange,
+  pageModeNode,
 }: {
   workspaceId: string;
   title: string;
   onTitleChange: (t: string) => void;
+  /** F1 — Hojas/Nodos tab pair, rendered top-center of the canvas. */
+  pageModeNode?: React.ReactNode;
 }) {
   const { fitView, screenToFlowPosition } = useReactFlow();
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
@@ -844,6 +887,15 @@ function CanvasInner({
             </div>
           </Panel>
 
+          {/* F1 — Top-center: Hojas/Nodos page-mode tabs. Rendered only
+              when the parent passes them in (always today; the prop
+              keeps the component testable in isolation). */}
+          {pageModeNode && (
+            <Panel position="top-center" className="m-3">
+              {pageModeNode}
+            </Panel>
+          )}
+
           {/* Top-right: action toolbar */}
           <Panel position="top-right" className="m-3">
             <div className="flex items-center gap-2">
@@ -1047,9 +1099,198 @@ function CanvasInner({
   );
 }
 
+// ─── F1 — Page-mode tabs (Hojas | Nodos) ─────────────────────────────
+//
+// Sits in the canvas pane (top-center) so the user can flip between the
+// document-style hojas canvas and the agent-graph builder without
+// leaving the workspace. Implemented as a role="tablist" with arrow-key
+// navigation so it's accessible to keyboard + screen-reader users.
+//
+// Visual: glassmorphic pill with two segmented buttons, matches the
+// floating chrome of the existing canvas Panels.
+function PageModeTabs({
+  mode,
+  onChange,
+}: {
+  mode: PageMode;
+  onChange: (next: PageMode) => void;
+}) {
+  const hojasRef = useRef<HTMLButtonElement | null>(null);
+  const nodosRef = useRef<HTMLButtonElement | null>(null);
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+      e.preventDefault();
+      const next: PageMode = mode === 'hojas' ? 'nodos' : 'hojas';
+      onChange(next);
+      // Move focus to the newly-active tab so screen readers announce it.
+      requestAnimationFrame(() => {
+        if (next === 'hojas') hojasRef.current?.focus();
+        else nodosRef.current?.focus();
+      });
+    }
+  };
+
+  return (
+    <div
+      role="tablist"
+      aria-label="Modo de la página del workspace"
+      onKeyDown={handleKeyDown}
+      className="inline-flex items-center gap-0.5 rounded-xl p-1 bg-white/80 dark:bg-[#0c1230]/85 backdrop-blur-xl border border-white/60 dark:border-white/10 shadow-sm"
+    >
+      <button
+        ref={hojasRef}
+        type="button"
+        role="tab"
+        aria-selected={mode === 'hojas'}
+        aria-pressed={mode === 'hojas'}
+        tabIndex={mode === 'hojas' ? 0 : -1}
+        onClick={() => onChange('hojas')}
+        title="Vista de hojas (⌘.)"
+        className={cn(
+          'h-8 px-3 rounded-lg text-[12px] font-semibold flex items-center gap-1.5 transition-all duration-200',
+          'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1534dc]/45 dark:focus-visible:ring-[#8b5cf6]/45',
+          mode === 'hojas'
+            ? 'bg-[#1534dc] dark:bg-[#8b5cf6] text-white shadow-sm shadow-[#1534dc]/25 dark:shadow-[#8b5cf6]/25'
+            : 'text-[#0e1745]/60 dark:text-white/60 hover:text-[#0e1745] dark:hover:text-white',
+        )}
+      >
+        <FileText className="w-3.5 h-3.5" aria-hidden />
+        <span>Hojas</span>
+      </button>
+      <button
+        ref={nodosRef}
+        type="button"
+        role="tab"
+        aria-selected={mode === 'nodos'}
+        aria-pressed={mode === 'nodos'}
+        tabIndex={mode === 'nodos' ? 0 : -1}
+        onClick={() => onChange('nodos')}
+        title="Vista de nodos (⌘.)"
+        className={cn(
+          'h-8 px-3 rounded-lg text-[12px] font-semibold flex items-center gap-1.5 transition-all duration-200',
+          'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1534dc]/45 dark:focus-visible:ring-[#8b5cf6]/45',
+          mode === 'nodos'
+            ? 'bg-[#1534dc] dark:bg-[#8b5cf6] text-white shadow-sm shadow-[#1534dc]/25 dark:shadow-[#8b5cf6]/25'
+            : 'text-[#0e1745]/60 dark:text-white/60 hover:text-[#0e1745] dark:hover:text-white',
+        )}
+      >
+        <Network className="w-3.5 h-3.5" aria-hidden />
+        <span>Nodos</span>
+      </button>
+    </div>
+  );
+}
+
+// ─── F1 — Nodos layout ────────────────────────────────────────────────
+//
+// Mirrors the hojas layout chrome (chat sidebar on the left, canvas on
+// the right) but renders the agent-graph builder instead of the TipTap
+// canvas. The chat panel still works in this mode — workspace-scoped
+// chat is useful regardless of view — though hojaTitles is empty since
+// the architect/edit_by_match flows don't apply to the nodes graph.
+//
+// ShiftyNodeCanvas owns its own ReactFlowProvider, so we don't wrap it
+// here. It also owns workspaceId hydration via the V2 store (set by the
+// page wrapper's useEffect). This wrapper just gives it the right
+// flex-fill container so its `w-full h-full flex flex-col` outermost
+// div sizes correctly inside the workspace's split layout.
+function NodosLayout({
+  workspaceId,
+  title,
+  pageModeNode,
+}: {
+  workspaceId: string;
+  title: string;
+  pageModeNode: React.ReactNode;
+}) {
+  return (
+    <div className="flex h-full">
+      {/* Workspace chat sidebar — same chrome as hojas mode. */}
+      <div className="hidden lg:flex flex-col min-h-0 w-[360px] shrink-0 border-r border-white/50 dark:border-white/10">
+        <section className="h-full min-h-0 bg-white/70 dark:bg-white/5 backdrop-blur-2xl overflow-hidden shadow-[0_8px_35px_rgba(0,0,0,0.06)]">
+          <ChatPanel
+            workspaceId={workspaceId}
+            workspaceTitle={title}
+            selectedNodeId={null}
+            hojaTitles={[]}
+            // No-op: build/edit intents only apply in hojas mode. The
+            // chat itself still streams; we just don't materialize hojas
+            // into the node-graph canvas.
+            onWorkspaceAction={() => undefined}
+          />
+        </section>
+      </div>
+
+      {/* Right pane — graph builder + the page-mode tabs floated on top. */}
+      <div className="flex-1 relative h-full min-w-0">
+        {/* Floating tabs (top-center) so they stay in the same spot
+            across both modes. The button below it is a small back link
+            mirroring the hojas mode's top-left back chip. */}
+        <div className="absolute top-3 left-1/2 -translate-x-1/2 z-20">
+          {pageModeNode}
+        </div>
+        <div className="absolute top-3 left-3 z-20">
+          <button
+            onClick={() => navigate('/workspaces')}
+            aria-label="Volver a la lista de workspaces"
+            className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-white/80 dark:bg-[#0c1230]/85 backdrop-blur-xl border border-white/60 dark:border-white/10 shadow-sm text-[13px] font-medium text-[#0e1745]/70 dark:text-white/70 hover:text-[#0e1745] dark:hover:text-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1534dc]/45 dark:focus-visible:ring-[#8b5cf6]/45"
+            title="Volver a workspaces"
+          >
+            <ArrowLeft className="w-4 h-4" aria-hidden />
+          </button>
+        </div>
+
+        <Suspense
+          fallback={
+            <div
+              className="absolute inset-0 flex items-center justify-center bg-[#f8f9fc]/85 dark:bg-[#080d1a]/85 backdrop-blur-sm"
+              role="status"
+              aria-busy="true"
+              aria-label="Cargando modo nodos"
+            >
+              <div className="flex flex-col items-center gap-3">
+                <div
+                  className="h-10 w-10 rounded-full border-2 border-[#1534dc]/20 border-t-[#1534dc] dark:border-[#8b5cf6]/20 dark:border-t-[#8b5cf6] animate-spin"
+                  aria-hidden
+                />
+                <p className="text-[12px] font-medium text-[#0e1745]/60 dark:text-white/55">
+                  Cargando modo nodos…
+                </p>
+              </div>
+            </div>
+          }
+        >
+          <ShiftyNodeCanvas />
+        </Suspense>
+      </div>
+    </div>
+  );
+}
+
 // ─── Page wrapper (provides ReactFlow context + workspace meta) ───────
 export function WorkspaceCanvasPage({ workspaceId }: { workspaceId: string }) {
   const [title, setTitle] = useState('Cargando…');
+
+  // F1 — page mode (hojas vs nodos). Hydrated from localStorage so the
+  // user lands on the same view they last used in this workspace.
+  const [pageMode, setPageModeState] = useState<PageMode>(() =>
+    readStoredPageMode(workspaceId),
+  );
+
+  // Re-hydrate on workspaceId change (the harness mounts a new page
+  // instance per id, but be defensive in case the wrapper is reused).
+  useEffect(() => {
+    setPageModeState(readStoredPageMode(workspaceId));
+  }, [workspaceId]);
+
+  const setPageMode = useCallback(
+    (next: PageMode) => {
+      setPageModeState(next);
+      writeStoredPageMode(workspaceId, next);
+    },
+    [workspaceId],
+  );
 
   // Wave C — inject the active workspace id into the V2 graph store so
   // the modo-nodos export pipeline (`runExportNode`) can hit
@@ -1093,19 +1334,57 @@ export function WorkspaceCanvasPage({ workspaceId }: { workspaceId: string }) {
     }
   }, [workspaceId]);
 
+  // F1 — keyboard shortcut: ⌘. (mac) / Ctrl+. (win) toggles modes.
+  // Scoped to the page, but ignored when typing in editable surfaces so
+  // it doesn't fight TipTap or the chat input.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const key = e.key === '.' || e.code === 'Period';
+      const mod = e.metaKey || e.ctrlKey;
+      if (!key || !mod) return;
+      const target = e.target as HTMLElement | null;
+      if (target) {
+        const tag = target.tagName;
+        const isEditable =
+          tag === 'INPUT' ||
+          tag === 'TEXTAREA' ||
+          target.isContentEditable;
+        if (isEditable) return;
+      }
+      e.preventDefault();
+      setPageMode(pageMode === 'hojas' ? 'nodos' : 'hojas');
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [pageMode, setPageMode]);
+
+  // The tabs UI is rendered inside both layouts so it stays in the same
+  // visual location regardless of mode. We declare it once here so both
+  // layouts share the exact same instance + props.
+  const tabsNode = <PageModeTabs mode={pageMode} onChange={setPageMode} />;
+
   return (
     <div className={cn(
       'h-screen flex flex-col bg-[#f8f9fc] dark:bg-mesh text-[#0e1745] dark:text-white overflow-hidden',
     )}>
       <TopDock />
       <div className="flex-1 min-h-0">
-        <ReactFlowProvider>
-          <CanvasInner
+        {pageMode === 'hojas' ? (
+          <ReactFlowProvider>
+            <CanvasInner
+              workspaceId={workspaceId}
+              title={title}
+              onTitleChange={handleTitleChange}
+              pageModeNode={tabsNode}
+            />
+          </ReactFlowProvider>
+        ) : (
+          <NodosLayout
             workspaceId={workspaceId}
             title={title}
-            onTitleChange={handleTitleChange}
+            pageModeNode={tabsNode}
           />
-        </ReactFlowProvider>
+        )}
       </div>
     </div>
   );
