@@ -143,4 +143,27 @@ test.describe('Production smoke', () => {
     });
     expect([200, 422, 502]).toContain(res.status());
   });
+
+  // Legacy /api/export (proxy a Cerebro /export/document) fue eliminado en
+  // chore/d2-remove-legacy-export. Modo nodos V2 usa /api/workspace/:id/export.
+  //
+  // Este test previene regresión accidental: si alguien re-introduce el
+  // endpoint (función Vercel o handler en server.ts), el smoke detona.
+  //
+  // Contrato: la respuesta NUNCA debe ser:
+  //   • 200 — proxy resucitado y devolviendo data
+  //   • 401 — handler nuevo montado con auth gate (resurrección con maquillaje)
+  // El estado terminal es 404 (route gone). Durante la ventana de transición
+  // antes de que main redespliegue, prod puede aún devolver 422 (Cerebro
+  // validation error vía proxy legacy) — eso se acepta hasta el deploy.
+  test('legacy /api/export not resurrected', async ({ request }) => {
+    const res = await request.post(`${PROD}/api/export`, {
+      data: { format: 'md', sections: [] },
+      headers: { 'Content-Type': 'application/json' },
+    });
+    const status = res.status();
+    expect(status).not.toBe(200);
+    expect(status).not.toBe(401);
+    expect([404, 422]).toContain(status);
+  });
 });
