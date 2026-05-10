@@ -1,7 +1,6 @@
 import React, { useState } from 'react';
 import { X, Copy, Check, FileCode2, History, Loader2 } from 'lucide-react';
-import { Snapshot, AppNode } from '../store/useGraphStore';
-import { useActiveGraphStore } from '../store';
+import { Snapshot, AppNode, useActiveGraphStore } from '../store';
 
 type ShareType = 'template' | 'snapshot';
 
