@@ -16,11 +16,30 @@
  * CEREBRO ENDPOINT
  * ----------------
  *   POST {SWARM_API_URL}/v1/llm/invoke
- *   body  { model, prompt, system?, tenant?, max_tokens?, temperature?, trace_label? }
+ *
+ *   Two body shapes are accepted by Cerebro:
+ *
+ *   (a) Legacy single-turn:
+ *     body  { model, prompt, system?, tenant?, app_id?, max_tokens?,
+ *             temperature?, trace_label? }
+ *
+ *   (b) Cache-aware multi-block (Cerebro Change 1, live 2026-05-09):
+ *     body  { model, system_blocks: [{text, cacheable}], messages: [...],
+ *             tenant?, app_id?, max_tokens?, temperature?, trace_label? }
+ *
+ *   When `system_blocks` is provided, Cerebro forwards each block to
+ *   OpenRouter with `cache_control: {type: "ephemeral"}` on the cacheable
+ *   ones, surfaces `cache_creation_input_tokens` / `cache_read_input_tokens`
+ *   on the response, and the chat history is sent through `messages`
+ *   (NOT flattened into a `prompt`). Verified live: 90.9% input cost
+ *   reduction on cache hit (~$0.00848 → ~$0.00077 per call at ~2200
+ *   cacheable tokens).
+ *
  *   resp  { output, text, usage, latency_ms, call_id, model, agent_id }
  *
- * Cerebro's invoke is single-turn — multi-turn chat history is flattened
- * into the `prompt` as `[role]: content` lines (see flattenMessages below).
+ * In legacy mode (no `systemBlocks` arg) Cerebro's invoke is single-turn —
+ * multi-turn chat history is flattened into the `prompt` as `[role]:
+ * content` lines (see flattenMessages below).
  *
  * `response_format` from the legacy CallArgs is dropped here. Architect /
  * classifier callers that need strict JSON output should append a "return
@@ -49,9 +68,36 @@ export interface OpenRouterMessage {
   content: string;
 }
 
+/**
+ * One stable / dynamic chunk of system context. Cerebro adds an
+ * OpenRouter `cache_control: {type: "ephemeral"}` to each entry where
+ * `cacheable === true`. Anthropic requires the cumulative cacheable
+ * text per block boundary to clear ~1024 tokens before any cache hit
+ * fires — keep mid-conversation drift out of cacheable blocks.
+ */
+export interface SystemBlock {
+  text: string;
+  cacheable?: boolean;
+}
+
 export interface CallArgs {
   model: string;
   messages: OpenRouterMessage[];
+  /**
+   * Cache-aware system context. When provided, the request switches to
+   * Cerebro's multi-block shape:
+   *   - `system_blocks` is sent verbatim (with `cacheable` defaulted to
+   *     `false` per block).
+   *   - `messages` is forwarded as-is, minus any `role:'system'` entries
+   *     (Cerebro discards them in this mode — system context belongs in
+   *     `system_blocks`).
+   *   - The legacy `prompt` / `system` body fields are NOT sent.
+   *
+   * When omitted (default), the legacy `flattenMessages → prompt+system`
+   * path is used so existing callers (transform / edit / architect /
+   * classifier) keep working unchanged.
+   */
+  systemBlocks?: SystemBlock[];
   temperature?: number;
   max_tokens?: number;
   /** Legacy: ignored by Cerebro's invoke. Use a strict-JSON system prompt
@@ -282,17 +328,41 @@ export async function callOpenRouter(args: CallArgs): Promise<string> {
   const timeoutMs = args.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const signal = combineSignals(args.signal, timeoutMs);
 
-  const { system, prompt } = flattenMessages(args.messages);
-
   const body: Record<string, unknown> = {
     model: args.model,
-    prompt,
   };
-  if (system) body.system = system;
+
+  if (args.systemBlocks && args.systemBlocks.length > 0) {
+    // Cache-aware shape (Cerebro Change 1). Normalize each block so the
+    // upstream contract is explicit — Cerebro defaults `cacheable` to
+    // false but we'd rather not leak `undefined` over the wire.
+    body.system_blocks = args.systemBlocks.map((b) => ({
+      text: b.text,
+      cacheable: b.cacheable === true,
+    }));
+    // Cerebro discards role:'system' entries in this mode (system
+    // context must live in `system_blocks`). Filter defensively here so
+    // a stray system message in the array can't sneak through.
+    body.messages = args.messages
+      .filter((m) => m.role !== 'system')
+      .map((m) => ({ role: m.role, content: m.content }));
+  } else {
+    // Legacy single-turn shape. Keep `prompt` + optional `system` —
+    // unchanged for transform / edit / architect / classifier callers
+    // whose system prompts are well below the 1024-token cache minimum.
+    const { system, prompt } = flattenMessages(args.messages);
+    body.prompt = prompt;
+    if (system) body.system = system;
+  }
+
   if (typeof args.temperature === 'number') body.temperature = args.temperature;
   if (typeof args.max_tokens === 'number') body.max_tokens = args.max_tokens;
   const tenantId = args.tenant ?? 'shift';
   body.tenant = tenantId;
+  // Studio is the only caller of this client. Sending app_id makes the
+  // Cerebro `cerebro_llm_calls` row attribute correctly without relying
+  // on a server-side default.
+  body.app_id = 'studio';
   if (args.trace_label) body.trace_label = args.trace_label;
 
   const t0 = Date.now();
