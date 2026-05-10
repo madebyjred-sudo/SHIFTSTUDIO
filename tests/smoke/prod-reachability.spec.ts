@@ -133,6 +133,29 @@ test.describe('Production smoke', () => {
     expect(res.status()).toBe(401);
   });
 
+  // ─── F1 — Hojas/Nodos toggle inside the workspace ────────────────
+  // The toggle is purely client-side (no new endpoints) — what we can
+  // smoke is that the workspace SPA URL serves and that BOTH server-
+  // side dependencies of each mode are still alive:
+  //   • Hojas needs /nodes (covered above)
+  //   • Nodos needs /graph (already covered above)
+  // This case verifies that the SPA HTML for /workspaces/:id is served
+  // by Vercel's catch-all rewrite, so the React router can mount the
+  // page (in either mode) without a 404 from the static layer.
+  test('SPA serves /workspaces (list)', async ({ request }) => {
+    const res = await request.get(`${PROD}/workspaces`);
+    expect(res.status()).toBe(200);
+    const body = await res.text();
+    expect(body).toContain('<!doctype html');
+  });
+
+  test('SPA serves /workspaces/:id (canvas)', async ({ request }) => {
+    const res = await request.get(`${PROD}/workspaces/${FAKE_UUID}`);
+    expect(res.status()).toBe(200);
+    const body = await res.text();
+    expect(body).toContain('<!doctype html');
+  });
+
   test('legacy /api/chat alive (Cerebro proxy)', async ({ request }) => {
     // Empty body → Cerebro returns validation error (200 bypass not expected).
     // Either 200 (Cerebro responded) or 422 (validation) — NOT 404 (route gone)
