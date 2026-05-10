@@ -2234,11 +2234,136 @@ workspaceRouter.post('/:id/export', async (req: Request, res: Response) => {
     return;
   }
 
+  // Format gate. The original surface was md|docx|pptx; modo nodos (Wave A2)
+  // adds three more: xlsx (in-process spreadsheet), pdf (Gamma deck exported
+  // as PDF), and carousel (Gamma 'social' format). The union below stays in
+  // sync with `src/types/export.ts` ExportFormat — keep them aligned when
+  // adding/removing formats.
   const format = (req.body?.format ?? 'md') as string;
-  if (!['md', 'docx', 'pptx'].includes(format)) {
-    res.status(400).json({ ok: false, error: 'invalid_format', hint: 'md|docx|pptx' });
+  const ALLOWED_FORMATS = ['md', 'docx', 'pptx', 'pdf', 'xlsx', 'carousel'];
+  if (!ALLOWED_FORMATS.includes(format)) {
+    res
+      .status(400)
+      .json({ ok: false, error: 'invalid_format', hint: ALLOWED_FORMATS.join('|') });
     return;
   }
+
+  // ─── Optional sections override (modo nodos) ────────────────────────
+  // When the ReactFlow grafo runner consolidates specialist outputs it
+  // ships them as a `sections[]` array — we then skip the hojas fetch
+  // and use the sections directly. Manual validation (the codebase
+  // doesn't use Zod). Kept narrow: only the shape we promise to support
+  // gets through; everything else is rejected with a precise error.
+  const rawSections = req.body?.sections;
+  let sections:
+    | Array<{
+        title: string;
+        content: string;
+        sourceNodeId?: string;
+        data?: { headers: string[]; rows: Array<Array<string | number | boolean | null>> };
+      }>
+    | null = null;
+  if (rawSections !== undefined && rawSections !== null) {
+    if (!Array.isArray(rawSections)) {
+      res.status(400).json({ ok: false, error: 'sections_must_be_array' });
+      return;
+    }
+    if (rawSections.length === 0) {
+      res.status(400).json({ ok: false, error: 'sections_empty' });
+      return;
+    }
+    if (rawSections.length > 200) {
+      res.status(400).json({ ok: false, error: 'sections_too_many', hint: 'max=200' });
+      return;
+    }
+    const validated: Array<{
+      title: string;
+      content: string;
+      sourceNodeId?: string;
+      data?: { headers: string[]; rows: Array<Array<string | number | boolean | null>> };
+    }> = [];
+    for (let i = 0; i < rawSections.length; i++) {
+      const s = rawSections[i];
+      if (!s || typeof s !== 'object') {
+        res.status(400).json({ ok: false, error: 'invalid_section', index: i });
+        return;
+      }
+      const title = (s as Record<string, unknown>).title;
+      const content = (s as Record<string, unknown>).content;
+      const sourceNodeId = (s as Record<string, unknown>).sourceNodeId;
+      const data = (s as Record<string, unknown>).data;
+      if (typeof title !== 'string' || title.length === 0) {
+        res.status(400).json({ ok: false, error: 'invalid_section_title', index: i });
+        return;
+      }
+      if (typeof content !== 'string') {
+        res.status(400).json({ ok: false, error: 'invalid_section_content', index: i });
+        return;
+      }
+      if (sourceNodeId !== undefined && typeof sourceNodeId !== 'string') {
+        res
+          .status(400)
+          .json({ ok: false, error: 'invalid_section_sourceNodeId', index: i });
+        return;
+      }
+      let validatedData:
+        | { headers: string[]; rows: Array<Array<string | number | boolean | null>> }
+        | undefined;
+      if (data !== undefined && data !== null) {
+        if (typeof data !== 'object' || Array.isArray(data)) {
+          res.status(400).json({ ok: false, error: 'invalid_section_data', index: i });
+          return;
+        }
+        const headers = (data as Record<string, unknown>).headers;
+        const rows = (data as Record<string, unknown>).rows;
+        if (!Array.isArray(headers) || !headers.every((h) => typeof h === 'string')) {
+          res
+            .status(400)
+            .json({ ok: false, error: 'invalid_section_table_headers', index: i });
+          return;
+        }
+        if (!Array.isArray(rows) || !rows.every((r) => Array.isArray(r))) {
+          res
+            .status(400)
+            .json({ ok: false, error: 'invalid_section_table_rows', index: i });
+          return;
+        }
+        // Shape check: every row must match headers.length.
+        if (rows.some((r) => (r as unknown[]).length !== headers.length)) {
+          res
+            .status(400)
+            .json({ ok: false, error: 'invalid_section_table_shape', index: i });
+          return;
+        }
+        validatedData = {
+          headers: headers as string[],
+          rows: rows as Array<Array<string | number | boolean | null>>,
+        };
+      }
+      validated.push({
+        title,
+        content,
+        ...(typeof sourceNodeId === 'string' ? { sourceNodeId } : {}),
+        ...(validatedData ? { data: validatedData } : {}),
+      });
+    }
+    sections = validated;
+  }
+
+  // Optional cover overrides — when sections is set, the modo nodos client
+  // can pass a deck title independent of the workspace title (the workspace
+  // is just a logical container). Both fields are best-effort strings; we
+  // sanitize for length but nothing else.
+  const titleOverrideRaw = req.body?.title;
+  const subtitleOverrideRaw = req.body?.subtitle;
+  const titleOverride =
+    typeof titleOverrideRaw === 'string' && titleOverrideRaw.trim()
+      ? String(titleOverrideRaw).slice(0, 240)
+      : undefined;
+  const subtitleOverride =
+    typeof subtitleOverrideRaw === 'string' && subtitleOverrideRaw.trim()
+      ? String(subtitleOverrideRaw).slice(0, 480)
+      : undefined;
 
   // Ownership gate runs first — same pattern as every other T3/T4 endpoint
   // in this file. Once `ownedWorkspace` returns true, the workspace fetch
@@ -2246,47 +2371,85 @@ workspaceRouter.post('/:id/export', async (req: Request, res: Response) => {
   if (!(await ownedWorkspace(userId, id, res))) return;
 
   try {
-    // Fetch workspace metadata + all nodes in one round-trip.
-    const [{ data: ws, error: wsErr }, { data: nodes, error: nErr }] = await Promise.all([
+    // Fetch workspace metadata. When `sections` is provided we still
+    // need the row for fallback title/description, but we skip the hojas
+    // round-trip entirely (modo nodos provides its own content).
+    const [{ data: ws, error: wsErr }, nodesQuery] = await Promise.all([
       supabaseAdmin!
         .from('studio_workspaces')
         .select('id, title, description, last_pptx')
         .eq('id', id)
         .maybeSingle(),
-      supabaseAdmin!
-        .from('studio_workspace_nodes')
-        .select('id, title, subtitle, content, x, y, color, type')
-        .eq('workspace_id', id),
+      sections
+        ? Promise.resolve({ data: [] as Array<Record<string, unknown>>, error: null })
+        : supabaseAdmin!
+            .from('studio_workspace_nodes')
+            .select('id, title, subtitle, content, x, y, color, type')
+            .eq('workspace_id', id),
     ]);
     if (wsErr || !ws) {
       res.status(404).json({ ok: false, error: 'workspace_not_found' });
       return;
     }
+    const { data: nodes, error: nErr } = nodesQuery;
     if (nErr) throw new Error(nErr.message);
 
-    // Reading order: top-to-bottom, then left-to-right. Snap y to row
-    // bands of 200px so two hojas at slightly different y don't flip
-    // randomly — visually-aligned hojas stay aligned in the doc.
-    const ordered = (nodes ?? []).slice().sort((a, b) => {
+    // Reading order for hojas: top-to-bottom, then left-to-right.
+    // For sections-driven exports we keep the caller's order verbatim;
+    // the modo nodos runner emits them in DAG topo order which is
+    // already meaningful.
+    const orderedHojas = (nodes ?? []).slice().sort((a, b) => {
       const yA = Math.floor((a.y as number) / 200);
       const yB = Math.floor((b.y as number) / 200);
       if (yA !== yB) return yA - yB;
       return (a.x as number) - (b.x as number);
     });
 
+    // Unified view used by md/docx renderers below — sections become
+    // synthetic hojas so we don't fork the rendering paths. The shape
+    // mirrors what `studio_workspace_nodes` would have returned.
+    const ordered: Array<{
+      id: string;
+      title: string;
+      subtitle: string | null;
+      content: { md: string };
+      color: string;
+    }> = sections
+      ? sections.map((s, i) => ({
+          id: s.sourceNodeId ?? `section-${i}`,
+          title: s.title,
+          subtitle: null,
+          content: { md: s.content },
+          color: 'default',
+        }))
+      : orderedHojas.map((n) => ({
+          id: String(n.id),
+          title: String(n.title),
+          subtitle: (n.subtitle as string | null) ?? null,
+          content: { md: (((n.content as Record<string, unknown>)?.md as string) ?? '') },
+          color: String(n.color ?? 'default'),
+        }));
+
+    // Effective cover title / dek — lets modo nodos pass its own deck
+    // title without renaming the underlying workspace row.
+    const effectiveTitle = titleOverride ?? String(ws.title);
+    const effectiveDescription = subtitleOverride ?? (ws.description as string | null) ?? '';
+
     const safeName =
-      String(ws.title)
+      effectiveTitle
         .replace(/[^\w\s-]/g, '')
         .trim()
         .replace(/\s+/g, '_') || 'workspace';
 
     if (format === 'md') {
       const lines: string[] = [];
-      lines.push(`# ${ws.title}`);
-      if (ws.description) lines.push('', `_${ws.description}_`);
+      lines.push(`# ${effectiveTitle}`);
+      if (effectiveDescription) lines.push('', `_${effectiveDescription}_`);
+      const unit = sections ? 'sección' : 'hoja';
+      const unitPlural = sections ? 'secciones' : 'hojas';
       lines.push(
         '',
-        `_Generado por Shifty Studio · ${ordered.length} hoja${ordered.length === 1 ? '' : 's'}_`,
+        `_Generado por Shifty Studio · ${ordered.length} ${ordered.length === 1 ? unit : unitPlural}_`,
         '',
       );
 
@@ -2304,7 +2467,7 @@ workspaceRouter.post('/:id/export', async (req: Request, res: Response) => {
         lines.push('---', '');
         lines.push(`## ${n.title}`);
         if (n.subtitle) lines.push('', `_${n.subtitle}_`);
-        const md = ((n.content as Record<string, unknown>)?.md as string) ?? '';
+        const md = n.content.md;
         if (md.trim()) lines.push('', md.trim());
         lines.push('');
       }
@@ -2329,7 +2492,7 @@ workspaceRouter.post('/:id/export', async (req: Request, res: Response) => {
     // Frontend polls (2). The startGeneration call still honors the 1h
     // cache: a fresh cached deck short-circuits to {status:'complete'}
     // here so the user gets it without polling.
-    if (format === 'pptx') {
+    if (format === 'pptx' || format === 'pdf' || format === 'carousel') {
       const force = Boolean(req.body?.force);
       const options = (req.body?.options ?? undefined) as
         | undefined
@@ -2340,66 +2503,174 @@ workspaceRouter.post('/:id/export', async (req: Request, res: Response) => {
             marca?: string;
             emojis?: boolean;
           };
-      const { startGeneration } = await import('../services/workspacePptxExport.js');
-      try {
-        const start = await startGeneration({ workspaceId: id, userId, force, options });
-        if (start.status === 'complete') {
-          // Cache hit — same shape the legacy "wait for it" flow returned.
-          const result = start.result;
-          reqLog(req).info('workspace.export.pptx.cache_hit', {
+
+      // Status-map shared by every Gamma error path below (pptx, pdf, carousel).
+      const statusMap: Record<string, number> = {
+        auth: 503,
+        insufficient_credits: 402,
+        forbidden: 403,
+        bad_request: 400,
+        rate_limited: 429,
+        timeout: 504,
+        failed: 502,
+        no_export_url: 502,
+        upstream: 502,
+        network: 502,
+      };
+
+      // ── PPTX (no sections) → cached path ───────────────────────────
+      // Workspace-canvas pptx exports keep the proven 1h cache flow.
+      // Adding sections-driven cache wouldn't help (modo nodos calls
+      // are intentionally fresh per run) and would risk leaking content
+      // between runs that share a workspaceId.
+      if (format === 'pptx' && !sections) {
+        const { startGeneration } = await import('../services/workspacePptxExport.js');
+        try {
+          const start = await startGeneration({ workspaceId: id, userId, force, options });
+          if (start.status === 'complete') {
+            const result = start.result;
+            reqLog(req).info('workspace.export.pptx.cache_hit', {
+              workspaceId: id,
+              generationId: result.generationId,
+            });
+            res.json({
+              ok: true,
+              format: 'pptx',
+              status: 'complete',
+              cached: true,
+              generatedAt: result.generatedAt,
+              filename: result.filename,
+              url: result.exportUrl,
+              exportUrl: result.exportUrl,
+              gammaUrl: result.gammaUrl,
+              generationId: result.generationId,
+            });
+            return;
+          }
+          reqLog(req).info('workspace.export.pptx.kicked_off', {
             workspaceId: id,
-            generationId: result.generationId,
+            hojas: ordered.length,
+            generationId: start.generationId,
           });
           res.json({
             ok: true,
             format: 'pptx',
+            status: 'pending',
+            generationId: start.generationId,
+            filename: start.filename,
+            pollingUrl: `/api/workspace/${id}/export/pptx-status?generation_id=${encodeURIComponent(start.generationId)}`,
+          });
+          return;
+        } catch (err) {
+          if (err instanceof GammaApiError) {
+            reqLog(req).warn('workspace.export.pptx.failed', {
+              workspaceId: id,
+              code: err.code,
+              message: err.message,
+            });
+            res.status(statusMap[err.code] ?? 500).json({
+              ok: false,
+              error: err.code,
+              detail: err.message,
+            });
+            return;
+          }
+          throw err;
+        }
+      }
+
+      // ── pptx-with-sections / pdf / carousel → generic Gamma path ──
+      // Modo nodos paths build the deck from the sections array (or, for
+      // pptx-with-no-sections, this branch is unreachable — handled
+      // above). Carousel maps to Gamma's 'social' format which is the
+      // closest analogue — the caller still requests `exportAs: 'pdf'`
+      // so the downloaded artifact is a printable carousel sheet
+      // (Gamma's social format does not support pptx export).
+      const gammaFormat: 'presentation' | 'social' =
+        format === 'carousel' ? 'social' : 'presentation';
+      const gammaExportAs: 'pptx' | 'pdf' =
+        format === 'pptx' ? 'pptx' : 'pdf';
+
+      // sections-driven exports carry their own content; without sections
+      // we synthesize from `ordered` so a workspace-canvas pdf still
+      // works (the user clicks "Export PDF" without running the grafo).
+      const sectionsForGamma =
+        sections ??
+        ordered.map((n) => ({
+          title: n.title,
+          content: n.content.md,
+        }));
+
+      if (sectionsForGamma.length === 0) {
+        res
+          .status(400)
+          .json({ ok: false, error: 'no_content', hint: 'workspace has no hojas and no sections were provided' });
+        return;
+      }
+
+      const { startGammaExport } = await import('../services/workspacePptxExport.js');
+      try {
+        const start = await startGammaExport({
+          workspaceId: id,
+          userId,
+          format: gammaFormat,
+          exportAs: gammaExportAs,
+          sections: sectionsForGamma,
+          title: titleOverride ?? effectiveTitle,
+          subtitle: subtitleOverride ?? (effectiveDescription || undefined),
+          options,
+        });
+        // startGammaExport never reports 'complete' today (sections-driven
+        // exports skip caching), but we narrow defensively so future cache
+        // additions surface as a typed branch instead of a runtime crash.
+        if (start.status === 'complete') {
+          reqLog(req).info('workspace.export.gamma.cache_hit', {
+            workspaceId: id,
+            format,
+            generationId: start.result.generationId,
+          });
+          res.json({
+            ok: true,
+            format,
             status: 'complete',
             cached: true,
-            generatedAt: result.generatedAt,
-            filename: result.filename,
-            url: result.exportUrl,
-            exportUrl: result.exportUrl,
-            gammaUrl: result.gammaUrl,
-            generationId: result.generationId,
+            generatedAt: start.result.generatedAt,
+            filename: start.result.filename,
+            url: start.result.exportUrl,
+            exportUrl: start.result.exportUrl,
+            gammaUrl: start.result.gammaUrl,
+            generationId: start.result.generationId,
           });
           return;
         }
-        // Pending — return the generationId so the client can poll.
-        reqLog(req).info('workspace.export.pptx.kicked_off', {
+        reqLog(req).info('workspace.export.gamma.kicked_off', {
           workspaceId: id,
-          hojas: ordered.length,
+          format,
+          gammaFormat,
+          gammaExportAs,
+          sections: sectionsForGamma.length,
           generationId: start.generationId,
         });
         res.json({
           ok: true,
-          format: 'pptx',
+          format,
           status: 'pending',
           generationId: start.generationId,
           filename: start.filename,
-          // Convenience: the client knows this from the workspaceId, but
-          // surface it explicitly so the API is self-describing.
-          pollingUrl: `/api/workspace/${id}/export/pptx-status?generation_id=${encodeURIComponent(start.generationId)}`,
+          // Modo nodos polls the same status endpoint. We attach
+          // `&format=` so the checker uses checkGammaExport (no
+          // last_pptx write-back) instead of the pptx-only checker.
+          pollingUrl: `/api/workspace/${id}/export/pptx-status?generation_id=${encodeURIComponent(start.generationId)}&format=${encodeURIComponent(format)}`,
         });
         return;
       } catch (err) {
         if (err instanceof GammaApiError) {
-          reqLog(req).warn('workspace.export.pptx.failed', {
+          reqLog(req).warn('workspace.export.gamma.failed', {
             workspaceId: id,
+            format,
             code: err.code,
             message: err.message,
           });
-          const statusMap: Record<string, number> = {
-            auth: 503,
-            insufficient_credits: 402,
-            forbidden: 403,
-            bad_request: 400,
-            rate_limited: 429,
-            timeout: 504,
-            failed: 502,
-            no_export_url: 502,
-            upstream: 502,
-            network: 502,
-          };
           res.status(statusMap[err.code] ?? 500).json({
             ok: false,
             error: err.code,
@@ -2409,6 +2680,84 @@ workspaceRouter.post('/:id/export', async (req: Request, res: Response) => {
         }
         throw err;
       }
+    }
+
+    // ─── XLSX — in-process spreadsheet, no Gamma round-trip ──────────
+    // One row per section (title, content, sourceNodeId). Sections that
+    // carry tabular `data` get their own sheet so the user can pivot/
+    // chart over the rows. Dynamic import keeps the xlsx package off the
+    // client bundle (it's server-only).
+    if (format === 'xlsx') {
+      let xlsxLib: typeof import('xlsx');
+      try {
+        xlsxLib = await import('xlsx');
+      } catch {
+        res
+          .status(501)
+          .json({ ok: false, error: 'xlsx_not_installed', hint: 'Run: npm install xlsx' });
+        return;
+      }
+      const XLSX = xlsxLib;
+
+      // Build sections rows. When the caller didn't pass `sections` we
+      // synthesize from hojas so a workspace-canvas xlsx export still
+      // works (one row per hoja).
+      const xlsxRows = sections
+        ? sections.map((s) => ({
+            Title: s.title,
+            Content: s.content,
+            SourceNodeId: s.sourceNodeId ?? '',
+          }))
+        : ordered.map((n) => ({
+            Title: n.title,
+            Content: n.content.md,
+            SourceNodeId: n.id,
+          }));
+
+      const workbook = XLSX.utils.book_new();
+      const summarySheet = XLSX.utils.json_to_sheet(xlsxRows, {
+        header: ['Title', 'Content', 'SourceNodeId'],
+      });
+      XLSX.utils.book_append_sheet(workbook, summarySheet, 'Sections');
+
+      // One sheet per section that carries `data` — names are deduped
+      // and sanitized to xlsx's 31-char + restricted-chars rule.
+      if (sections) {
+        const usedNames = new Set<string>(['Sections']);
+        sections.forEach((s, i) => {
+          if (!s.data) return;
+          const baseName = s.title
+            .replace(/[\\/?*[\]:]/g, '_')
+            .slice(0, 28)
+            .trim();
+          let name = baseName.length > 0 ? baseName : `Section_${i + 1}`;
+          let suffix = 1;
+          while (usedNames.has(name)) {
+            const tail = `_${suffix++}`;
+            name = `${baseName.slice(0, 28 - tail.length)}${tail}`;
+          }
+          usedNames.add(name);
+          const rows = [s.data!.headers, ...s.data!.rows];
+          const sheet = XLSX.utils.aoa_to_sheet(rows);
+          XLSX.utils.book_append_sheet(workbook, sheet, name);
+        });
+      }
+
+      const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+
+      reqLog(req).info('workspace.export.xlsx.ok', {
+        workspaceId: id,
+        sections: sections ? sections.length : ordered.length,
+        bytes: (buffer as Buffer).length,
+      });
+
+      res.setHeader(
+        'Content-Type',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      );
+      res.setHeader('Content-Disposition', `attachment; filename="${safeName}.xlsx"`);
+      res.send(buffer);
+      return;
     }
 
     // ─── DOCX ─────────────────────────────────────────────────────
@@ -2739,7 +3088,7 @@ workspaceRouter.post('/:id/export', async (req: Request, res: Response) => {
     children.push(
       new Paragraph({
         children: [
-          new TextRun({ text: String(ws.title), size: 56, bold: true, color: '0E1745' }),
+          new TextRun({ text: effectiveTitle, size: 56, bold: true, color: '0E1745' }),
         ],
         alignment: AlignmentType.CENTER,
         spacing: { before: 1800, after: 200 },
@@ -2747,12 +3096,12 @@ workspaceRouter.post('/:id/export', async (req: Request, res: Response) => {
     );
 
     // Description / dek
-    if (ws.description && String(ws.description).trim()) {
+    if (effectiveDescription && effectiveDescription.trim()) {
       children.push(
         new Paragraph({
           children: [
             new TextRun({
-              text: String(ws.description),
+              text: effectiveDescription,
               italics: true,
               size: 26,
               color: '555555',
@@ -2786,7 +3135,12 @@ workspaceRouter.post('/:id/export', async (req: Request, res: Response) => {
       new Paragraph({
         children: [
           new TextRun({
-            text: `${ordered.length} ${ordered.length === 1 ? 'hoja' : 'hojas'} · Generado el ${dateStr}`,
+            text: (() => {
+              const unit = sections ? 'sección' : 'hoja';
+              const unitPlural = sections ? 'secciones' : 'hojas';
+              const word = ordered.length === 1 ? unit : unitPlural;
+              return `${ordered.length} ${word} · Generado el ${dateStr}`;
+            })(),
             italics: true,
             size: 22,
             color: '888888',
@@ -2848,16 +3202,20 @@ workspaceRouter.post('/:id/export', async (req: Request, res: Response) => {
     }
 
     // ─── Body — one hoja per section ──────────────────────────────
+    const eyebrowLabel = sections ? 'SECCIÓN' : 'HOJA';
+    const emptyContentLabel = sections
+      ? '(Sección sin contenido)'
+      : '(Hoja sin contenido)';
     ordered.forEach((n, i) => {
       children.push(new Paragraph({ children: [new PageBreak()] }));
-      const accent = HOJA_ACCENTS[String(n.color)] ?? HOJA_ACCENTS.default;
+      const accent = HOJA_ACCENTS[n.color] ?? HOJA_ACCENTS.default;
 
-      // Hoja number eyebrow
+      // Hoja/sección number eyebrow
       children.push(
         new Paragraph({
           children: [
             new TextRun({
-              text: `HOJA ${String(i + 1).padStart(2, '0')}`,
+              text: `${eyebrowLabel} ${String(i + 1).padStart(2, '0')}`,
               size: 16,
               color: accent,
               bold: true,
@@ -2871,18 +3229,18 @@ workspaceRouter.post('/:id/export', async (req: Request, res: Response) => {
       children.push(
         new Paragraph({
           children: [
-            new TextRun({ text: String(n.title), size: 40, bold: true, color: '0E1745' }),
+            new TextRun({ text: n.title, size: 40, bold: true, color: '0E1745' }),
           ],
           spacing: { after: 80 },
         }),
       );
       // Subtitle
-      if (n.subtitle && String(n.subtitle).trim()) {
+      if (n.subtitle && n.subtitle.trim()) {
         children.push(
           new Paragraph({
             children: [
               new TextRun({
-                text: String(n.subtitle),
+                text: n.subtitle,
                 size: 24,
                 italics: true,
                 color: '666666',
@@ -2904,14 +3262,14 @@ workspaceRouter.post('/:id/export', async (req: Request, res: Response) => {
       );
 
       // Body
-      const md = ((n.content as Record<string, unknown>)?.md as string) ?? '';
+      const md = n.content.md;
       if (md.trim()) {
         children.push(...mdBlocksToParagraphs(md));
       } else {
         children.push(
           new Paragraph({
             children: [
-              new TextRun({ text: '(Hoja sin contenido)', italics: true, color: 'BBBBBB' }),
+              new TextRun({ text: emptyContentLabel, italics: true, color: 'BBBBBB' }),
             ],
           }),
         );
@@ -2921,8 +3279,8 @@ workspaceRouter.post('/:id/export', async (req: Request, res: Response) => {
     // ─── Document with header/footer + numbering ──────────────────
     const doc = new Document({
       creator: 'Shifty Studio',
-      title: String(ws.title),
-      description: String(ws.description ?? ''),
+      title: effectiveTitle,
+      description: effectiveDescription,
       numbering: {
         config: [
           {
@@ -2996,7 +3354,7 @@ workspaceRouter.post('/:id/export', async (req: Request, res: Response) => {
                   alignment: AlignmentType.RIGHT,
                   children: [
                     new TextRun({
-                      text: String(ws.title),
+                      text: effectiveTitle,
                       size: 18,
                       color: 'AAAAAA',
                       italics: true,
@@ -3093,14 +3451,37 @@ workspaceRouter.get('/:id/export/pptx-status', async (req: Request, res: Respons
     return;
   }
 
+  // Optional ?format= disambiguates which checker to run. The default
+  // (pptx) preserves the legacy contract: pptx writes to last_pptx so a
+  // re-click within the 1h window short-circuits without burning Gamma
+  // credits. pdf/carousel skip the cache (modo nodos generations are
+  // user-driven and intentionally fresh per run; caching across
+  // sections-arrays would cause stale-content bugs that are hard to
+  // debug from the user's side).
+  const queryFormat = String(req.query.format ?? 'pptx').trim();
+  if (!['pptx', 'pdf', 'carousel'].includes(queryFormat)) {
+    res
+      .status(400)
+      .json({ ok: false, error: 'invalid_format', hint: 'pptx|pdf|carousel' });
+    return;
+  }
+
   // Ownership gate — same pattern as POST /:id/export. Reject before
   // hitting Gamma so a leaked generationId from another tenant can't be
   // used to read someone else's deck via this status endpoint.
   if (!(await ownedWorkspace(userId, id, res))) return;
 
   try {
-    const { checkGeneration } = await import('../services/workspacePptxExport.js');
-    const out = await checkGeneration(generationId, id, userId);
+    const mod = await import('../services/workspacePptxExport.js');
+    const out =
+      queryFormat === 'pptx'
+        ? await mod.checkGeneration(generationId, id, userId)
+        : await mod.checkGammaExport({
+            generationId,
+            workspaceId: id,
+            userId,
+            exportAs: queryFormat === 'pdf' || queryFormat === 'carousel' ? 'pdf' : 'pdf',
+          });
 
     if (out.status === 'pending') {
       res.json({

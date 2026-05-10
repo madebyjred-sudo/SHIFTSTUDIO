@@ -55,7 +55,10 @@ import {
   createGeneration,
   getGenerationStatus,
   GammaApiError,
+  type GammaFormat,
+  type GammaExportAs,
 } from './gammaApi.js';
+import type { BranchSection } from '../types/export.js';
 
 export interface WorkspacePptxResult {
   generationId: string;
@@ -456,6 +459,264 @@ export async function checkGeneration(
     `[workspace_pptx] generation complete workspaceId=${workspaceId} generationId=${generationId} credits_used=${status.credits?.used ?? '?'} credits_remaining=${status.credits?.remaining ?? '?'}`,
   );
 
+  return {
+    status: 'complete',
+    result: {
+      generationId: status.generationId,
+      gammaUrl: status.gammaUrl ?? '',
+      exportUrl: status.exportUrl,
+      filename,
+      cached: false,
+      generatedAt,
+    },
+  };
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Generalized Gamma export — pdf + carousel + sections support
+// ──────────────────────────────────────────────────────────────────────
+//
+// `startGeneration` / `checkGeneration` above are pptx-only and read the
+// hojas directly out of `studio_workspace_nodes`. For modo nodos (the
+// ReactFlow grafo) the runner consolidates specialist outputs into a
+// `BranchSection[]` array and ships them to the export endpoint without
+// ever materializing hojas — those sections must drive the deck source
+// directly.
+//
+// Rather than refactor `startGeneration` (which would risk regressing
+// the proven pptx flow), the generic helpers below run side-by-side:
+//   - `startGammaExport`  — accepts {format, exportAs, sections?, title?}
+//   - `checkGammaExport`  — generation-id status check (no caching)
+//
+// Cache: skipped on this path. Modo nodos generations are user-driven
+// and cheap to re-kick; the URL-cached `last_pptx` row only makes sense
+// for the workspace-canvas pptx button (one deck per workspace).
+
+/** Public extension hooks for the generalized helper. Kept narrow so
+ *  routes can pass through user input without rebuilding the union by
+ *  hand. */
+export interface GammaExportInput {
+  /** Workspace ownership gate — verified against studio_workspaces.user_id. */
+  workspaceId: string;
+  userId: string | null;
+  /** Gamma `format` (presentation | document | social | webpage). */
+  format: GammaFormat;
+  /** Gamma `exportAs` (pptx | pdf | png) — what file the user downloads. */
+  exportAs: GammaExportAs;
+  /** Pre-consolidated sections from the modo nodos runner. Each section
+   *  becomes one card slide with `# title` + `content`. */
+  sections: BranchSection[];
+  /** Cover title. Falls back to the workspace row's title. */
+  title?: string;
+  /** Cover subtitle / dek. Falls back to workspace.description. */
+  subtitle?: string;
+  /** Per-call branding/context options (tono, audiencia, etc). */
+  options?: PptxOptions;
+}
+
+export type StartGammaExportResult =
+  | {
+      status: 'complete';
+      result: {
+        generationId: string;
+        gammaUrl: string;
+        exportUrl: string;
+        filename: string;
+        cached: false;
+        generatedAt: string;
+      };
+    }
+  | {
+      status: 'pending';
+      generationId: string;
+      filename: string;
+    };
+
+export type CheckGammaExportResult =
+  | {
+      status: 'complete';
+      result: {
+        generationId: string;
+        gammaUrl: string;
+        exportUrl: string;
+        filename: string;
+        cached: false;
+        generatedAt: string;
+      };
+    }
+  | { status: 'pending'; generationId: string }
+  | { status: 'failed'; generationId: string; error: string };
+
+/**
+ * Compose deck source markdown from a list of sections. One `# title`
+ * heading per section, separated by `\n---\n` so Gamma's
+ * `cardSplit:'inputTextBreaks'` lays them out as one card per section.
+ *
+ * Cover slide is prepended when `title` is provided.
+ */
+function buildSectionsInputText(input: {
+  title?: string;
+  subtitle?: string;
+  sections: BranchSection[];
+}): string {
+  const lines: string[] = [];
+  if (input.title) {
+    lines.push(`# ${input.title}`);
+    if (input.subtitle) lines.push('', input.subtitle);
+    lines.push(
+      '',
+      `_${input.sections.length} sección${input.sections.length === 1 ? '' : 'es'} · Shifty Studio_`,
+    );
+  }
+  for (const s of input.sections) {
+    lines.push('', '---', '');
+    lines.push(`# ${s.title}`);
+    if (s.content && s.content.trim()) lines.push('', s.content.trim());
+  }
+  return lines.join('\n').slice(0, 400_000);
+}
+
+/** Map exportAs → file extension for the download filename. */
+function extensionForExportAs(exportAs: GammaExportAs): string {
+  switch (exportAs) {
+    case 'pptx':
+      return 'pptx';
+    case 'pdf':
+      return 'pdf';
+    case 'png':
+      return 'png';
+  }
+}
+
+/**
+ * Sections-driven Gamma kickoff. No cache — every call burns Gamma
+ * credits. Caller is responsible for de-bouncing repeated clicks.
+ *
+ * Throws WorkspaceNotFoundError if the workspace doesn't exist or doesn't
+ * belong to userId, or GammaApiError on Gamma create failures.
+ */
+export async function startGammaExport(
+  input: GammaExportInput,
+): Promise<StartGammaExportResult> {
+  const { workspaceId, userId, format, exportAs, sections } = input;
+  if (!userId) throw new Error('user_id required for startGammaExport');
+  if (!supabaseAdmin)
+    throw new Error('supabase admin client not configured for startGammaExport');
+  if (!Array.isArray(sections) || sections.length === 0) {
+    throw new GammaApiError('sections array required and non-empty', 'bad_request');
+  }
+
+  // Ownership gate. We re-fetch the workspace row to lift the title
+  // for the filename (when the caller didn't pass one) and to confirm
+  // the row belongs to this user before burning Gamma credits.
+  const { data: ws, error: wsErr } = await supabaseAdmin
+    .from('studio_workspaces')
+    .select('id, title, description')
+    .eq('id', workspaceId)
+    .eq('user_id', userId)
+    .maybeSingle();
+  if (wsErr || !ws) throw new WorkspaceNotFoundError();
+  const workspace = ws as { id: string; title: string; description: string | null };
+
+  const titleForCover = input.title ?? workspace.title;
+  const subtitleForCover = input.subtitle ?? workspace.description ?? undefined;
+  const safeName = safeFilenameFromTitle(titleForCover);
+  const filename = `${safeName}.${extensionForExportAs(exportAs)}`;
+
+  const inputText = buildSectionsInputText({
+    title: titleForCover,
+    subtitle: subtitleForCover,
+    sections,
+  });
+
+  const created = await createGeneration({
+    inputText,
+    format,
+    exportAs,
+    cardSplit: 'inputTextBreaks',
+    textMode: 'preserve',
+    textOptions: { language: 'es-419', tone: 'professional' },
+    imageOptions: { source: 'aiGenerated' },
+    cardOptions: {
+      // Carousel/social usually wants square or portrait. Gamma's
+      // `social` format defaults to a fluid card; we leave dimensions
+      // off for non-presentation formats so Gamma picks the right one.
+      ...(format === 'presentation' ? { dimensions: '16x9' as const } : {}),
+    },
+    additionalInstructions: buildAdditionalInstructions(input.options),
+  });
+
+  console.log(
+    `[workspace_gamma] kicked off workspaceId=${workspaceId} format=${format} exportAs=${exportAs} sections=${sections.length} generationId=${created.generationId} chars=${inputText.length}`,
+  );
+
+  return { status: 'pending', generationId: created.generationId, filename };
+}
+
+/**
+ * Single-shot status check for a generic Gamma generation kicked off via
+ * `startGammaExport`. Mirrors `checkGeneration` minus the `last_pptx`
+ * cache write — sections-driven exports are not cached.
+ */
+export async function checkGammaExport(
+  input: {
+    generationId: string;
+    workspaceId: string;
+    userId: string | null;
+    /** Used to derive the download filename suffix. */
+    exportAs: GammaExportAs;
+    /** Optional explicit title, falls back to workspace.title. */
+    title?: string;
+  },
+): Promise<CheckGammaExportResult> {
+  const { generationId, workspaceId, userId, exportAs } = input;
+  if (!userId) throw new Error('user_id required for checkGammaExport');
+  if (!supabaseAdmin)
+    throw new Error('supabase admin client not configured for checkGammaExport');
+
+  const { data: ws, error: wsErr } = await supabaseAdmin
+    .from('studio_workspaces')
+    .select('id, title')
+    .eq('id', workspaceId)
+    .eq('user_id', userId)
+    .maybeSingle();
+  if (wsErr || !ws) throw new WorkspaceNotFoundError();
+  const workspace = ws as { id: string; title: string };
+  const titleForFilename = input.title ?? workspace.title;
+  const safeName = safeFilenameFromTitle(titleForFilename);
+  const filename = `${safeName}.${extensionForExportAs(exportAs)}`;
+
+  let status;
+  try {
+    status = await getGenerationStatus(generationId);
+  } catch (err) {
+    if (err instanceof GammaApiError && err.code === 'failed') {
+      return { status: 'failed', generationId, error: err.message };
+    }
+    throw err;
+  }
+
+  if (status.status === 'failed') {
+    return {
+      status: 'failed',
+      generationId,
+      error: status.error?.message ?? 'gamma:generation failed',
+    };
+  }
+
+  if (status.status !== 'completed') {
+    return { status: 'pending', generationId };
+  }
+
+  if (!status.exportUrl) {
+    return {
+      status: 'failed',
+      generationId,
+      error: `gamma:generation ${generationId} completed but no exportUrl present`,
+    };
+  }
+
+  const generatedAt = new Date().toISOString();
   return {
     status: 'complete',
     result: {
