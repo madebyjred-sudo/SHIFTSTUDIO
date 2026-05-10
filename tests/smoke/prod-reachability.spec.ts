@@ -66,6 +66,53 @@ test.describe('Production smoke', () => {
     });
   }
 
+  // ─── Multi-format export (Wave B / modo nodos) ───────────────────
+  // The export endpoint accepts md|docx|pptx|pdf|xlsx|carousel; sections
+  // are optional. Auth gate must reject every shape unauthenticated. We
+  // do NOT exercise the success path here — that requires a real user
+  // and would burn Gamma credits on each run; e2e tests cover that.
+  for (const fmt of ['md', 'docx', 'pptx', 'pdf', 'xlsx', 'carousel']) {
+    test(`auth gate alive: POST /api/workspace/${FAKE_UUID}/export format=${fmt}`, async ({
+      request,
+    }) => {
+      const res = await request.post(`${PROD}/api/workspace/${FAKE_UUID}/export`, {
+        data: { format: fmt },
+        headers: { 'Content-Type': 'application/json' },
+      });
+      expect(res.status()).toBe(401);
+    });
+  }
+
+  // sections-only path: POST with sections[] and no DB hojas. Same auth
+  // gate must fire. The body is intentionally a tiny minimal sections
+  // array so we exercise the JSON-parse path; it must NOT 400 here (the
+  // 401 has to come first, before body validation).
+  test(`auth gate alive: POST /api/workspace/${FAKE_UUID}/export with sections`, async ({
+    request,
+  }) => {
+    const res = await request.post(`${PROD}/api/workspace/${FAKE_UUID}/export`, {
+      data: {
+        format: 'xlsx',
+        sections: [{ title: 'Smoke', content: 'auth gate probe' }],
+      },
+      headers: { 'Content-Type': 'application/json' },
+    });
+    expect(res.status()).toBe(401);
+  });
+
+  // pptx-status now accepts ?format=pptx|pdf|carousel. Auth gate must
+  // fire for every value, with no 404 / 500 from the format-aware path.
+  for (const fmt of ['pptx', 'pdf', 'carousel']) {
+    test(`auth gate alive: GET /api/workspace/${FAKE_UUID}/export/pptx-status?format=${fmt}`, async ({
+      request,
+    }) => {
+      const res = await request.get(
+        `${PROD}/api/workspace/${FAKE_UUID}/export/pptx-status?generation_id=fake&format=${fmt}`,
+      );
+      expect(res.status()).toBe(401);
+    });
+  }
+
   // ─── Modo nodos graph persistence (T-A1) ─────────────────────────
   // GET should 401 (read gate alive). PUT should 401 (write gate alive,
   // body validation runs AFTER auth so no body is needed). 404 = route
