@@ -30,6 +30,7 @@ import {
   RefreshCw,
   Copy,
   Check,
+  Sparkles,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import {
@@ -47,6 +48,13 @@ import {
 interface Props {
   open: boolean;
   onClose: () => void;
+  /**
+   * Optional handler that re-enters the first-login onboarding wizard.
+   * Surfaced as a secondary button in the header — useful when a user
+   * skipped or partially completed onboarding and wants to revisit.
+   * When omitted (e.g. tests, embedded contexts), the button is hidden.
+   */
+  onReopenOnboarding?: () => void;
 }
 
 type Tab = 'files' | 'history';
@@ -441,7 +449,7 @@ function HistoryList({
 
 // ─── Main panel ──────────────────────────────────────────────────────
 
-export function NeuronPanel({ open, onClose }: Props) {
+export function NeuronPanel({ open, onClose, onReopenOnboarding }: Props) {
   const [tab, setTab] = useState<Tab>('files');
 
   // Files state
@@ -645,21 +653,42 @@ export function NeuronPanel({ open, onClose }: Props) {
                   </p>
                 </div>
               </div>
-              <button
-                type="button"
-                onClick={onClose}
-                disabled={saving || deleting}
-                className={cn(
-                  'h-8 w-8 flex items-center justify-center rounded-full',
-                  'text-[#0e1745]/55 dark:text-white/55 hover:text-[#0e1745] dark:hover:text-white',
-                  'hover:bg-black/5 dark:hover:bg-white/10 transition-colors',
-                  'disabled:opacity-40 disabled:cursor-not-allowed',
-                  'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/60',
+              <div className="flex items-center gap-1.5">
+                {onReopenOnboarding && (
+                  <button
+                    type="button"
+                    onClick={onReopenOnboarding}
+                    disabled={saving || deleting}
+                    className={cn(
+                      'h-8 px-2.5 rounded-md text-[11px] font-semibold inline-flex items-center gap-1.5',
+                      'text-[#0e1745]/65 dark:text-white/65 hover:text-[#0e1745] dark:hover:text-white',
+                      'hover:bg-indigo-50 dark:hover:bg-indigo-500/10 transition-colors',
+                      'disabled:opacity-40 disabled:cursor-not-allowed',
+                      'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/60',
+                    )}
+                    title="Volver al onboarding"
+                    aria-label="Volver al onboarding inicial"
+                  >
+                    <Sparkles className="w-3.5 h-3.5" />
+                    Onboarding
+                  </button>
                 )}
-                aria-label="Cerrar"
-              >
-                <X className="w-4 h-4" />
-              </button>
+                <button
+                  type="button"
+                  onClick={onClose}
+                  disabled={saving || deleting}
+                  className={cn(
+                    'h-8 w-8 flex items-center justify-center rounded-full',
+                    'text-[#0e1745]/55 dark:text-white/55 hover:text-[#0e1745] dark:hover:text-white',
+                    'hover:bg-black/5 dark:hover:bg-white/10 transition-colors',
+                    'disabled:opacity-40 disabled:cursor-not-allowed',
+                    'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/60',
+                  )}
+                  aria-label="Cerrar"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
             </div>
 
             {/* Quota + tabs row */}
