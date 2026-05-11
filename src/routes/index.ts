@@ -5,3 +5,4 @@
  */
 export { workspaceRouter } from './workspace.js';
 export { adminRouter } from './admin.js';
+export { createNeuronProxyRouter } from './neuron-proxy.js';

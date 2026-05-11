@@ -47,6 +47,13 @@ const WorkspaceCanvasPage = lazy(() =>
 // recharts payload stays out of the chat-only entry bundle.
 const AdminUsagePage = lazy(() => import("./pages/AdminUsagePage"));
 
+// "Mi memoria" — opened on demand from the avatar dropdown. Lazy so
+// the chat-only entry doesn't pay for motion/react animations + the
+// neuron client + editor up front.
+const NeuronPanel = lazy(() =>
+  import("./components/neuron/NeuronPanel").then((m) => ({ default: m.NeuronPanel })),
+);
+
 // Shared route-level fallback — matches Studio's auth-loading spinner.
 function WorkspaceRouteFallback() {
   return (
@@ -74,9 +81,14 @@ export default function App() {
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);        // desktop panel
   const [isMobileDrawerOpen, setIsMobileDrawerOpen] = useState(false); // mobile drawer
 
+  // Neuron ("Mi memoria") modal state — opened from the avatar dropdown.
+  const [isNeuronOpen, setIsNeuronOpen] = useState(false);
+
   const toggleHistory = () => setIsHistoryOpen((v) => !v);
   const openMobileDrawer = () => setIsMobileDrawerOpen(true);
   const closeMobileDrawer = () => setIsMobileDrawerOpen(false);
+  const openNeuronPanel = () => setIsNeuronOpen(true);
+  const closeNeuronPanel = () => setIsNeuronOpen(false);
 
   // ─── Auth: Session Guard ───────────────────────────────────────────────────
   const { isAuthenticated, isAuthLoading, setSession } = useAuthStore();
@@ -273,6 +285,7 @@ export default function App() {
               onOpenHistory={openMobileDrawer}
               onToggleHistory={toggleHistory}
               isHistoryOpen={isHistoryOpen}
+              onOpenNeuronPanel={openNeuronPanel}
             />
 
             {/* ═══════════════════════════════════════════
@@ -316,6 +329,15 @@ export default function App() {
               side="left"
               className="lg:hidden"
             />
+
+            {/* Mi memoria — neuron panel. Mounted lazily, only when
+                the user actually opens it (Suspense bound around the
+                Suspense-eligible <NeuronPanel /> import). */}
+            {isNeuronOpen && (
+              <Suspense fallback={null}>
+                <NeuronPanel open={isNeuronOpen} onClose={closeNeuronPanel} />
+              </Suspense>
+            )}
           </div>
         </ChatProvider>
       </ThemeProvider>

@@ -107,6 +107,45 @@ export async function getUserIdFromRequest(req: Request): Promise<string | null>
   return null;
 }
 
+/**
+ * Resolve the user's email from a request, JWT-only.
+ *
+ * Used by the neurons (Cerebro persistent memory) wiring: Cerebro keys
+ * memory files by `user_id = <email>` because email is the stable
+ * cross-app identifier (UUID rotates per Supabase project; email does
+ * not). Returning null is non-fatal — the caller responds 401 and the
+ * frontend prompts re-auth.
+ *
+ * Contract:
+ *   - Bearer token present + valid → return `data.user.email` (or null
+ *     if the auth provider has no email on file).
+ *   - Bearer token present + invalid → null (mirrors getUserIdFromRequest
+ *     fail-closed semantics).
+ *   - No Bearer token → null. We deliberately do NOT honor `x-user-id`
+ *     or anon fallback here: those paths produce a UUID, not an email,
+ *     and an attacker-supplied `x-user-email` header would be a trivial
+ *     spoof primitive against another user's memory bucket.
+ *
+ * Never throws.
+ */
+export async function getUserEmailFromRequest(req: Request): Promise<string | null> {
+  const authHeader = req.headers.authorization || req.headers.Authorization;
+  const headerStr = Array.isArray(authHeader) ? authHeader[0] : authHeader;
+  if (!headerStr || typeof headerStr !== 'string' || !headerStr.startsWith('Bearer ')) {
+    return null;
+  }
+  const token = headerStr.slice('Bearer '.length).trim();
+  if (!token || !supabaseAdmin) return null;
+  try {
+    const { data, error } = await supabaseAdmin.auth.getUser(token);
+    if (error || !data?.user?.email) return null;
+    return data.user.email;
+  } catch (err) {
+    console.warn('[auth] getUserEmailFromRequest threw:', (err as Error).message);
+    return null;
+  }
+}
+
 export { ANON_USER_ID };
 
 /**
