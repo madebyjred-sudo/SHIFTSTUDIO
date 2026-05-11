@@ -1,7 +1,9 @@
 /**
  * @file NeuronOnboardingWizard.tsx
  * @description First-login wizard that bootstraps the user's neuron with
- * a rich profile so Ana has context from turn 1. 8 steps:
+ * a rich profile so Shifty (Studio chat) and Ana (Status reports) both
+ * have context from turn 1 — they share the same neuron, scoped by
+ * realm + user_email. 8 steps:
  *   1. welcome      — pitch, set expectations
  *   2. identity     — short structured fields (name/role/company/etc.)
  *   3. work         — long-form "what do you do day to day"
@@ -279,7 +281,7 @@ function renderMarkdownForStep(step: Step, d: OnboardingData): string {
 // The literal prompt copy users paste into ChatGPT/Claude/Gemini. Lives
 // at module scope so it can be reused for the "Copy" button + the help
 // text without rendering it twice in JSX.
-const AI_IMPORT_PROMPT = `Necesito que me ayudes a crear un resumen estructurado de TODO lo que sabes sobre mí basado en nuestras conversaciones previas. Otro asistente (Ana) va a absorber este resumen para conocerme rápido.
+const AI_IMPORT_PROMPT = `Necesito que me ayudes a crear un resumen estructurado de TODO lo que sabes sobre mí basado en nuestras conversaciones previas. Otros asistentes (Shifty en mi tool de trabajo, Ana en mis reportes weekly) van a absorber este resumen para conocerme rápido.
 
 Devolveme en este formato markdown EXACTO:
 
@@ -752,7 +754,7 @@ export function NeuronOnboardingWizard({
                   id="neuron-onboarding-title"
                   className="text-[15px] font-semibold text-[#0e1745] dark:text-white"
                 >
-                  Conociendo a Ana, tu asistente
+                  Conociendo a tus asistentes
                 </h2>
               </div>
             </div>
@@ -811,7 +813,7 @@ export function NeuronOnboardingWizard({
                 {step === 'work' && (
                   <LongFormStep
                     title="¿Qué hacés día a día?"
-                    description="Contale a Ana en qué consiste tu trabajo. Sé concreto: tareas reales, qué decisiones tomás, qué problemas resolvés. Mientras más detalle, mejor te conoce."
+                    description="Contale a Shifty en qué consiste tu trabajo. Sé concreto: tareas reales, qué decisiones tomás, qué problemas resolvés. Mientras más detalle, mejor te conoce."
                     placeholder="Ej: dirijo marketing en una agencia. Mis días arrancan revisando métricas de campañas activas, después gestiono al equipo creativo, y por la tarde estoy en reuniones con clientes…"
                     value={data.work}
                     onChange={(v) => setData((d) => ({ ...d, work: v }))}
@@ -831,7 +833,7 @@ export function NeuronOnboardingWizard({
                 {step === 'team' && (
                   <LongFormStep
                     title="¿Con quién trabajás?"
-                    description="Equipo, clientes, mentores, partners. Nombrá personas y describí brevemente la relación. Esto ayuda a Ana cuando mencionás a 'Oscar' o 'el equipo de marketing'."
+                    description="Equipo, clientes, mentores, partners. Nombrá personas y describí brevemente la relación. Esto ayuda a Shifty cuando mencionás a 'Oscar' o 'el equipo de marketing'."
                     placeholder="Ej: Oscar — mi VP, decide presupuesto. Cata — diseñadora senior, mi mano derecha. Cliente Garnier — Ana María, gerente de marca…"
                     value={data.team}
                     onChange={(v) => setData((d) => ({ ...d, team: v }))}
@@ -842,7 +844,7 @@ export function NeuronOnboardingWizard({
                 {step === 'style' && (
                   <LongFormStep
                     title="¿Cómo te gusta trabajar?"
-                    description="Horarios, tools que usás, formato de feedback que preferís, anti-patterns que detestás, lenguaje técnico de tu industria. Cosas que harían que Ana sonara como uno de tu equipo."
+                    description="Horarios, tools que usás, formato de feedback que preferís, anti-patterns que detestás, lenguaje técnico de tu industria. Cosas que harían que Shifty sonara como uno de tu equipo."
                     placeholder="Ej: arranco a las 8am, deep work hasta las 12. Uso Linear + Figma + Notion. Feedback directo, sin rodeos. Detesto reuniones sin agenda…"
                     value={data.style}
                     onChange={(v) => setData((d) => ({ ...d, style: v }))}
@@ -966,9 +968,9 @@ export function NeuronOnboardingWizard({
                   ¿Seguro que querés saltar?
                 </h3>
                 <p className="mt-1.5 text-[12.5px] leading-relaxed text-[#0e1745]/65 dark:text-white/65">
-                  Ana sabrá menos sobre vos al arrancar. Podés volver más
-                  tarde desde <strong>Mi memoria</strong>. Lo que escribiste
-                  hasta ahora queda guardado como borrador.
+                  Tus asistentes sabrán menos sobre vos al arrancar. Podés
+                  volver más tarde desde <strong>Mi memoria</strong>. Lo que
+                  escribiste hasta ahora queda guardado como borrador.
                 </p>
                 <div className="mt-4 flex items-center justify-end gap-2">
                   <GhostButton onClick={() => setConfirmingSkip(false)}>
@@ -999,14 +1001,15 @@ function WelcomeStep({ onStart }: { onStart: () => void }) {
     <div className="space-y-5 max-w-2xl">
       <div className="space-y-2">
         <h3 className="text-[20px] font-semibold text-[#0e1745] dark:text-white tracking-tight">
-          Hola — vamos a presentarte a Ana
+          Hola — vamos a presentarte a Shifty
         </h3>
       </div>
       <div className="space-y-3 text-[13.5px] leading-relaxed text-[#0e1745]/75 dark:text-white/75">
         <p>
-          Ana es tu asistente que va a recordar contexto entre
-          conversaciones. Mientras más sepa de vos al arrancar, más útil
-          es desde el primer turno.
+          Shifty es tu asistente en Studio que va a recordar contexto
+          entre conversaciones. La misma memoria también la usa Ana cuando
+          generás reportes en Status. Mientras más sepa de vos al
+          arrancar, más útil es desde el primer turno.
         </p>
         <p>
           Te voy a hacer unas 7 preguntas — algunas cortas, otras donde
@@ -1053,7 +1056,7 @@ function IdentityStep({
           Lo básico sobre vos
         </h3>
         <p className="mt-1 text-[12.5px] text-[#0e1745]/60 dark:text-white/55">
-          Esto le da a Ana un anclaje rápido. Sé breve.
+          Esto le da a tus asistentes un anclaje rápido. Sé breve.
         </p>
       </div>
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -1182,7 +1185,7 @@ function ProjectsStep({
           ¿En qué estás trabajando ahora?
         </h3>
         <p className="mt-1 text-[12.5px] leading-relaxed text-[#0e1745]/60 dark:text-white/55">
-          Listá tus proyectos en curso. Ana los va a referenciar cuando
+          Listá tus proyectos en curso. Shifty los va a referenciar cuando
           hables de ellos.
         </p>
       </div>
@@ -1344,8 +1347,8 @@ function AiImportStep({
           ariaLabel="Respuesta importada de tu IA habitual"
         />
         <p className="text-[11.5px] text-[#0e1745]/50 dark:text-white/50">
-          No tiene que ser perfecto — Ana va a integrar lo que pegues con
-          el resto.
+          No tiene que ser perfecto — tus asistentes van a integrar lo que
+          pegues con el resto.
         </p>
       </div>
     </div>
@@ -1369,10 +1372,11 @@ function ReviewStep({
     <div className="space-y-4 max-w-2xl">
       <div>
         <h3 className="text-[18px] font-semibold text-[#0e1745] dark:text-white tracking-tight">
-          Listo — esto es lo que Ana va a saber de vos
+          Listo — esto es lo que tus asistentes van a saber de vos
         </h3>
         <p className="mt-1 text-[12.5px] leading-relaxed text-[#0e1745]/60 dark:text-white/55">
-          Revisá los {filledFileCount}{' '}
+          Shifty lo lee cada vez que chateás en Studio. Ana lo lee cuando
+          generás reportes en Status. Revisá los {filledFileCount}{' '}
           {filledFileCount === 1 ? 'archivo' : 'archivos'} que vamos a
           guardar en tu memoria. Podés volver a editar cualquier paso
           antes de confirmar.
@@ -1463,7 +1467,7 @@ function ReviewStep({
       {filledFileCount === 0 && (
         <div className="p-3 rounded-lg bg-amber-50 dark:bg-amber-500/10 border border-amber-200/60 dark:border-amber-500/30 text-[12px] text-amber-800 dark:text-amber-200">
           No agregaste contenido en ningún paso. Si confirmás, no se va a
-          guardar nada y Ana arrancará sin contexto sobre vos.
+          guardar nada y tus asistentes arrancarán sin contexto sobre vos.
         </div>
       )}
     </div>
