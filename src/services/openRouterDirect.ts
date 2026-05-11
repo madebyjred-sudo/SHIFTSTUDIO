@@ -121,6 +121,35 @@ export interface CallArgs {
   /** Studio workspace id when the call is workspace-scoped. Logged
    *  into studio_ai_call_log.workspace_id. Not forwarded upstream. */
   workspaceId?: string | null;
+  // ─── Neurons (Cerebro persistent memory) ────────────────────────────
+  /**
+   * Realm bucket for Cerebro's memory tool. Cerebro stores `/memories/*`
+   * files keyed by `(realm, user_id)`. Default 'shift' so Studio shares
+   * a realm with other Shift apps that opt into the same identity.
+   *
+   * Only forwarded to Cerebro when `enableMemory === true` AND
+   * `userEmail` is non-empty.
+   */
+  realm?: string;
+  /**
+   * The user's EMAIL (not Supabase UUID). Cerebro uses email as the
+   * stable cross-app identity for memory because the UUID is project-
+   * scoped while the email is not.
+   *
+   * Required for `enable_memory:true` to take effect. If absent while
+   * `enableMemory === true`, we log a one-time warn and send the
+   * legacy body (no memory flags) so the call still completes.
+   */
+  userEmail?: string | null;
+  /**
+   * Opt-in switch for Cerebro's memory tool. Default OFF for every
+   * call site — explicit chat / conversational handlers turn it on
+   * (e.g. /turn intent=chat, graph executions). Classifier /
+   * transform / architect / edit calls leave it false because they
+   * are one-shot, stateless transformations where memory would
+   * leak unrelated context into the output.
+   */
+  enableMemory?: boolean;
 }
 
 /**
@@ -147,6 +176,13 @@ interface InvokeResponse {
  * just wouldn't show up and there'd be no signal in the logs.
  */
 let _adminWarnIssued = false;
+
+/**
+ * One-shot warn flag for the neurons (memory) wiring: fires when a
+ * caller asks for `enableMemory:true` but no `userEmail` is available
+ * to key the memory bucket by. The call proceeds without memory.
+ */
+let _neuronsWarnIssued = false;
 
 /**
  * Fire-and-forget INSERT into studio_ai_call_log. Never throws —
@@ -364,6 +400,29 @@ export async function callOpenRouter(args: CallArgs): Promise<string> {
   // on a server-side default.
   body.app_id = 'studio';
   if (args.trace_label) body.trace_label = args.trace_label;
+
+  // ─── Neurons wiring (Cerebro Change: persistent memory per user) ───
+  // When enableMemory is on AND we have an email to key by, send the
+  // trio Cerebro expects (`realm`, `user_id`, `enable_memory`). Cerebro
+  // activates its memory tool internally, reads/writes /memories/*
+  // files for that user, and the response shape doesn't change.
+  //
+  // If the flag is on but no email is available (anon session, bypass
+  // mode), we WARN once per process and quietly drop the flag — better
+  // to lose memory than to write into the wrong bucket or crash the
+  // user-facing turn.
+  if (args.enableMemory === true) {
+    if (args.userEmail && args.userEmail.length > 0) {
+      body.realm = args.realm ?? 'shift';
+      body.user_id = args.userEmail;
+      body.enable_memory = true;
+    } else if (!_neuronsWarnIssued) {
+      _neuronsWarnIssued = true;
+      console.warn(
+        '[neurons] enableMemory=true but userEmail missing — memory disabled for this call. Verify the JWT carries an email claim.',
+      );
+    }
+  }
 
   const t0 = Date.now();
   let upstream: Response;
