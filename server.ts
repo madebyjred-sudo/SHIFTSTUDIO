@@ -4,7 +4,7 @@ import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
 import { AGENT_MAP, MODEL_MAP, isDebateRequest } from "./src/shared/constants.js";
-import { workspaceRouter, adminRouter } from "./src/routes/index.js";
+import { workspaceRouter, adminRouter, createNeuronProxyRouter } from "./src/routes/index.js";
 import { correlationMiddleware } from "./src/routes/workspace.js";
 import { logger } from "./src/lib/logger.js";
 
@@ -303,6 +303,11 @@ async function startServer() {
   // Admin BFF — operator views over studio_ai_call_log. Gated on the
   // ADMIN_USER_IDS env var allowlist (see src/routes/admin.ts).
   app.use("/api/admin", adminRouter);
+
+  // Neuron BFF — proxies Studio frontend → Cerebro's per-user memory
+  // (/v1/neuron/{realm}/{email}/*) with the shared-secret token
+  // injected server-side. See src/routes/neuron-proxy.ts.
+  app.use("/api/neuron", createNeuronProxyRouter());
 
   // List available agents endpoint (Proxy to Swarm)
   app.get("/api/agents", async (req, res) => {

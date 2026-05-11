@@ -113,8 +113,9 @@ export async function getUserIdFromRequest(req: Request): Promise<string | null>
  * Used by the neurons (Cerebro persistent memory) wiring: Cerebro keys
  * memory files by `user_id = <email>` because email is the stable
  * cross-app identifier (UUID rotates per Supabase project; email does
- * not). Returning null is non-fatal — the caller drops the
- * `enable_memory` flag and the LLM call proceeds without memory.
+ * not). Returning null is non-fatal — callers handle it contextually:
+ *   - `/turn` chat: drops the `enable_memory` flag and proceeds without memory
+ *   - `/api/neuron/*` BFF proxy: responds 401, frontend prompts re-auth
  *
  * Contract:
  *   - Bearer token present + valid → return `data.user.email` (or null

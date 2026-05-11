@@ -1,4 +1,4 @@
-import { Clock, Layers, LogOut, Moon, PanelLeftClose, PanelLeftOpen, Sun } from 'lucide-react';
+import { Brain, Clock, Layers, LogOut, Moon, PanelLeftClose, PanelLeftOpen, Sun } from 'lucide-react';
 import { DynamicSVG } from './DynamicSVG';
 import { useActiveGraphStore } from '@/store';
 import { cn } from '@/lib/utils';
@@ -9,9 +9,10 @@ interface TopDockProps {
   onOpenHistory?: () => void;
   onToggleHistory?: () => void;
   isHistoryOpen?: boolean;
+  onOpenNeuronPanel?: () => void;
 }
 
-export function TopDock({ onOpenHistory, onToggleHistory, isHistoryOpen }: TopDockProps) {
+export function TopDock({ onOpenHistory, onToggleHistory, isHistoryOpen, onOpenNeuronPanel }: TopDockProps) {
   const { theme, toggleTheme } = useTheme();
   const { user, logout } = useAuthStore();
   const activeMode = useActiveGraphStore((state) => state.activeMode);
@@ -116,6 +117,15 @@ export function TopDock({ onOpenHistory, onToggleHistory, isHistoryOpen }: TopDo
                     {user?.email ?? 'Usuario Shift'}
                   </p>
                 </div>
+                {onOpenNeuronPanel && (
+                  <button
+                    onClick={onOpenNeuronPanel}
+                    className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-[#0e1745]/75 dark:text-white/70 hover:text-[#0e1745] dark:hover:text-white hover:bg-indigo-50 dark:hover:bg-indigo-500/10 rounded-lg transition-all duration-150"
+                  >
+                    <Brain className="w-3.5 h-3.5" />
+                    <span>Mi memoria</span>
+                  </button>
+                )}
                 <button
                   onClick={handleLogout}
                   className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-[#0e1745]/70 dark:text-white/60 hover:text-red-500 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 rounded-lg transition-all duration-150"
