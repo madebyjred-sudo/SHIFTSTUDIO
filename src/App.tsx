@@ -14,6 +14,7 @@ import { AuthView } from "./components/AuthView";
 
 import React, { useState, useEffect, lazy, Suspense } from "react";
 import { cn } from "@/lib/utils";
+import { useNeuronOnboarding } from "./hooks/useNeuronOnboarding";
 // Phase 3 perf — lazy the conditional-render top-level routes so the chat-only
 // entry doesn't pay for ReactFlow + dagre (Canvas), the admin dashboard, or the
 // embed primitives upfront. Each is only rendered on a specific URL/state.
@@ -54,6 +55,15 @@ const NeuronPanel = lazy(() =>
   import("./components/neuron/NeuronPanel").then((m) => ({ default: m.NeuronPanel })),
 );
 
+// First-login onboarding wizard. Lazy: only mounted once the
+// useNeuronOnboarding hook flags the user (or a re-entry from
+// NeuronPanel). Keeps motion/react + the 8-step JSX off the cold path.
+const NeuronOnboardingWizard = lazy(() =>
+  import("./components/onboarding/NeuronOnboardingWizard").then((m) => ({
+    default: m.NeuronOnboardingWizard,
+  })),
+);
+
 // Shared route-level fallback — matches Studio's auth-loading spinner.
 function WorkspaceRouteFallback() {
   return (
@@ -84,11 +94,25 @@ export default function App() {
   // Neuron ("Mi memoria") modal state — opened from the avatar dropdown.
   const [isNeuronOpen, setIsNeuronOpen] = useState(false);
 
+  // Onboarding wizard — first-login flow for users with empty neurons.
+  // The hook handles all the auto-fire gating; we lift the trigger here
+  // so NeuronPanel can re-enter the flow via a "Volver al onboarding"
+  // button without owning its own gating state.
+  const onboarding = useNeuronOnboarding();
+
   const toggleHistory = () => setIsHistoryOpen((v) => !v);
   const openMobileDrawer = () => setIsMobileDrawerOpen(true);
   const closeMobileDrawer = () => setIsMobileDrawerOpen(false);
   const openNeuronPanel = () => setIsNeuronOpen(true);
   const closeNeuronPanel = () => setIsNeuronOpen(false);
+  const reopenOnboarding = () => {
+    // Re-entry from "Mi memoria". Close the neuron panel first so the
+    // wizard takes the visual stage cleanly (both modals have high
+    // z-index; the wizard's is higher but stacking two large overlays
+    // looks confused).
+    setIsNeuronOpen(false);
+    onboarding.forceOpen();
+  };
 
   // ─── Auth: Session Guard ───────────────────────────────────────────────────
   const { isAuthenticated, isAuthLoading, setSession } = useAuthStore();
@@ -204,6 +228,35 @@ export default function App() {
 
   if (!isAuthenticated && !bypassAuth) return <AuthView />;
 
+  // Shared post-auth overlays — wizard auto-fires for users with empty
+  // neurons (decided by useNeuronOnboarding), or can be re-entered from
+  // NeuronPanel via the "Volver al onboarding" button. NeuronPanel is
+  // the existing "Mi memoria" surface. Both are kept lazy so they don't
+  // weigh on the cold-path bundle.
+  const postAuthOverlays = (
+    <>
+      {isNeuronOpen && (
+        <Suspense fallback={null}>
+          <NeuronPanel
+            open={isNeuronOpen}
+            onClose={closeNeuronPanel}
+            onReopenOnboarding={reopenOnboarding}
+          />
+        </Suspense>
+      )}
+      {onboarding.shouldShow && (
+        <Suspense fallback={null}>
+          <NeuronOnboardingWizard
+            open={onboarding.shouldShow}
+            onClose={onboarding.dismiss}
+            onComplete={onboarding.complete}
+            userEmail={onboarding.email}
+          />
+        </Suspense>
+      )}
+    </>
+  );
+
   // ─── Workspace routes: /workspaces and /workspaces/:id ─────────────
   // These render full-screen, OUTSIDE the chat/canvas layout. They have
   // their own TopDock + chrome. The default (`/` and everything else)
@@ -219,6 +272,7 @@ export default function App() {
           <Suspense fallback={<WorkspaceRouteFallback />}>
             <AdminUsagePage />
           </Suspense>
+          {postAuthOverlays}
         </ThemeProvider>
       </ErrorBoundary>
     );
@@ -230,6 +284,7 @@ export default function App() {
           <Suspense fallback={<WorkspaceRouteFallback />}>
             <WorkspacesListPage />
           </Suspense>
+          {postAuthOverlays}
         </ThemeProvider>
       </ErrorBoundary>
     );
@@ -243,6 +298,7 @@ export default function App() {
             <Suspense fallback={<WorkspaceRouteFallback />}>
               <WorkspaceCanvasPage workspaceId={workspaceIdFromPath} />
             </Suspense>
+            {postAuthOverlays}
           </ChatProvider>
         </ThemeProvider>
       </ErrorBoundary>
@@ -330,14 +386,8 @@ export default function App() {
               className="lg:hidden"
             />
 
-            {/* Mi memoria — neuron panel. Mounted lazily, only when
-                the user actually opens it (Suspense bound around the
-                Suspense-eligible <NeuronPanel /> import). */}
-            {isNeuronOpen && (
-              <Suspense fallback={null}>
-                <NeuronPanel open={isNeuronOpen} onClose={closeNeuronPanel} />
-              </Suspense>
-            )}
+            {/* Shared post-auth overlays (Mi memoria + onboarding wizard). */}
+            {postAuthOverlays}
           </div>
         </ChatProvider>
       </ThemeProvider>
