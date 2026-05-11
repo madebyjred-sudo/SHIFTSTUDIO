@@ -39,7 +39,11 @@
 import crypto from 'node:crypto';
 import { Router, type NextFunction, type Request, type Response } from 'express';
 import { supabaseAdmin } from '../services/supabaseAdminClient.js';
-import { getUserIdFromRequest, isValidUuid } from '../services/auth.js';
+import {
+  getUserEmailFromRequest,
+  getUserIdFromRequest,
+  isValidUuid,
+} from '../services/auth.js';
 import {
   callOpenRouter,
   extractJsonObject,
@@ -1713,6 +1717,14 @@ Return ONLY valid JSON matching the schema. No prose, no code fences, no preambl
     const abortController = new AbortController();
     req.on('close', () => abortController.abort());
 
+    // ── Neurons wiring (persistent memory per user) ──
+    // Resolve the user's email from the same JWT we already verified
+    // in requireUser. Cerebro keys /memories/* by (realm, user_id =
+    // email). If we can't get an email (anon dev fallback / bypass
+    // mode), we leave `userEmail` null and the chat call still works
+    // — callOpenRouter quietly drops the memory flag in that case.
+    const userEmail = await getUserEmailFromRequest(req);
+
     // Pull workspace metadata + selected hoja + asset / hoja blocks
     // in parallel — same shape as CL2 but pointing at studio_* tables.
     const [
@@ -1936,6 +1948,11 @@ Return ONLY valid JSON matching the schema. No prose, no code fences, no preambl
         trace_label: 'studio.workspace.turn.chat',
         userId,
         workspaceId: id,
+        // Persistent memory: only chat turns get it. Classifier /
+        // transform / architect / edit calls stay stateless.
+        enableMemory: true,
+        userEmail,
+        realm: tenantId,
       });
       reqLog(req).info('workspace.turn.chat.ok', {
         chars: assembled.length,

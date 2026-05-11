@@ -132,6 +132,24 @@ async function getAuthToken(): Promise<string | undefined> {
   }
 }
 
+/**
+ * Pull the authenticated user's email from the current Supabase session.
+ * Used by `startExecution` to wire Cerebro's persistent memory tool:
+ * Cerebro keys `/memories/*` by `(realm, user_id = email)`. Returns
+ * `null` when there is no session, the session has no user, or the
+ * user has no email on file (e.g. phone-only auth). Never throws.
+ */
+async function getAuthUserEmail(): Promise<string | null> {
+  if (!supabase) return null;
+  try {
+    const { data } = await supabase.auth.getSession();
+    const email = data?.session?.user?.email;
+    return typeof email === 'string' && email.length > 0 ? email : null;
+  } catch {
+    return null;
+  }
+}
+
 // ─── Public API ───────────────────────────────────────────────────────
 
 /**
@@ -156,13 +174,33 @@ export async function startExecution(
   const base = getGatewayBaseUrl();
   const url = `${base}/v1/graph/execute`;
 
-  const body = {
+  // ── Neurons wiring (persistent memory per user) ──
+  // Cerebro's `/v1/graph/execute` accepts the same memory trio
+  // (`realm`, `user_id`, `enable_memory`) on the root body and is
+  // expected to propagate it to each specialist's internal /v1/llm/
+  // invoke call. If the contract drifts (e.g. an older Cerebro build
+  // that ignores these fields at this endpoint), Cerebro silently
+  // drops them — no crash, just no memory. We send them anyway so
+  // the moment Cerebro ships the propagation the wiring lights up.
+  //
+  // VERIFY: handoff `2026-05-10-studio-graph-execute.md` confirms the
+  // root-level placement. If a later spec moves them under
+  // `execution_params` or per-node, this is the single site to patch.
+  const userEmail = await getAuthUserEmail();
+  const enableMemory = Boolean(userEmail);
+
+  const body: Record<string, unknown> = {
     app_id: APP_ID,
     workspace_id: workspaceId,
     nodes,
     edges,
     trace_label: traceLabel,
   };
+  if (enableMemory) {
+    body.realm = DEFAULT_TENANT;
+    body.user_id = userEmail;
+    body.enable_memory = true;
+  }
 
   const res = await fetch(url, {
     method: 'POST',
