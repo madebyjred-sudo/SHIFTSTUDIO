@@ -20,6 +20,7 @@ import { GATEWAY_URL } from "@/config";
 import { parseAndApplyGraphTopology } from "@/lib/graph-parser";
 import { useActiveGraphStore } from "@/store";
 import { isV2Enabled } from "@/store";
+import { supabase } from "@/services/supabaseClient";
 
 function useAutoResizeTextarea(ref: React.RefObject<HTMLTextAreaElement | null>, value: string) {
   useEffect(() => {
@@ -309,9 +310,27 @@ export function AnimatedAiInput({ defaultTenantId = "shift", onOpenHistory, comp
         return;
       }
 
+      // Bearer JWT — sin esto el backend no resuelve el email del usuario
+      // y /api/chat cae a memoria deshabilitada. Con email válido →
+      // Cerebro hidrata la neurona persistente y Shifty recuerda al user.
+      // Fallback gracioso: si no hay session (bypass dev, supabase=null),
+      // sale sin Authorization y memoria queda off pero el chat funciona.
+      let chatAuthToken: string | undefined;
+      if (supabase) {
+        try {
+          const { data: sessionData } = await supabase.auth.getSession();
+          chatAuthToken = sessionData?.session?.access_token;
+        } catch (sessionErr) {
+          console.warn('[chat] supabase.getSession threw:', sessionErr);
+        }
+      }
+
       const res = await fetch(`/api/chat`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(chatAuthToken ? { Authorization: `Bearer ${chatAuthToken}` } : {}),
+        },
         body: JSON.stringify({
           messages: allMessages,
           preferred_agent: AGENT_INFO[effectiveAgent].id,
