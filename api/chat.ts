@@ -1,8 +1,15 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
+import type { Request as ExpressRequest } from 'express';
 import { AGENT_MAP, MODEL_MAP, isDebateRequest } from '../src/shared/constants.js';
+import { getUserEmailFromRequest } from '../src/services/auth.js';
 
 // Python Swarm Backend URL
 const SWARM_API_URL = process.env.SWARM_API_URL || "http://localhost:8000";
+
+// Neurons realm — hardcoded "shift" para Studio. Cross-app: misma neurona la
+// lee Ana en Status app (mismo realm + same user email). Ver
+// ~/AGENTS/CEREBRO/handoffs/2026-05-10-neurons-wiring-clients.md.
+const NEURONS_REALM = "shift";
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'POST') {
@@ -62,6 +69,29 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     console.log(`[Vercel Gateway] Routing to: ${targetEndpoint}`);
 
+    // ─── Neurons wiring (post Cerebro `feat/oai-compat-v2` 2c7cdd8) ─────
+    // /swarm/chat ahora propaga `realm/user_id/enable_memory` al agent's
+    // LLM call interno cuando vienen presentes + email valido en JWT.
+    // Sin email: chat sigue funcionando exactamente igual que antes,
+    // simplemente sin memoria — failsafe para sesiones anon o JWT sin
+    // claim email. Trade-off documentado: el agente pierde read/write_file
+    // tools en esa request cuando memory=on; aceptable para chat surfaces.
+    const userEmail = await getUserEmailFromRequest(req as unknown as ExpressRequest);
+    const swarmBody: Record<string, unknown> = {
+      messages: apiMessages,
+      preferred_agent: swarmAgentId,
+      model: swarmModel,
+      tenant_id: tenantId,
+      session_id: sessionId,
+      search_enabled: isSearchEnabled,
+      attachments: attachments,
+    };
+    if (userEmail && userEmail.length > 0) {
+      swarmBody.realm = NEURONS_REALM;
+      swarmBody.user_id = userEmail;
+      swarmBody.enable_memory = true;
+    }
+
     // THE PYTHON BRIDGE: Always call FastAPI
     // CRITICAL FIX: ALWAYS forward preferred_agent (even "shiftai") so the
     // Python backend can enforce Nodes Mode routing via [SYSTEM INSTRUCTION:].
@@ -70,15 +100,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       headers: {
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        messages: apiMessages,
-        preferred_agent: swarmAgentId,
-        model: swarmModel,
-        tenant_id: tenantId,
-        session_id: sessionId,
-        search_enabled: isSearchEnabled,
-        attachments: attachments
-      }),
+      body: JSON.stringify(swarmBody),
     });
 
     if (!swarmResponse.ok) {

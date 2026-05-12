@@ -19,6 +19,7 @@ import { DebateDashboard } from "./debate-dashboard";
 import { GATEWAY_URL } from "@/config";
 import { parseAndApplyGraphTopology } from "@/lib/graph-parser";
 import { useActiveGraphStore } from "@/store";
+import { supabase } from "@/services/supabaseClient";
 import { isV2Enabled } from "@/store";
 
 function useAutoResizeTextarea(ref: React.RefObject<HTMLTextAreaElement | null>, value: string) {
@@ -309,9 +310,19 @@ export function AnimatedAiInput({ defaultTenantId = "shift", onOpenHistory, comp
         return;
       }
 
+      // Bearer JWT: el BFF (/api/chat) lo necesita para resolver el email del
+      // user vía getUserEmailFromRequest, y propaga realm/user_id/enable_memory
+      // a /swarm/chat (Cerebro propaga internamente al LLM call con memory tool).
+      // Sin Bearer: chat sigue funcionando, simplemente sin memoria persistente.
+      const { data: { session } } = await supabase.auth.getSession();
+      const accessToken = session?.access_token;
+
       const res = await fetch(`/api/chat`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+        },
         body: JSON.stringify({
           messages: allMessages,
           preferred_agent: AGENT_INFO[effectiveAgent].id,
