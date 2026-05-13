@@ -20,10 +20,11 @@ import { memo, useCallback, useState } from 'react';
 import { NodeResizer } from '@xyflow/react';
 import {
   GripVertical, Trash2, FileText, FileType, Music,
-  ExternalLink, Maximize2, X,
+  ExternalLink, Maximize2, X, RefreshCw,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { AssetContent, NodeColor, WorkspaceNode } from '@/services/workspaceApi';
+import { reextractAsset } from '@/services/workspaceApi';
 
 const COLOR_ACCENTS: Record<NodeColor, string> = {
   default:  'border-[#1534dc]/15 dark:border-[#8b5cf6]/30',
@@ -54,6 +55,48 @@ function AssetNodeImpl({
     e.stopPropagation();
     data.onDelete(id);
   }, [data, id]);
+
+  // ── Re-index (re-run text extraction for unindexed documents) ────
+  // The "no indexado" badge becomes a button — clicking it hits the
+  // /reextract endpoint which pulls the asset back from storage and
+  // runs pdf-parse / mammoth / decode again, then patches
+  // content.extracted_text. Useful when:
+  //   - asset was uploaded before the extractor existed (legacy)
+  //   - first-pass extraction silently failed (broken PDF, transient)
+  //   - user just wants to retry
+  // Local state for in-flight + error so the badge can swap UI.
+  const [reindexing, setReindexing] = useState(false);
+  const [reindexError, setReindexError] = useState<string | null>(null);
+  const handleReindex = useCallback(async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (reindexing) return;
+    setReindexing(true);
+    setReindexError(null);
+    try {
+      const updated = await reextractAsset(data.workspaceId, id);
+      const newContent = updated.content as AssetContent | null;
+      const hasText = !!(newContent?.extracted_text && newContent.extracted_text.length > 0);
+      if (!hasText) {
+        // Extraction returned null — most likely encrypted PDF, oversize,
+        // unsupported MIME, or the underlying parser threw and was caught
+        // server-side. Surface a friendly message instead of pretending it
+        // worked.
+        setReindexError('No se pudo extraer texto. Puede ser PDF protegido, formato no soportado, o muy grande.');
+      } else {
+        // Mutate the node data in place so the badge disappears immediately
+        // (the parent will reconcile from the server on next reload). This
+        // bypasses memo bailout because aHasText !== bHasText in the memo
+        // equality check.
+        if (data.content && typeof data.content === 'object') {
+          (data.content as AssetContent).extracted_text = newContent!.extracted_text;
+        }
+      }
+    } catch (err) {
+      setReindexError((err as Error).message || 'Error indexando');
+    } finally {
+      setReindexing(false);
+    }
+  }, [data, id, reindexing]);
 
   return (
     <>
@@ -162,19 +205,39 @@ function AssetNodeImpl({
           )}
         </div>
 
-        {/* Phase 3.G — "no indexado" badge for documents/audio whose
-            extracted_text is missing or empty. The chat agent can't
-            read these assets, so we surface that the file exists on the
-            canvas but won't be searchable in conversation. */}
+        {/* "no indexado" badge → clickable button that re-runs extraction.
+            Document/audio assets whose extracted_text is empty get this
+            badge. The chat agent can't read them; clicking the badge hits
+            /reextract to retry the parser. */}
         {(data.type === 'document' || data.type === 'audio') &&
          !(content?.extracted_text && content.extracted_text.length > 0) && (
-          <div
-            className="absolute bottom-2 right-2 text-[10px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-700 dark:text-amber-300 pointer-events-none"
-            title="Este archivo no fue indexado para chat (muy grande o tipo no soportado)."
-            aria-label="Archivo no indexado para chat"
+          <button
+            type="button"
+            onClick={handleReindex}
+            disabled={reindexing}
+            className={cn(
+              'absolute bottom-2 right-2 text-[10px] px-2 py-1 rounded inline-flex items-center gap-1 transition-colors',
+              reindexError
+                ? 'bg-rose-500/15 text-rose-700 dark:text-rose-300 hover:bg-rose-500/25'
+                : 'bg-amber-500/15 text-amber-700 dark:text-amber-300 hover:bg-amber-500/25',
+              reindexing && 'opacity-60 cursor-wait',
+            )}
+            title={
+              reindexError
+                ? reindexError
+                : reindexing
+                  ? 'Indexando…'
+                  : 'Click para reintentar indexar este archivo (texto extraíble para chat).'
+            }
+            aria-label={reindexError ? `Error: ${reindexError}` : 'Reintentar indexación del archivo'}
           >
-            ⚠ no indexado
-          </div>
+            <RefreshCw
+              size={9}
+              className={cn(reindexing && 'animate-spin')}
+              aria-hidden
+            />
+            {reindexing ? 'Indexando…' : reindexError ? '⚠ falló' : '⚠ no indexado'}
+          </button>
         )}
       </div>
 

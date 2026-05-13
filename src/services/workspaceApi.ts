@@ -376,6 +376,34 @@ export async function deleteNode(workspaceId: string, nodeId: string): Promise<v
   await handleJson<{ ok: boolean }>(res);
 }
 
+/**
+ * Re-run text extraction on an already-uploaded document/audio asset.
+ *
+ * Use case: an asset uploaded before the extractor existed (or one whose
+ * first-pass extraction silently failed) shows the "no indexado" badge
+ * because `content.extracted_text` is empty. The chat agent can't read
+ * it. This endpoint pulls the object back from storage, runs the parser
+ * again (pdf-parse / mammoth / decode), and persists the resulting text.
+ * Idempotent — running it on an already-indexed asset just refreshes.
+ *
+ * Returns the updated node with `content.extracted_text` populated when
+ * extraction succeeds. If extraction yields `null` (encrypted PDF,
+ * unsupported MIME, oversize), the returned node has no `extracted_text`
+ * and the badge will stay; caller should surface the upstream error
+ * detail in that case.
+ */
+export async function reextractAsset(
+  workspaceId: string,
+  nodeId: string,
+): Promise<WorkspaceNode> {
+  const res = await fetch(
+    `/api/workspace/${workspaceId}/nodes/${nodeId}/reextract`,
+    { method: 'POST', headers: await authedHeaders() },
+  );
+  const body = await handleJson<{ ok: boolean; node: WorkspaceNode }>(res);
+  return body.node;
+}
+
 // ─── Graph persistence (modo nodos) ──────────────────────────────────
 //
 // The "modo nodos" graph state (ReactFlow nodes + edges + viewport) lives
