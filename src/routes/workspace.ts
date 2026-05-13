@@ -1912,7 +1912,16 @@ Return ONLY valid JSON matching the schema. No prose, no code fences, no preambl
       systemBlocks.push({ text: workspaceMetaBlock, cacheable: true });
     }
     if (puntoMedioRagBlock) {
-      systemBlocks.push({ text: puntoMedioRagBlock, cacheable: true });
+      // NOTE: this used to be cacheable:true, but when enable_memory:true is
+      // sent, Cerebro injects a 5th cacheable block (memory tool protocol),
+      // pushing total cache_control markers to 5 — Bedrock/Anthropic caps at
+      // 4 ("A maximum of 4 blocks with cache_control may be provided"). RAG
+      // varies per call so cache hit ratio was the lowest of the 4 anyway —
+      // dropping cacheable here is the cheapest fix that preserves memory.
+      // Order: persona / canvasReadingRules / workspaceMeta = 3 cacheable.
+      // Cerebro memory protocol = 4th cacheable (injected when memory on).
+      // puntoMedioRag + dynamicContext = uncached tail.
+      systemBlocks.push({ text: puntoMedioRagBlock, cacheable: false });
     }
     if (dynamicContext) {
       systemBlocks.push({ text: dynamicContext, cacheable: false });

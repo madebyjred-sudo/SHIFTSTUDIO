@@ -34,6 +34,7 @@ import {
 } from 'lucide-react';
 import { marked } from 'marked';
 import DOMPurify from 'dompurify';
+import TextareaAutosize from 'react-textarea-autosize';
 import { cn } from '@/lib/utils';
 import {
   streamWorkspaceTurn,
@@ -244,7 +245,8 @@ export function ChatPanel({
   const abortRef = useRef<AbortController | null>(null);
   const streamingTextRef = useRef('');
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
-  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  // textareaRef removed — TextareaAutosize owns the height now. Re-add if a
+  // future feature needs imperative focus/select on the input.
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const pendingTimers = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
 
@@ -452,13 +454,8 @@ export function ChatPanel({
     el.scrollIntoView({ behavior: streaming ? 'auto' : 'smooth', block: 'end' });
   }, [messages, streamingText, streaming]);
 
-  // ── Auto-grow textarea (max ~6 lines ≈ 144px) ─────────────────────
-  useEffect(() => {
-    const ta = textareaRef.current;
-    if (!ta) return;
-    ta.style.height = 'auto';
-    ta.style.height = `${Math.min(ta.scrollHeight, 144)}px`;
-  }, [input]);
+  // Auto-grow textarea handled by TextareaAutosize (minRows=2, maxRows=6).
+  // Previous useEffect that manually set ta.style.height is obsolete.
 
   // ── Selected hoja chip data ───────────────────────────────────────
   const selectedHoja = useMemo(() => {
@@ -743,7 +740,7 @@ export function ChatPanel({
         aria-live="polite"
         aria-atomic="false"
         aria-relevant="additions text"
-        className="flex-1 min-h-0 overflow-y-auto px-3 py-3 space-y-3"
+        className="flex-1 min-h-0 overflow-y-auto px-3 py-3 space-y-3 [scrollbar-width:thin] [scrollbar-color:rgba(0,0,0,0.18)_transparent] dark:[scrollbar-color:rgba(255,255,255,0.18)_transparent] [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-black/15 dark:[&::-webkit-scrollbar-thumb]:bg-white/15 [&::-webkit-scrollbar-track]:bg-transparent"
       >
         {messages.length === 0 && !streaming && !error && (
           <EmptyState />
@@ -791,18 +788,23 @@ export function ChatPanel({
             'focus-within:border-[#1534dc]/45 focus-within:ring-2 focus-within:ring-[#1534dc]/15 dark:focus-within:border-[#8b5cf6]/45 dark:focus-within:ring-[#8b5cf6]/20',
           )}
         >
-          <textarea
-            ref={textareaRef}
+          {/* TextareaAutosize: grows naturally between minRows and maxRows
+              without producing a browser-default scrollbar — fixes the "two
+              scrollbars" bug where the inner <textarea> would scroll inside
+              an already-scrolling messages list and render a chunky white
+              default scrollbar. */}
+          <TextareaAutosize
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
             placeholder={selectedHoja
               ? `Conversá sobre "${selectedHoja.title}" o pedí una nueva hoja…`
               : 'Conversá sobre tu workspace o pedí una nueva hoja…'}
-            rows={2}
+            minRows={2}
+            maxRows={6}
             disabled={streaming}
             aria-label="Mensaje al chat del workspace"
-            className="w-full resize-none bg-transparent px-3.5 pt-3 text-[13px] leading-relaxed text-[#0e1745] dark:text-white placeholder:text-black/30 dark:placeholder:text-white/30 focus:outline-none disabled:opacity-60 max-h-[144px]"
+            className="w-full resize-none bg-transparent px-3.5 pt-3 text-[13px] leading-relaxed text-[#0e1745] dark:text-white placeholder:text-black/30 dark:placeholder:text-white/30 focus:outline-none disabled:opacity-60"
           />
           <div className="flex items-center justify-between px-3 pb-2">
             <p className="text-[10.5px] text-[#0e1745]/35 dark:text-white/30 select-none">
