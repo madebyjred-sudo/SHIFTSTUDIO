@@ -145,6 +145,7 @@ export function GraphChatSidebar({ open, onClose }: GraphChatSidebarProps) {
     <aside
       className="shifty-graph-sidebar bg-white/95 dark:bg-[#0e1118]/95 border-l border-black/8 dark:border-white/8 shadow-2xl backdrop-blur-xl"
       data-state={open ? 'open' : 'closed'}
+      data-testid="graph-chat-sidebar"
       aria-label="Chat con Shifty para construir el grafo"
       aria-hidden={!open}
     >
@@ -245,6 +246,7 @@ export function GraphChatSidebar({ open, onClose }: GraphChatSidebarProps) {
             disabled={isThinking}
             autoFocus={open}
             aria-label="Mensaje al architect del grafo"
+            data-testid="graph-chat-input"
             className="w-full resize-none bg-transparent px-3.5 pt-3 text-[13px] leading-relaxed text-[#0e1745] dark:text-white placeholder:text-black/30 dark:placeholder:text-white/30 focus:outline-none disabled:opacity-60"
           />
           <div className="flex items-center justify-between px-3 pb-2">
@@ -256,6 +258,7 @@ export function GraphChatSidebar({ open, onClose }: GraphChatSidebarProps) {
               onClick={() => void handleSend()}
               disabled={isThinking}
               aria-label="Enviar mensaje"
+              data-testid="graph-chat-send"
               className={cn(
                 'flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-white text-[12px] font-semibold transition-colors disabled:opacity-40',
                 'bg-[#1534dc] hover:bg-[#1230c0] dark:bg-[#8b5cf6] dark:hover:bg-[#7a4cf2]',
@@ -304,7 +307,10 @@ const ArchitectBubble = memo(
 
     if (isUser) {
       return (
-        <div className="flex justify-end animate-in fade-in slide-in-from-bottom-1 duration-200">
+        <div
+          data-testid="graph-chat-message-user"
+          className="flex justify-end animate-in fade-in slide-in-from-bottom-1 duration-200"
+        >
           <div className="rounded-2xl px-4 py-3 max-w-[88%] text-[13px] leading-relaxed bg-[#1534dc] dark:bg-[#8b5cf6] text-white ml-auto shadow-sm shadow-[#1534dc]/20 dark:shadow-[#8b5cf6]/20">
             <p className="whitespace-pre-wrap">{message.content}</p>
           </div>
@@ -315,7 +321,10 @@ const ArchitectBubble = memo(
     const isGraphTurn = message.mode === 'graph';
 
     return (
-      <div className="flex flex-col items-start gap-1.5 animate-in fade-in slide-in-from-bottom-1 duration-200">
+      <div
+        data-testid="graph-chat-message-assistant"
+        className="flex flex-col items-start gap-1.5 animate-in fade-in slide-in-from-bottom-1 duration-200"
+      >
         <div className="rounded-2xl px-4 py-3 max-w-[88%] text-[13px] leading-relaxed bg-white/85 dark:bg-white/[0.06] text-[#0e1745] dark:text-white border border-black/5 dark:border-white/10">
           <div
             className="hoja-prose chat-md max-w-none"
