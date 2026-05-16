@@ -20,7 +20,12 @@ export async function login(page: Page): Promise<void> {
   await page.locator('input#password').fill(PASSWORD!);
   // Submit button — exact match avoids OAuth (GitHub/Google) sibling buttons.
   await page.getByRole('button', { name: 'Iniciar sesión', exact: true }).click();
-  await expect(page).toHaveURL(/\/workspaces(\/.*)?$/, { timeout: 15_000 });
+  // Post-login default lands on `/` (Chat home). Wait for TopDock + activate
+  // Workspace mode via the data-testid tab — App.tsx's mode-aware router
+  // then navigates to /workspaces (or /workspaces/:lastId).
+  await expect(page.getByTestId('topdock-mode-workspace')).toBeVisible({ timeout: 15_000 });
+  await page.getByTestId('topdock-mode-workspace').click();
+  await expect(page).toHaveURL(/\/workspaces(\/.*)?$/, { timeout: 10_000 });
 }
 
 /**
@@ -72,10 +77,13 @@ export async function waitForStoreExposed(page: Page): Promise<void> {
  * is visible. Handles the fact that the default mode may be 'workspace'.
  */
 export async function openModoNodos(page: Page): Promise<void> {
-  // May already be on nodos — try toggling only if the renderer isn't up.
-  const rendererVisible = await page.locator('.react-flow__renderer').isVisible().catch(() => false);
-  if (!rendererVisible) {
-    await page.getByTestId('topdock-mode-nodos').click();
-    await expect(page.locator('.react-flow__renderer')).toBeVisible({ timeout: 10_000 });
+  // Always click the Nodos tab — the renderer may be pre-mounted off-screen
+  // in Workspace mode, so visibility check can false-positive. Only skip
+  // the click if the Nodos tab is already aria-pressed.
+  const tab = page.getByTestId('topdock-mode-nodos');
+  const pressed = await tab.getAttribute('aria-pressed').catch(() => null);
+  if (pressed !== 'true') {
+    await tab.click();
   }
+  await expect(page.locator('.react-flow__renderer')).toBeVisible({ timeout: 10_000 });
 }
