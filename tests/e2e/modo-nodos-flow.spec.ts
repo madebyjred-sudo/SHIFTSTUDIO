@@ -54,9 +54,11 @@ const MOCK_EXEC = process.env.PLAYWRIGHT_MOCK_GRAPH_EXEC === 'true';
  */
 async function login(page: Page) {
   await page.goto('/');
-  await page.getByLabel(/correo|email/i).fill(EMAIL!);
-  await page.getByLabel(/contraseña|password/i).fill(PASSWORD!);
-  await page.getByRole('button', { name: /entrar|sign in/i }).click();
+  // Target inputs by id directly — getByLabel collides with "Show password"
+  // button + "Recuperar contraseña" link added to auth view.
+  await page.locator('input#email').fill(EMAIL!);
+  await page.locator('input#password').fill(PASSWORD!);
+  await page.getByRole('button', { name: 'Iniciar sesión', exact: true }).click();
   // The redirect after login goes to /workspaces by default in the new (F1)
   // app shell.
   await expect(page).toHaveURL(/\/workspaces(\/.*)?$/, { timeout: 15_000 });

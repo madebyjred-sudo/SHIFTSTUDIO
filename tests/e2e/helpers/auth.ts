@@ -14,9 +14,12 @@ const PASSWORD = process.env.E2E_TEST_PASSWORD;
  */
 export async function login(page: Page): Promise<void> {
   await page.goto('/');
-  await page.getByLabel(/correo|email/i).fill(EMAIL!);
-  await page.getByLabel(/contraseña|password/i).fill(PASSWORD!);
-  await page.getByRole('button', { name: /entrar|sign in/i }).click();
+  // Target inputs by id directly — getByLabel collides with "Show password"
+  // button and "Recuperar contraseña" link added to auth view.
+  await page.locator('input#email').fill(EMAIL!);
+  await page.locator('input#password').fill(PASSWORD!);
+  // Submit button — exact match avoids OAuth (GitHub/Google) sibling buttons.
+  await page.getByRole('button', { name: 'Iniciar sesión', exact: true }).click();
   await expect(page).toHaveURL(/\/workspaces(\/.*)?$/, { timeout: 15_000 });
 }
 

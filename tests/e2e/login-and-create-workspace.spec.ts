@@ -21,9 +21,11 @@ test.describe('E2E: login → create workspace → add hoja', () => {
   test('happy path', async ({ page }) => {
     // Step 1 — sign in
     await page.goto('/');
-    await page.getByLabel(/correo|email/i).fill(EMAIL!);
-    await page.getByLabel(/contraseña|password/i).fill(PASSWORD!);
-    await page.getByRole('button', { name: /entrar|sign in/i }).click();
+    // Target inputs by id directly — getByLabel collides with "Show password"
+    // button + "Recuperar contraseña" link added to auth view.
+    await page.locator('input#email').fill(EMAIL!);
+    await page.locator('input#password').fill(PASSWORD!);
+    await page.getByRole('button', { name: 'Iniciar sesión', exact: true }).click();
 
     // Step 2 — navigate to workspaces
     await page.getByRole('button', { name: /workspaces/i }).click();
