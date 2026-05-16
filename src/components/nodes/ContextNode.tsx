@@ -5,14 +5,17 @@ import { useActiveGraphStore } from '../../store';
 import { useConnectionDrag } from '../../lib/connection-drag-context';
 
 export function ContextNode({ id, data }: any) {
-  const [text, setText] = useState(data.text || '');
+  // Field rename: Cerebro executor reads `data.content` for context nodes.
+  // Keep `data.text` fallback for backwards-compat with graphs persisted
+  // before this rename. New writes always go to `data.content`.
+  const [text, setText] = useState(data.content ?? data.text ?? '');
   const updateNodeData = useActiveGraphStore((s) => s.updateNodeData);
   const status = data.status || 'IDLE';
 
   const handleTextChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const val = e.target.value;
     setText(val);
-    updateNodeData(id, { text: val });
+    updateNodeData(id, { content: val });
   }, [id, updateNodeData]);
 
   const ringClass = status === 'RUNNING' ? 'ring-2 ring-blue-500 ring-offset-2 dark:ring-offset-[#1A1A1A] animate-pulse duration-1000' : status === 'COMPLETED' ? 'ring-2 ring-emerald-500 ring-offset-2 dark:ring-offset-[#1A1A1A]' : '';

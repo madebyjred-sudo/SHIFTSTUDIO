@@ -32,11 +32,27 @@ export function CanvasContextMenu({ id, top, left, type, onClose }: ContextMenuP
     const newNodeId = `node_${Date.now()}`;
     
     let baseData: Record<string, any> = { label: 'Nuevo Nodo', status: 'IDLE' };
-    
+
     if (nodeType === 'specialist') {
-      baseData = { ...baseData, agent: 'Jorge - Content', prompt: '' };
+      // Defaults required by the Cerebro executor — missing any of these
+      // raises ValueError server-side. Keep in sync with SpecialistNode's
+      // own state defaults so a node created via right-click renders the
+      // same as one created via toolbar / generated graph.
+      baseData = {
+        ...baseData,
+        label: '',
+        agent: 'shiftai',
+        prompt: '',
+        model: 'anthropic/claude-sonnet-4.6',
+        max_tokens: 800,
+        temperature: 0.4,
+      };
+    } else if (nodeType === 'context') {
+      // Context nodes ship with the `content` field (Cerebro executor
+      // reads `data.content`). UI binds to the same field.
+      baseData = { ...baseData, content: '' };
     }
-    
+
     addNode({
       id: newNodeId,
       type: nodeType,
