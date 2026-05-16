@@ -4,6 +4,10 @@
   "outputDirectory": "dist",
   "rewrites": [
     { "source": "/api/neuron/(.*)", "destination": "/api/neuron" },
-    { "source": "/((?!api|assets|.*\\..*).*)", "destination": "/index.html" }
+    { "source": "/v1/graph/(.*)", "destination": "https://shift-cerebro-production.up.railway.app/v1/graph/$1" },
+    { "source": "/v1/llm/(.*)", "destination": "https://shift-cerebro-production.up.railway.app/v1/llm/$1" },
+    { "source": "/v1/neuron/(.*)", "destination": "https://shift-cerebro-production.up.railway.app/v1/neuron/$1" },
+    { "source": "/v1/chat/(.*)", "destination": "https://shift-cerebro-production.up.railway.app/v1/chat/$1" },
+    { "source": "/((?!api|assets|v1|.*\\..*).*)", "destination": "/index.html" }
   ]
 }
