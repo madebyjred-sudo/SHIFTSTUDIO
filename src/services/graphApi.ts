@@ -27,44 +27,41 @@ export interface GraphGenerateResponse {
     message?: string;
 }
 
-// Cerebro graph endpoints — namespace audit 2026-05-16:
+// Cerebro v1 namespace migration (consolidated 2026-05-16).
 //
-//   /v1/graph/execute  → live (SSE, used by graphExecutionApi.ts)
-//   /v1/graph/generate → NOT live (404). Legacy /graph/generate works.
-//   /v1/graph/resume   → NOT live (404). Legacy /graph/resume also 404
-//                        (was already broken pre-refactor — no consumers
-//                         on Cerebro side appear to wire it).
+// Legacy paths `/graph/generate` + `/graph/resume` siguen vivos como
+// fallback. Canonical paths `/v1/graph/*` agregadas en Cerebro commit
+// 9b3956d (alias delegates con schemas idénticos al legacy). Migración
+// inicial W0-S2 fue revertida en `89644fb` por 404; ahora con aliases
+// live, restauro la migration y consolido todo el namespace /v1/graph/*
+// junto con /v1/graph/execute (graphExecutionApi.ts) y el resto del
+// gateway surface (/v1/llm/invoke, /v1/neuron/*, /v1/chat/completions).
 //
-// Originally migrated to /v1/* speculatively per W0-S2 prompt. Smoke
-// revealed the v1 aliases were never deployed for generate/resume.
-// Reverted generateGraph back to legacy /graph/generate (it works).
-// resumeGraph is kept on /graph/resume for symmetry but emits a warning
-// — the route's been broken upstream for a while. When Cerebro publishes
-// /v1/graph/generate + /v1/graph/resume aliases, batch-edit both back
-// to /v1/* (issue tracked in the next neuro handoff).
+// Smoke 2026-05-16 con body `{}` → 422 (route live, validation falla).
+// Schema validation idéntica a legacy — sin cambios de body shape.
 export async function generateGraph(params: GenerateGraphRequest): Promise<GraphGenerateResponse> {
-    const res = await fetch(`${getBaseUrl()}/graph/generate`, {
+    const res = await fetch(`${getBaseUrl()}/v1/graph/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(params),
     });
 
     if (!res.ok) {
-        throw new Error(`Error en /graph/generate: ${res.status} ${res.statusText}`);
+        throw new Error(`Error en /v1/graph/generate: ${res.status} ${res.statusText}`);
     }
 
     return await res.json();
 }
 
 export async function resumeGraph(pauseId: string, decision: 'approve' | 'reject'): Promise<any> {
-    const res = await fetch(`${getBaseUrl()}/graph/resume`, {
+    const res = await fetch(`${getBaseUrl()}/v1/graph/resume`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ pause_id: pauseId, decision }),
     });
 
     if (!res.ok) {
-        throw new Error(`Error en /graph/resume: ${res.status} ${res.statusText}`);
+        throw new Error(`Error en /v1/graph/resume: ${res.status} ${res.statusText}`);
     }
 
     return await res.json();
