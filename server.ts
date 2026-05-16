@@ -6,6 +6,7 @@ import { fileURLToPath } from "url";
 import { AGENT_MAP, MODEL_MAP, isDebateRequest } from "./src/shared/constants.js";
 import { workspaceRouter, adminRouter, createNeuronProxyRouter } from "./src/routes/index.js";
 import { correlationMiddleware } from "./src/routes/workspace.js";
+import { getUserEmailFromRequest } from "./src/services/auth.js";
 import { logger } from "./src/lib/logger.js";
 
 dotenv.config();
@@ -123,6 +124,28 @@ async function startServer() {
 
       console.log(`[Express Gateway] Routing to: ${targetEndpoint}`);
 
+      // Neurons memory wiring — symmetric with the Vercel handler at
+      // `api/chat.ts` (commit 3c22f82). When the dev frontend sends a Bearer
+      // JWT, we extract the email and forward realm/user_id/enable_memory
+      // so Cerebro's /swarm/chat activates the memory tool (Cerebro
+      // 2c7cdd8 in feat/oai-compat-v2). Without a Bearer token, chat
+      // continues to work — just stateless (no per-user neurona).
+      const userEmail = await getUserEmailFromRequest(req);
+      const swarmBody: Record<string, unknown> = {
+        messages: messages,
+        preferred_agent: swarmAgentId,
+        model: swarmModel,
+        tenant_id: tenantId,
+        session_id: sessionId,
+        search_enabled: body.search_enabled || false,
+        attachments: body.attachments || [],
+      };
+      if (userEmail && userEmail.length > 0) {
+        swarmBody.realm = "shift";
+        swarmBody.user_id = userEmail;
+        swarmBody.enable_memory = true;
+      }
+
       // Proxy directly to FastAPI
       // CRITICAL FIX: ALWAYS forward preferred_agent (even "shiftai") so the
       // Python backend can enforce Nodes Mode routing via [SYSTEM INSTRUCTION:].
@@ -132,15 +155,7 @@ async function startServer() {
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          messages: messages,
-          preferred_agent: swarmAgentId,
-          model: swarmModel,
-          tenant_id: tenantId,
-          session_id: sessionId,
-          search_enabled: body.search_enabled || false,
-          attachments: body.attachments || [],
-        }),
+        body: JSON.stringify(swarmBody),
       }, 60000); // 60s max per node/chat
 
       if (!swarmResponse.ok) {

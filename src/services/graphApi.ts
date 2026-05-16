@@ -27,29 +27,36 @@ export interface GraphGenerateResponse {
     message?: string;
 }
 
+// Cerebro v1 namespace migration (2026-05-16 weekend refactor W0-S2).
+// Legacy paths `/graph/generate` + `/graph/resume` were aliases on Cerebro's
+// pre-v1 router. Canonical paths under `/v1/graph/*` align with the rest of
+// the gateway surface (`/v1/llm/invoke`, `/v1/graph/execute`, `/v1/neuron/*`,
+// `/v1/chat/completions`). Cerebro keeps the legacy aliases live for a
+// deprecation window, but new code paths should use `/v1/graph/*` to match
+// the public API contract and the feature-flag rename (`graph_execute_sse`).
 export async function generateGraph(params: GenerateGraphRequest): Promise<GraphGenerateResponse> {
-    const res = await fetch(`${getBaseUrl()}/graph/generate`, {
+    const res = await fetch(`${getBaseUrl()}/v1/graph/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(params),
     });
 
     if (!res.ok) {
-        throw new Error(`Error en /graph/generate: ${res.status} ${res.statusText}`);
+        throw new Error(`Error en /v1/graph/generate: ${res.status} ${res.statusText}`);
     }
 
     return await res.json();
 }
 
 export async function resumeGraph(pauseId: string, decision: 'approve' | 'reject'): Promise<any> {
-    const res = await fetch(`${getBaseUrl()}/graph/resume`, {
+    const res = await fetch(`${getBaseUrl()}/v1/graph/resume`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ pause_id: pauseId, decision }),
     });
 
     if (!res.ok) {
-        throw new Error(`Error en /graph/resume: ${res.status} ${res.statusText}`);
+        throw new Error(`Error en /v1/graph/resume: ${res.status} ${res.statusText}`);
     }
 
     return await res.json();
