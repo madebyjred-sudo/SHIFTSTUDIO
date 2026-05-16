@@ -84,6 +84,32 @@ type AppState = {
   // New V2 Execution concepts
   generateGraph: (userMessage: string, chatHistory: any[], tenantId: string) => Promise<{ mode: string, narrative?: string, message?: string }>;
 
+  /**
+   * Wave-D (2026-05-16): apply a freshly-architected graph onto the
+   * canvas while painting an animated diff. Each node receives a
+   * transient `data.diffState` ('added'|'removed'|'modified') that
+   * `SpecialistNode`/`ContextNode`/`ExportNode` consume to render the
+   * visual flair (green ring/scale, red fade, blue pulse). The flag is
+   * cleared after `DIFF_ANIMATION_MS` so subsequent edits don't keep
+   * pulsing forever.
+   *
+   * The diff is computed BEFORE the new graph is committed:
+   *   • added    → ids in newGraph that weren't in current.
+   *   • removed  → ids in current that aren't in newGraph (we keep them
+   *                in the rendered nodes for one animation cycle with
+   *                `diffState: 'removed'` so the fade-out is visible,
+   *                then drop them on cleanup).
+   *   • modified → id match, data object differs (shallow stringify
+   *                compare — cheap and good enough for the architect
+   *                output which is plain JSON).
+   *
+   * Layout: re-runs dagre on the merged node set so newly added nodes
+   * snap into a clean DAG instead of stacking at (0,0). Existing node
+   * positions are preserved when they already had a position so the
+   * canvas doesn't lurch around for the user.
+   */
+  applyGraphWithDiff: (newGraph: { nodes: any[]; edges: Edge[] }) => void;
+
   // SSE-driven graph execution (mirrors V1's executeGraph surface).
   // The implementation lives in the create() body below; the type is
   // declared here so consumers can read it via useActiveGraphStore.
@@ -145,6 +171,36 @@ import {
  * Cleared on graph:done, cancel, or connection error.
  */
 let activeUnsubscribe: (() => void) | null = null;
+
+/**
+ * Wave-D diff animation duration. Long enough for the eye to register
+ * the colour change, short enough that subsequent edits don't queue up
+ * a long-running pulse storm. Mirrors the CSS animation duration in
+ * `src/index.css` (`shifty-graph-diff-*` keyframes).
+ */
+const DIFF_ANIMATION_MS = 1500;
+
+/**
+ * Pending diff-cleanup timer. Module-scope so a follow-up
+ * applyGraphWithDiff call replaces the previous timer rather than
+ * scheduling parallel cleanups that would prematurely clear the new
+ * diffState before the user sees the animation.
+ */
+let diffCleanupTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * Cheap shallow equality for two node `data` objects. Used by the diff
+ * to decide if a same-id node counts as "modified". Stringify is good
+ * enough — the architect output is plain JSON and we only need to know
+ * if the visible config (agent, prompt, label, text…) changed.
+ */
+function nodeDataEqual(a: unknown, b: unknown): boolean {
+  try {
+    return JSON.stringify(a ?? {}) === JSON.stringify(b ?? {});
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Coerce an unknown raw `data.format` value into a known ExportFormat.
@@ -385,24 +441,14 @@ export const useGraphStoreV2 = create<AppState>((set, get) => ({
       });
 
       if (response.mode === 'graph' && response.graph) {
-        // Map backend nodes — apply dagre auto-layout for clean positioning
-        const rawNodes = response.graph.nodes.map((n: any) => {
-          const existing = get().nodes.find(en => en.id === n.id);
-          return {
-            ...n,
-            position: existing ? existing.position : { x: 0, y: 0 },
-          };
+        // Wave-D: route through applyGraphWithDiff so the user sees
+        // added/removed/modified animations. Legacy plain-set kept for
+        // reference in git history; the diff path is strictly additive
+        // (it still calls takeSnapshot for undo support).
+        get().applyGraphWithDiff({
+          nodes: response.graph.nodes,
+          edges: response.graph.edges as Edge[],
         });
-        
-        // Auto-layout with dagre (top-down DAG)
-        const { nodes: layoutedNodes } = getLayoutedElements(
-          rawNodes,
-          response.graph.edges,
-          'TB',
-        );
-        
-        get().takeSnapshot();
-        set({ nodes: layoutedNodes, edges: response.graph.edges });
       }
 
       return response;
@@ -410,6 +456,114 @@ export const useGraphStoreV2 = create<AppState>((set, get) => ({
       console.error("Error generating graph:", e);
       throw e;
     }
+  },
+
+  applyGraphWithDiff: (newGraph) => {
+    const current = get();
+    const prevNodes = current.nodes;
+    const prevEdges = current.edges;
+
+    const prevById = new Map(prevNodes.map((n) => [n.id, n]));
+    const nextById = new Map((newGraph.nodes as AppNode[]).map((n) => [n.id, n]));
+
+    // ─── Build the merged node set with diffState markers ───────────
+    //
+    // Pass 1: new + retained nodes carry forward their previous
+    // position when known so the canvas doesn't jump on a partial
+    // update (the architect doesn't include positions). Newly added
+    // nodes get a placeholder (0,0) — dagre below assigns the real
+    // coordinates.
+    const mergedRaw: AppNode[] = newGraph.nodes.map((n: any) => {
+      const prev = prevById.get(n.id);
+      const isNew = !prev;
+      const isModified = !isNew && !nodeDataEqual(prev?.data, n.data);
+      const diffState = isNew ? 'added' : isModified ? 'modified' : null;
+      return {
+        ...n,
+        position: prev?.position ?? { x: 0, y: 0 },
+        data: { ...(n.data ?? {}), diffState },
+      } as AppNode;
+    });
+
+    // Pass 2: removed nodes — keep them on the canvas one animation
+    // cycle so the fade-out is visible, then strip them on cleanup.
+    // We mark them with diffState='removed' and tag a transient
+    // `__pendingRemoval` flag so the cleanup pass knows to drop them.
+    const removedNodes: AppNode[] = prevNodes
+      .filter((n) => !nextById.has(n.id))
+      .map((n) => ({
+        ...n,
+        data: { ...(n.data ?? {}), diffState: 'removed', __pendingRemoval: true },
+      }));
+
+    const merged = [...mergedRaw, ...removedNodes];
+
+    // Re-layout dagre on the survivors (skip removed nodes from the
+    // layout pass so they fade in place rather than being relayouted
+    // mid-animation).
+    const survivors = merged.filter(
+      (n) => !((n.data as { __pendingRemoval?: boolean })?.__pendingRemoval),
+    );
+    let layoutedSurvivors: AppNode[] = survivors;
+    try {
+      const { nodes: laid } = getLayoutedElements(
+        survivors,
+        newGraph.edges,
+        'TB',
+      );
+      // dagre returns the same array shape — but the positions of
+      // already-positioned nodes might shift slightly. Preserve the
+      // PREVIOUS position for any node that already had one so the
+      // canvas doesn't lurch; only newly-added nodes get fresh
+      // coordinates.
+      layoutedSurvivors = laid.map((n) => {
+        const prev = prevById.get(n.id);
+        const isNew = !prev;
+        return isNew ? n : { ...n, position: prev?.position ?? n.position };
+      });
+    } catch (e) {
+      console.warn('[applyGraphWithDiff] dagre layout failed:', e);
+    }
+
+    const finalNodes: AppNode[] = [
+      ...layoutedSurvivors,
+      ...merged.filter(
+        (n) => (n.data as { __pendingRemoval?: boolean })?.__pendingRemoval,
+      ),
+    ];
+
+    // Take a snapshot BEFORE applying so undo restores the pre-diff
+    // state in one step (the user can ctrl-z the entire architect
+    // turn).
+    current.takeSnapshot();
+    set({ nodes: finalNodes, edges: newGraph.edges });
+
+    // Schedule cleanup — clear diffState on survivors + actually
+    // remove pendingRemoval nodes. Overwrite any prior timer so
+    // back-to-back applyGraphWithDiff calls don't trip each other.
+    if (diffCleanupTimer) {
+      clearTimeout(diffCleanupTimer);
+      diffCleanupTimer = null;
+    }
+    diffCleanupTimer = setTimeout(() => {
+      diffCleanupTimer = null;
+      set((state) => ({
+        nodes: state.nodes
+          .filter(
+            (n) =>
+              !((n.data as { __pendingRemoval?: boolean })?.__pendingRemoval),
+          )
+          .map((n) => {
+            const data = n.data as { diffState?: unknown } | undefined;
+            if (!data || !data.diffState) return n;
+            const { diffState: _drop, ...rest } = data as Record<
+              string,
+              unknown
+            >;
+            return { ...n, data: rest };
+          }),
+      }));
+    }, DIFF_ANIMATION_MS);
   },
 
   /**

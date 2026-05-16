@@ -13,7 +13,7 @@ import {
   type OnConnectStart,
   type OnConnectEnd,
 } from '@xyflow/react';
-import { Play, Square, LayoutGrid, Loader2, Check, AlertCircle, CloudOff } from 'lucide-react';
+import { Play, Square, LayoutGrid, Loader2, Check, AlertCircle, CloudOff, MessageSquare } from 'lucide-react';
 import '@xyflow/react/dist/style.css';
 import { useActiveGraphStore } from '../store';
 import { useGraphStoreV2 } from '../store/useGraphStoreV2';
@@ -21,6 +21,8 @@ import { AgentStepper } from './AgentStepper';
 import { ContextNode } from './nodes/ContextNode';
 import { SpecialistNode } from './nodes/SpecialistNode';
 import { ExportNode } from './nodes/ExportNode';
+import { GraphChatSidebar } from './nodes/GraphChatSidebar';
+import { GraphCommandBar, type GraphCommandBarHandle } from './nodes/GraphCommandBar';
 import { AnimatedEdge } from './edges/AnimatedEdge';
 import { HITLModal } from './HITLModal';
 import { CanvasContextMenu } from './CanvasContextMenu';
@@ -120,6 +122,10 @@ function ShiftyNodeCanvasInner() {
   } = useActiveGraphStore();
   const [menu, setMenu] = useState<{ id: string | null; top: number; left: number; type: 'pane' | 'node' | 'edge' } | null>(null);
   const [showShareModal, setShowShareModal] = useState(false);
+  // Wave-D: chat sidebar visibility + command bar focus handle. Both
+  // surfaces share `useGraphArchitectChat` state via localStorage scope.
+  const [chatSidebarOpen, setChatSidebarOpen] = useState(false);
+  const commandBarRef = useRef<GraphCommandBarHandle | null>(null);
   const { fitView, getViewport, setViewport } = useReactFlow();
 
   // Workspace id is set by `WorkspaceCanvasPage` on mount via the V2
@@ -234,11 +240,29 @@ function ShiftyNodeCanvasInner() {
     const viewport = safeViewport(getViewport());
     lastViewportRef.current = viewport;
 
+    // Wave-D: strip transient diff-animation flags before persisting.
+    // `diffState` + `__pendingRemoval` are set by `applyGraphWithDiff`
+    // and cleared after the animation. Persisting them would replay the
+    // animation on the next hydration (or worse — leak pendingRemoval
+    // ghosts onto the canvas). Skip pendingRemoval nodes entirely so a
+    // save that races the cleanup doesn't ship deleted nodes.
+    const sanitizedNodes = stateNow.nodes
+      .filter((n) => {
+        const data = n.data as { __pendingRemoval?: boolean } | undefined;
+        return !data?.__pendingRemoval;
+      })
+      .map((n) => {
+        const data = (n.data ?? {}) as Record<string, unknown>;
+        if (!('diffState' in data) && !('__pendingRemoval' in data)) return n;
+        const { diffState: _d, __pendingRemoval: _p, ...rest } = data;
+        return { ...n, data: rest };
+      });
+
     try {
       const result = await saveGraph(
         workspaceId,
         {
-          nodes: stateNow.nodes as unknown as Record<string, unknown>[],
+          nodes: sanitizedNodes as unknown as Record<string, unknown>[],
           edges: stateNow.edges as unknown as Record<string, unknown>[],
           viewport,
         },
@@ -356,11 +380,28 @@ function ShiftyNodeCanvasInner() {
     };
   }, []);
 
-  // Keyboard shortcuts (Ctrl+Z / Cmd+Z)
+  // Keyboard shortcuts (Ctrl+Z / Cmd+Z + Wave-D Cmd+K / Cmd+/)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Ignore if typing in input
-      if (document.activeElement?.tagName === 'INPUT' || document.activeElement?.tagName === 'TEXTAREA') return;
+      const inEditable =
+        document.activeElement?.tagName === 'INPUT' ||
+        document.activeElement?.tagName === 'TEXTAREA';
+
+      // Wave-D shortcuts work even when an input is focused (so the
+      // user can refocus the command bar from anywhere). Undo/redo
+      // continue to ignore inputs to avoid clobbering text edits.
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        commandBarRef.current?.focus();
+        return;
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key === '/') {
+        e.preventDefault();
+        setChatSidebarOpen((prev) => !prev);
+        return;
+      }
+
+      if (inEditable) return;
 
       if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
         e.preventDefault();
@@ -554,11 +595,18 @@ function ShiftyNodeCanvasInner() {
 
   // xyflow puts the className from `node.className` on the wrapper div.
   // We synthesize that here without mutating the store — pure derived.
+  // Two channels feed into the className:
+  //   • shake (F2) — added when a failed-drop animation needs to play.
+  //   • diff   (Wave-D) — added/modified/removed flair on architect turns.
   const flowNodes = useMemo(() => {
-    if (!shakeKey) return nodes;
-    return nodes.map(n => n.id === shakeKey.nodeId
-      ? { ...n, className: [n.className, 'shifty-connection-shake'].filter(Boolean).join(' ') }
-      : n);
+    return nodes.map((n) => {
+      const data = n.data as { diffState?: 'added' | 'modified' | 'removed' } | undefined;
+      const diffClass = data?.diffState ? `shifty-diff-${data.diffState}` : null;
+      const shakeClass = shakeKey?.nodeId === n.id ? 'shifty-connection-shake' : null;
+      if (!diffClass && !shakeClass) return n;
+      const merged = [n.className, diffClass, shakeClass].filter(Boolean).join(' ');
+      return { ...n, className: merged };
+    });
   }, [nodes, shakeKey]);
 
   // Cleanup persistent tooltip on unmount.
@@ -662,6 +710,26 @@ function ShiftyNodeCanvasInner() {
 
           <Panel position="top-right" className="m-4">
             <div className="flex items-center gap-3">
+              {/* Wave-D: open the conversational graph builder. The
+                  button is always present so even an empty canvas can
+                  bootstrap a graph via Shifty. */}
+              <button
+                type="button"
+                onClick={() => setChatSidebarOpen((prev) => !prev)}
+                title="Chat con Shifty (Cmd+/)"
+                aria-label="Abrir chat con Shifty"
+                aria-pressed={chatSidebarOpen}
+                data-testid="graph-chat-toggle"
+                className={`flex items-center gap-2 min-h-9 px-4 py-2 text-[12px] font-bold rounded-xl shadow-lg border-2 transition-all backdrop-blur-md ${
+                  chatSidebarOpen
+                    ? 'bg-[#1534dc] text-white border-[#1230c0] dark:bg-[#8b5cf6] dark:border-[#7a4cf2]'
+                    : 'bg-white dark:bg-black/50 text-gray-700 dark:text-white border-gray-200 dark:border-white/10 hover:border-indigo-500 dark:hover:border-indigo-500'
+                }`}
+              >
+                <MessageSquare className="w-3.5 h-3.5" />
+                CHAT
+              </button>
+
               {nodes.length > 0 && (
                 <button
                   onClick={handleRelayout}
@@ -708,6 +776,18 @@ function ShiftyNodeCanvasInner() {
           </Panel>
         </ReactFlow>
         <TimeTravelTimeline />
+
+        {/* Wave-D: conversational graph builder surfaces. Both live
+            inside the canvas container so they layer above the
+            ReactFlow viewport but below modals. */}
+        <GraphCommandBar
+          ref={commandBarRef}
+          onRequestOpenSidebar={() => setChatSidebarOpen(true)}
+        />
+        <GraphChatSidebar
+          open={chatSidebarOpen}
+          onClose={() => setChatSidebarOpen(false)}
+        />
       </div>
 
       <ShareWorkflowModal isOpen={showShareModal} onClose={() => setShowShareModal(false)} />
