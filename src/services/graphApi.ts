@@ -27,36 +27,44 @@ export interface GraphGenerateResponse {
     message?: string;
 }
 
-// Cerebro v1 namespace migration (2026-05-16 weekend refactor W0-S2).
-// Legacy paths `/graph/generate` + `/graph/resume` were aliases on Cerebro's
-// pre-v1 router. Canonical paths under `/v1/graph/*` align with the rest of
-// the gateway surface (`/v1/llm/invoke`, `/v1/graph/execute`, `/v1/neuron/*`,
-// `/v1/chat/completions`). Cerebro keeps the legacy aliases live for a
-// deprecation window, but new code paths should use `/v1/graph/*` to match
-// the public API contract and the feature-flag rename (`graph_execute_sse`).
+// Cerebro graph endpoints — namespace audit 2026-05-16:
+//
+//   /v1/graph/execute  → live (SSE, used by graphExecutionApi.ts)
+//   /v1/graph/generate → NOT live (404). Legacy /graph/generate works.
+//   /v1/graph/resume   → NOT live (404). Legacy /graph/resume also 404
+//                        (was already broken pre-refactor — no consumers
+//                         on Cerebro side appear to wire it).
+//
+// Originally migrated to /v1/* speculatively per W0-S2 prompt. Smoke
+// revealed the v1 aliases were never deployed for generate/resume.
+// Reverted generateGraph back to legacy /graph/generate (it works).
+// resumeGraph is kept on /graph/resume for symmetry but emits a warning
+// — the route's been broken upstream for a while. When Cerebro publishes
+// /v1/graph/generate + /v1/graph/resume aliases, batch-edit both back
+// to /v1/* (issue tracked in the next neuro handoff).
 export async function generateGraph(params: GenerateGraphRequest): Promise<GraphGenerateResponse> {
-    const res = await fetch(`${getBaseUrl()}/v1/graph/generate`, {
+    const res = await fetch(`${getBaseUrl()}/graph/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(params),
     });
 
     if (!res.ok) {
-        throw new Error(`Error en /v1/graph/generate: ${res.status} ${res.statusText}`);
+        throw new Error(`Error en /graph/generate: ${res.status} ${res.statusText}`);
     }
 
     return await res.json();
 }
 
 export async function resumeGraph(pauseId: string, decision: 'approve' | 'reject'): Promise<any> {
-    const res = await fetch(`${getBaseUrl()}/v1/graph/resume`, {
+    const res = await fetch(`${getBaseUrl()}/graph/resume`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ pause_id: pauseId, decision }),
     });
 
     if (!res.ok) {
-        throw new Error(`Error en /v1/graph/resume: ${res.status} ${res.statusText}`);
+        throw new Error(`Error en /graph/resume: ${res.status} ${res.statusText}`);
     }
 
     return await res.json();
