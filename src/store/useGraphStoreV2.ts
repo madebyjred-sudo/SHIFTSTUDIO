@@ -187,12 +187,15 @@ function buildSectionsForExportNode(
     if (!pred) continue;
     const data = (pred.data ?? {}) as Record<string, unknown>;
     // Specialist nodes carry their LLM output in `outputText`; context
-    // nodes carry the user-typed brief in `text`. Fallback to label/title
-    // when neither is set so an empty branch still surfaces a heading
-    // (the server rejects empty-string content with a 400).
+    // nodes carry the user-typed brief in `content` (legacy graphs stored
+    // it as `text` — keep that fallback so older saved graphs still
+    // export). Order: outputText → content → text. The server rejects
+    // empty-string content with a 400, so we skip branches without any.
     let content = '';
     if (typeof data.outputText === 'string' && data.outputText.trim()) {
       content = data.outputText;
+    } else if (typeof data.content === 'string' && data.content.trim()) {
+      content = data.content;
     } else if (typeof data.text === 'string' && data.text.trim()) {
       content = data.text;
     }
