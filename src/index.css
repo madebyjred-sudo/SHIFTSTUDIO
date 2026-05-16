@@ -602,3 +602,94 @@ button {
     border-color: color-mix(in srgb, var(--color-shift-status-running) 70%, black 30%);
 }
 .hoja-prose.chat-md > *:last-child { margin-bottom: 0; }
+
+/* ─── Wave-D: graph diff animations ─────────────────────────────────────
+   When the architect ships a new/edited graph through
+   `applyGraphWithDiff`, each node gets a transient `data.diffState`
+   flag that the node components forward to the wrapper as
+   `data-diff-state`. We paint:
+     • added    → emerald ring + scale 1.05 → 1, 1s
+     • modified → indigo pulse ring, 1s
+     • removed  → opacity fade-out 0.5s before unmount
+   The keyframes timings match `DIFF_ANIMATION_MS` (1500ms) in the
+   store so cleanup runs after the longest animation has finished.
+   Respects prefers-reduced-motion by collapsing to a static colour
+   nudge with no transform. */
+@keyframes shifty-diff-added {
+    0%   { transform: scale(1.05); box-shadow: 0 0 0 4px color-mix(in srgb, var(--color-shift-status-completed) 70%, transparent); }
+    60%  { transform: scale(1.02); box-shadow: 0 0 0 6px color-mix(in srgb, var(--color-shift-status-completed) 50%, transparent); }
+    100% { transform: scale(1);    box-shadow: 0 0 0 0   color-mix(in srgb, var(--color-shift-status-completed) 0%, transparent); }
+}
+
+@keyframes shifty-diff-modified {
+    0%   { box-shadow: 0 0 0 0   color-mix(in srgb, var(--color-shift-status-running) 0%, transparent); }
+    35%  { box-shadow: 0 0 0 6px color-mix(in srgb, var(--color-shift-status-running) 55%, transparent); }
+    70%  { box-shadow: 0 0 0 4px color-mix(in srgb, var(--color-shift-status-running) 35%, transparent); }
+    100% { box-shadow: 0 0 0 0   color-mix(in srgb, var(--color-shift-status-running) 0%, transparent); }
+}
+
+@keyframes shifty-diff-removed {
+    0%   { opacity: 1; transform: scale(1); }
+    100% { opacity: 0; transform: scale(0.92); }
+}
+
+.shifty-diff-added {
+    animation: shifty-diff-added 1000ms ease-out;
+    border-radius: 12px;
+}
+.shifty-diff-modified {
+    animation: shifty-diff-modified 1000ms ease-out;
+    border-radius: 12px;
+}
+.shifty-diff-removed {
+    animation: shifty-diff-removed 500ms ease-in forwards;
+    pointer-events: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .shifty-diff-added,
+    .shifty-diff-modified,
+    .shifty-diff-removed {
+        animation: none;
+    }
+    .shifty-diff-added {
+        outline: 2px solid var(--color-shift-status-completed);
+        outline-offset: 2px;
+    }
+    .shifty-diff-modified {
+        outline: 2px solid var(--color-shift-status-running);
+        outline-offset: 2px;
+    }
+    .shifty-diff-removed {
+        opacity: 0.4;
+    }
+}
+
+/* ─── Wave-D: graph chat sidebar ────────────────────────────────────── */
+.shifty-graph-sidebar {
+    position: absolute;
+    top: 0;
+    right: 0;
+    height: 100%;
+    width: 360px;
+    max-width: 92vw;
+    z-index: 30;
+    display: flex;
+    flex-direction: column;
+    transition: transform 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+    pointer-events: auto;
+}
+.shifty-graph-sidebar[data-state="closed"] {
+    transform: translateX(calc(100% + 16px));
+    pointer-events: none;
+}
+
+/* ─── Wave-D: in-canvas command bar ─────────────────────────────────── */
+.shifty-graph-command-bar {
+    position: absolute;
+    left: 50%;
+    bottom: 24px;
+    transform: translateX(-50%);
+    width: min(480px, calc(100vw - 48px));
+    z-index: 25;
+}
