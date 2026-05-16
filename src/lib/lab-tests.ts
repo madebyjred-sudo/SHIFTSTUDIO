@@ -91,8 +91,8 @@ if (typeof window !== 'undefined') {
         // Wait for React to hydrate, then load & optionally run
         setTimeout(() => {
             console.log(`🧪 AUTO-LOAD: Detectado ?lab=${labCase}`);
-            // Switch to canvas mode
-            useActiveGraphStore.getState().setActiveMode('canvas');
+            // Switch to nodos mode (legacy 'canvas' renamed 2026-05-16)
+            useActiveGraphStore.getState().setActiveMode('nodos');
             loadLabTest(labCase as any);
 
             if (params.get('autorun') === 'true') {

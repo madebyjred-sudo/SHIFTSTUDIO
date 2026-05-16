@@ -36,33 +36,53 @@ export function TopDock({ onOpenHistory, onToggleHistory, isHistoryOpen, onOpenN
           </div>
         </div>
 
-        {/* Workspace toggle */}
+        {/* Workspace toggle — 3 modos (Chat | Workspace | Nodos). Selected
+            state usa el mismo solid `bg-white dark:bg-white/10 shadow-sm`
+            para los tres botones; sin gradients. Routing y navigation viven
+            en App.tsx (useEffect que reacciona a activeMode). */}
         <div className="flex items-center gap-0.5 rounded-xl p-1 bg-black/5 dark:bg-white/5 border border-black/5 dark:border-white/10">
           <button
+            data-testid="topdock-mode-chat"
             className={cn(
-              "h-9 px-4 rounded-lg text-xs font-semibold transition-all",
+              "h-9 px-4 rounded-lg text-xs font-semibold transition-colors",
               activeMode === 'chat'
                 ? "bg-white dark:bg-white/10 shadow-sm text-[#0e1745] dark:text-white"
                 : "text-[#0e1745]/55 dark:text-white/55 hover:text-[#0e1745] dark:hover:text-white"
             )}
             onClick={() => setActiveMode('chat')}
-            aria-label="Cambiar a modo chat"
+            aria-label="Modo chat"
+            aria-pressed={activeMode === 'chat'}
           >
             Chat
           </button>
           <button
-            data-testid="topdock-mode-nodes"
+            data-testid="topdock-mode-workspace"
             className={cn(
-              "h-9 px-4 rounded-lg text-xs font-semibold transition-all flex items-center gap-1.5",
-              activeMode === 'canvas'
-                ? "bg-gradient-to-r from-indigo-500 to-purple-600 text-white shadow-sm"
+              "h-9 px-4 rounded-lg text-xs font-semibold transition-colors",
+              activeMode === 'workspace'
+                ? "bg-white dark:bg-white/10 shadow-sm text-[#0e1745] dark:text-white"
                 : "text-[#0e1745]/55 dark:text-white/55 hover:text-[#0e1745] dark:hover:text-white"
             )}
-            onClick={() => setActiveMode('canvas')}
-            aria-label="Cambiar a modo nodos"
+            onClick={() => setActiveMode('workspace')}
+            aria-label="Modo workspace (hojas)"
+            aria-pressed={activeMode === 'workspace'}
+          >
+            Workspace
+          </button>
+          <button
+            data-testid="topdock-mode-nodos"
+            className={cn(
+              "h-9 px-4 rounded-lg text-xs font-semibold transition-colors flex items-center gap-1.5",
+              activeMode === 'nodos'
+                ? "bg-white dark:bg-white/10 shadow-sm text-[#0e1745] dark:text-white"
+                : "text-[#0e1745]/55 dark:text-white/55 hover:text-[#0e1745] dark:hover:text-white"
+            )}
+            onClick={() => setActiveMode('nodos')}
+            aria-label="Modo nodos (grafo)"
+            aria-pressed={activeMode === 'nodos'}
           >
             <Layers className="w-3.5 h-3.5" />
-            Nodes
+            Nodos
           </button>
         </div>
 

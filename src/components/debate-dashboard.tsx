@@ -375,7 +375,7 @@ export function DebateDashboard({ isOpen, onClose }: DebateDashboardProps) {
                   </button>
                 )}
                 {result && !isDebating && (
-                  <button onClick={handleUseConclusion} className="px-6 py-2.5 rounded-xl text-sm font-bold bg-gradient-to-r from-emerald-500 to-teal-500 text-white shadow-[0_0_20px_rgba(16,185,129,0.3)] transition-all flex items-center gap-2">
+                  <button onClick={handleUseConclusion} className="px-6 py-2.5 rounded-xl text-sm font-bold bg-emerald-500 hover:bg-emerald-600 text-white shadow-md transition-colors flex items-center gap-2">
                     <MessageSquarePlus className="w-4 h-4" /> Usar Veredicto en Chat
                   </button>
                 )}

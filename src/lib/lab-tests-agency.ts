@@ -256,7 +256,7 @@ export async function loadAndRunAgencyTest(
 
     store.setNodes(testCase.nodes);
     store.setEdges(testCase.edges);
-    store.setActiveMode('canvas');
+    store.setActiveMode('nodos');
 
     await new Promise(r => setTimeout(r, 500));
 

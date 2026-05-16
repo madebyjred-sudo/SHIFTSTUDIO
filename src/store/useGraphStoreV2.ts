@@ -53,8 +53,15 @@ type AppState = {
   setNodes: (nodes: AppNode[]) => void;
   setEdges: (edges: Edge[]) => void;
 
-  activeMode: 'chat' | 'canvas';
-  setActiveMode: (mode: 'chat' | 'canvas') => void;
+  // Tri-state global nav mode. `'canvas'` (legacy) was split into
+  // `'workspace'` (hojas-mode inside a workspace) and `'nodos'` (graph
+  // builder) when the top-dock collapsed Chat|Nodes into Chat|Workspace|
+  // Nodos (2026-05-16). Routing in App.tsx maps modes → URLs:
+  //   • 'chat'      → /  (root chat layout)
+  //   • 'workspace' → /workspaces or /workspaces/:lastId in hojas mode
+  //   • 'nodos'     → /workspaces/:lastId in nodos mode
+  activeMode: 'chat' | 'workspace' | 'nodos';
+  setActiveMode: (mode: 'chat' | 'workspace' | 'nodos') => void;
 
   // Wave C: workspace association for the modo nodos export pipeline.
   // The active workspace id is set by `WorkspaceCanvasPage` on mount and

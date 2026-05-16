@@ -24,10 +24,11 @@ const ShiftAIEmbed = lazy(() =>
 const AdminDashboard = lazy(() => import("./components/admin/AdminDashboard"));
 // F1 (2026-05-10): the root-level "canvas" mode (no workspace bound) was
 // only ever an exploration surface — the V2 graph store can't autosave
-// without a workspaceId. Modo nodos now lives INSIDE a workspace via the
-// Hojas/Nodos toggle in WorkspaceCanvasPage. Setting `activeMode='canvas'`
-// at the root-level redirects to `/workspaces` so the user lands somewhere
-// the graph actually persists. We no longer import ShiftyNodeCanvas here.
+// without a workspaceId. Modo nodos now lives INSIDE a workspace, and
+// the unified top-nav (2026-05-16) collapsed the dual "TopDock Chat|Nodes
+// + in-page Hojas|Nodos tabs" UX into a single Chat|Workspace|Nodos
+// segmented control. Routing happens in this file (useEffect reacts to
+// activeMode + currentPath and calls navigate()).
 import { useActiveGraphStore } from "./store";
 import { useAuthStore } from "./store/useAuthStore";
 import { supabase } from "./services/supabaseClient";
@@ -167,19 +168,99 @@ export default function App() {
     return () => window.removeEventListener('workspace:unauthorized', handler);
   }, [bypassAuth]);
 
-  // F1 (2026-05-10): the root-level "canvas" mode is gone. The TopDock
-  // toggle still flips activeMode (kept for backwards-compat with the
-  // existing TopDock UI), but at the root path we redirect into the
-  // workspaces list and reset the mode so the user lands somewhere modo
-  // nodos can actually persist (workspace-scoped, via the Hojas/Nodos
-  // tabs inside WorkspaceCanvasPage). Workspace pages own their own
-  // pageMode and ignore activeMode entirely, so this never fires there.
+  // URL → activeMode sync: when the user lands directly on a workspace
+  // URL (deep-link, refresh, browser back/forward), the global
+  // `activeMode` may not match. Promote/demote so the segmented control
+  // reflects the rendered surface:
+  //   • on /workspaces/:id   — preserve 'nodos' or default to 'workspace'
+  //   • on /workspaces (list)— always 'workspace' (the list can't render
+  //                            the graph builder)
+  //   • on /                  — always 'chat'
   useEffect(() => {
-    if (activeMode !== 'canvas') return;
-    if (currentPath.startsWith('/workspaces')) return;
-    if (currentPath.startsWith('/admin')) return;
-    setActiveMode('chat');
-    navigate('/workspaces');
+    if (matchWorkspaceId(currentPath)) {
+      if (activeMode === 'chat') setActiveMode('workspace');
+    } else if (isWorkspacesList(currentPath)) {
+      // The list page has no canvas; if mode is still 'nodos' from a
+      // prior canvas page, demote so the segmented control reads
+      // 'Workspace' (matches the rendered list).
+      if (activeMode !== 'workspace') setActiveMode('workspace');
+    } else if (currentPath === '/' && activeMode !== 'chat') {
+      // Root path but mode says non-chat — likely a manual URL edit.
+      // Snap back to chat so the segmented control matches the rendered
+      // chat-only layout.
+      setActiveMode('chat');
+    }
+    // Run on URL changes; activeMode changes are handled in the
+    // navigation effect below.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentPath]);
+
+  // Unified top-nav routing (2026-05-16): the global `activeMode` drives
+  // both render output AND URL navigation. Three modes:
+  //   • 'chat'      → root chat layout at `/`
+  //   • 'workspace' → /workspaces (list) or /workspaces/:lastId (hojas)
+  //   • 'nodos'     → /workspaces/:lastId (graph builder)
+  //
+  // We remember the last-visited workspace id in localStorage so users
+  // who click "Workspace" or "Nodos" from chat-mode land on the workspace
+  // they were last editing instead of bouncing through the list. If
+  // there's no last id, Workspace falls back to /workspaces and Nodos
+  // falls back to /workspaces (the list itself surfaces a "no workspaces"
+  // empty state).
+  useEffect(() => {
+    if (currentPath.startsWith('/admin')) return; // admin owns its own routing
+    const workspaceIdOnPath = matchWorkspaceId(currentPath);
+    if (workspaceIdOnPath) {
+      // Cache the id so other modes know where to deep-link back to.
+      try {
+        window.localStorage.setItem('studio-last-workspace-id', workspaceIdOnPath);
+      } catch {
+        /* quota / disabled — non-fatal */
+      }
+    }
+
+    const lastWorkspaceId = (() => {
+      try {
+        return window.localStorage.getItem('studio-last-workspace-id');
+      } catch {
+        return null;
+      }
+    })();
+
+    if (activeMode === 'chat') {
+      // Anywhere outside `/` → bounce home so the user sees the chat
+      // layout. Workspace pages don't render at `/`, so this is safe.
+      if (currentPath !== '/') navigate('/');
+      return;
+    }
+
+    if (activeMode === 'workspace') {
+      // No workspace on path → either deep-link to last, or go to list.
+      if (!currentPath.startsWith('/workspaces')) {
+        if (lastWorkspaceId) navigate(`/workspaces/${lastWorkspaceId}`);
+        else navigate('/workspaces');
+      }
+      // Already on /workspaces or /workspaces/:id — page itself handles
+      // hojas-as-default. No further action.
+      return;
+    }
+
+    if (activeMode === 'nodos') {
+      // Need a workspace to render the graph. From the chat layout or
+      // the workspaces LIST, deep-link to last workspace; if none,
+      // demote back to 'workspace' so the list is the safe landing.
+      const onWorkspaceCanvas = matchWorkspaceId(currentPath) !== null;
+      if (!onWorkspaceCanvas) {
+        if (lastWorkspaceId) navigate(`/workspaces/${lastWorkspaceId}`);
+        else setActiveMode('workspace');
+      }
+      // Already on /workspaces/:id — WorkspaceCanvasPage reads activeMode
+      // and renders ShiftyNodeCanvas directly when mode === 'nodos'.
+      return;
+    }
+    // exhaustiveness placeholder — `activeMode` is the tri-state union
+    // and TypeScript will catch any new variants here at compile time.
+    void (activeMode satisfies never);
   }, [activeMode, currentPath, setActiveMode]);
 
   useEffect(() => {
@@ -305,11 +386,12 @@ export default function App() {
     );
   }
 
-  // F1 (2026-05-10): the root-level layout is now chat-only. If the
-  // user clicks "Nodes" in TopDock the redirect-effect above hands them
-  // off to /workspaces; we render a brief loading-style fallback while
-  // the navigation flushes so we don't flash the chat layout.
-  if (activeMode === 'canvas') {
+  // Unified top-nav (2026-05-16): root path is chat-only. If the user
+  // clicks Workspace/Nodos from chat-mode, the redirect-effect above
+  // hands them off to /workspaces (or /workspaces/:lastId); we render a
+  // brief loading-style fallback while the navigation flushes so we
+  // don't flash the chat layout under the new URL.
+  if (activeMode !== 'chat') {
     return <WorkspaceRouteFallback />;
   }
 

@@ -969,8 +969,8 @@ function NewNoteModal({
             disabled={!canSubmit}
             className={cn(
               'h-8 px-3 rounded-md text-[11.5px] font-semibold inline-flex items-center gap-1.5',
-              'bg-gradient-to-r from-indigo-500 to-purple-600 text-white',
-              'hover:from-indigo-600 hover:to-purple-700 transition-colors',
+              'bg-[#1534dc] dark:bg-[#8b5cf6] text-white',
+              'hover:bg-[#1230c0] dark:hover:bg-[#7a4cf2] transition-colors',
               'disabled:opacity-40 disabled:cursor-not-allowed',
             )}
           >
@@ -1286,7 +1286,7 @@ export function NeuronPanel({ open, onClose, onReopenOnboarding }: Props) {
             <div className="px-5 pt-4 pb-3 border-b border-black/5 dark:border-white/5 shrink-0">
               <div className="flex items-start justify-between gap-3">
                 <div className="flex items-start gap-3 min-w-0">
-                  <div className="h-8 w-8 rounded-lg bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center shadow-sm shrink-0 mt-0.5">
+                  <div className="h-8 w-8 rounded-lg bg-[#1534dc] dark:bg-[#8b5cf6] flex items-center justify-center shadow-sm shrink-0 mt-0.5">
                     <Brain className="w-4 h-4 text-white" aria-hidden />
                   </div>
                   <div className="min-w-0">
@@ -1326,10 +1326,10 @@ export function NeuronPanel({ open, onClose, onReopenOnboarding }: Props) {
                       disabled={saving || deleting}
                       className={cn(
                         'h-8 px-3 rounded-md text-[11.5px] font-semibold inline-flex items-center gap-1.5',
-                        'bg-gradient-to-r from-indigo-500 to-purple-600 text-white',
-                        'hover:from-indigo-600 hover:to-purple-700 transition-colors',
+                        'bg-[#1534dc] dark:bg-[#8b5cf6] text-white',
+                        'hover:bg-[#1230c0] dark:hover:bg-[#7a4cf2] transition-colors',
                         'disabled:opacity-40 disabled:cursor-not-allowed',
-                        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/60',
+                        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1534dc]/60 dark:focus-visible:ring-[#8b5cf6]/60',
                       )}
                       aria-label="Crear nueva nota"
                     >
@@ -1485,8 +1485,8 @@ export function NeuronPanel({ open, onClose, onReopenOnboarding }: Props) {
                             onClick={() => openNewNote(null)}
                             className={cn(
                               'h-8 w-full rounded-md text-[11.5px] font-semibold inline-flex items-center justify-center gap-1.5',
-                              'bg-gradient-to-r from-indigo-500 to-purple-600 text-white',
-                              'hover:from-indigo-600 hover:to-purple-700 transition-colors',
+                              'bg-[#1534dc] dark:bg-[#8b5cf6] text-white',
+                              'hover:bg-[#1230c0] dark:hover:bg-[#7a4cf2] transition-colors',
                             )}
                           >
                             <FilePlus className="w-3.5 h-3.5" />
