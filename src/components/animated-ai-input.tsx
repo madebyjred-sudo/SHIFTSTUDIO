@@ -119,7 +119,11 @@ export function AnimatedAiInput({ defaultTenantId = "shift", onOpenHistory, comp
   const [isDebateMode, setIsDebateMode] = useState(false);
   const [isFocused, setIsFocused] = useState(false);
   const activeMode = useActiveGraphStore((state) => state.activeMode);
-  const isCanvasMode = activeMode === 'canvas';
+  // 2026-05-16: legacy `'canvas'` value renamed to `'nodos'` for the
+  // graph-builder mode. `isCanvasMode` is kept as a local alias so the
+  // downstream branches (JSON topology prompt injection, agent label
+  // override, panel chrome, etc.) keep the same shape.
+  const isCanvasMode = activeMode === 'nodos';
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);

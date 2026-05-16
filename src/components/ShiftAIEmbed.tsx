@@ -23,7 +23,7 @@ export function ShiftAIEmbed({ tenantId = "shift" }: ShiftAIEmbedProps) {
                         whileHover={{ scale: 1.1 }}
                         whileTap={{ scale: 0.95 }}
                         onClick={() => setIsOpen(true)}
-                        className="fixed bottom-6 right-6 z-[9999] w-14 h-14 rounded-full bg-gradient-to-br from-blue-600 to-indigo-700 text-white shadow-[0_8px_32px_rgba(59,130,246,0.5)] flex items-center justify-center hover:shadow-[0_8px_40px_rgba(59,130,246,0.7)] transition-shadow"
+                        className="fixed bottom-6 right-6 z-[9999] w-14 h-14 rounded-full bg-[#1534dc] text-white shadow-[0_8px_32px_rgba(59,130,246,0.5)] flex items-center justify-center hover:shadow-[0_8px_40px_rgba(59,130,246,0.7)] transition-shadow"
                     >
                         <MessageCircle className="w-6 h-6" />
                     </motion.button>
@@ -43,7 +43,7 @@ export function ShiftAIEmbed({ tenantId = "shift" }: ShiftAIEmbedProps) {
                         {/* Header */}
                         <div className="flex items-center justify-between px-5 py-3 border-b border-black/5 dark:border-white/10 bg-white/50 dark:bg-white/5">
                             <div className="flex items-center gap-2">
-                                <div className="w-8 h-8 rounded-full bg-gradient-to-br from-blue-600 to-indigo-700 flex items-center justify-center">
+                                <div className="w-8 h-8 rounded-full bg-[#1534dc] flex items-center justify-center">
                                     <MessageCircle className="w-4 h-4 text-white" />
                                 </div>
                                 <div>

@@ -187,7 +187,7 @@ export function parseAndApplyGraphTopology(content: string): { success: boolean;
       const store = useActiveGraphStore.getState();
       store.setNodes(flowNodes);
       store.setEdges(flowEdges);
-      store.setActiveMode('canvas'); // Immersive auto-transition to Canvas
+      store.setActiveMode('nodos'); // Immersive auto-transition to modo nodos
 
       // Remove the JSON block from content for clean chat display
       const beforeBlock = content.slice(0, blockInfo.start);

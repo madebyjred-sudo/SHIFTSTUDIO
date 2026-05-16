@@ -26,8 +26,8 @@ export function TimeTravelTimeline() {
                 key={snap.id}
                 onClick={() => restoreSnapshot(snap.id)}
                 className={`relative group flex items-center justify-center w-8 h-8 rounded-full transition-all duration-300 flex-shrink-0
-                  ${isActive 
-                    ? 'bg-gradient-to-br from-indigo-500 to-purple-600 text-white shadow-md shadow-indigo-500/30 scale-110' 
+                  ${isActive
+                    ? 'bg-[#1534dc] dark:bg-[#8b5cf6] text-white shadow-md scale-110'
                     : 'bg-gray-100 dark:bg-white/5 text-gray-500 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-white/10'
                   }
                 `}

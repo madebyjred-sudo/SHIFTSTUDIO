@@ -2,11 +2,11 @@
  * E2E — modo nodos full flow.
  *
  * Five sub-flows in this spec:
- *   1. Toggle Hojas ↔ Nodos (per-workspace persisted in localStorage)
+ *   1. Toggle Workspace ↔ Nodos via unified top-nav (global activeMode)
  *   2. Graph autosave + reload persistence
  *   3. Mock execution (RUNNING → COMPLETED topo order; export download)
  *   4. Connection validation feedback (invalid tooltip; valid silent)
- *   5. Root-level TopDock "Nodes" redirects to /workspaces
+ *   5. Root-level TopDock "Nodos" redirects to /workspaces or /workspaces/:lastId
  *
  * REQUIRED env (per `tests/e2e/login-and-create-workspace.spec.ts` pattern):
  *   E2E_TEST_EMAIL       — Supabase auth user
@@ -26,8 +26,9 @@
  *     in the e2e job of `.github/workflows/ci.yml`.
  *
  * Notes on app-side hooks added for this spec:
- *   • All key targets carry stable `data-testid`s (page-mode-tab-*, graph-run-
- *     button, graph-save-badge, connection-tooltip, topdock-mode-nodes).
+ *   • All key targets carry stable `data-testid`s (topdock-mode-chat |
+ *     topdock-mode-workspace | topdock-mode-nodos, graph-run-button,
+ *     graph-save-badge, connection-tooltip).
  *   • Visiting any workspace URL with `?e2e=1` exposes the V2 graph store as
  *     `window.__studioGraphStore` so we can inject nodes/edges directly —
  *     drag-and-drop on a ReactFlow pane is brittle in headless Chromium.
@@ -148,43 +149,37 @@ test.describe('E2E: modo nodos full flow', () => {
   // Generous timeout so a slow Vercel cold-start doesn't flake the suite.
   test.setTimeout(90_000);
 
-  test('toggle Hojas ↔ Nodos persists per workspace', async ({ page }) => {
+  test('toggle Workspace ↔ Nodos via unified top-nav', async ({ page }) => {
     await login(page);
-    const workspaceId = await createWorkspace(page);
+    await createWorkspace(page);
 
-    // Default mode = hojas — the Hojas tab should be the selected one and
-    // the ReactFlow renderer should NOT be on screen yet.
+    // Default mode on a workspace URL = workspace (hojas) — the
+    // Workspace button in the top-dock should be pressed and the
+    // ReactFlow renderer should NOT be on screen yet.
     await expect(
-      page.getByTestId('page-mode-tab-hojas'),
-    ).toHaveAttribute('aria-selected', 'true');
+      page.getByTestId('topdock-mode-workspace'),
+    ).toHaveAttribute('aria-pressed', 'true');
     await expect(page.locator('.react-flow__renderer')).toHaveCount(0);
 
     // Flip to Nodos.
-    await page.getByTestId('page-mode-tab-nodos').click();
+    await page.getByTestId('topdock-mode-nodos').click();
     await expect(
-      page.getByTestId('page-mode-tab-nodos'),
-    ).toHaveAttribute('aria-selected', 'true');
+      page.getByTestId('topdock-mode-nodos'),
+    ).toHaveAttribute('aria-pressed', 'true');
     await expect(page.locator('.react-flow__renderer')).toBeVisible({
       timeout: 10_000,
     });
 
-    // localStorage records the choice scoped to this workspace.
-    const stored = await page.evaluate(
-      (id) => window.localStorage.getItem(`studio-workspace-mode-${id}`),
-      workspaceId,
-    );
-    expect(stored).toBe('nodos');
-
-    // Flip back to Hojas — renderer goes away, store flips.
-    await page.getByTestId('page-mode-tab-hojas').click();
+    // Flip back to Workspace — renderer goes away.
+    await page.getByTestId('topdock-mode-workspace').click();
     await expect(page.locator('.react-flow__renderer')).toHaveCount(0, {
       timeout: 5_000,
     });
-    const storedBack = await page.evaluate(
-      (id) => window.localStorage.getItem(`studio-workspace-mode-${id}`),
-      workspaceId,
-    );
-    expect(storedBack).toBe('hojas');
+
+    // The unified top-nav no longer writes a per-workspace localStorage
+    // key (`studio-workspace-mode-${id}`); the global activeMode store is
+    // the single source of truth. The page wrapper still caches the last
+    // workspace id under `studio-last-workspace-id` for deep-linking.
   });
 
   test('graph autosave + reload persistence', async ({ page }) => {
@@ -201,7 +196,7 @@ test.describe('E2E: modo nodos full flow', () => {
     );
 
     // Enter modo nodos.
-    await page.getByTestId('page-mode-tab-nodos').click();
+    await page.getByTestId('topdock-mode-nodos').click();
     await expect(page.locator('.react-flow__renderer')).toBeVisible({
       timeout: 10_000,
     });
@@ -212,7 +207,7 @@ test.describe('E2E: modo nodos full flow', () => {
     // Coming back from the reload: re-select nodos so the canvas mounts
     // again (the page-mode default may snap back to hojas pending the
     // hydration of localStorage on first paint).
-    await page.getByTestId('page-mode-tab-nodos').click().catch(() => undefined);
+    await page.getByTestId('topdock-mode-nodos').click().catch(() => undefined);
     await expect(page.locator('.react-flow__renderer')).toBeVisible({
       timeout: 10_000,
     });
@@ -277,7 +272,7 @@ test.describe('E2E: modo nodos full flow', () => {
     // Reload the page (keep the workspace id, drop the e2e flag so
     // hydration happens via the canonical path).
     await page.goto(`/workspaces/${workspaceId}`);
-    await page.getByTestId('page-mode-tab-nodos').click();
+    await page.getByTestId('topdock-mode-nodos').click();
     await expect(page.locator('.react-flow__renderer')).toBeVisible({
       timeout: 10_000,
     });
@@ -301,13 +296,13 @@ test.describe('E2E: modo nodos full flow', () => {
     await login(page);
     const workspaceId = await createWorkspace(page);
 
-    await page.getByTestId('page-mode-tab-nodos').click();
+    await page.getByTestId('topdock-mode-nodos').click();
     await expect(page.locator('.react-flow__renderer')).toBeVisible({
       timeout: 10_000,
     });
 
     await enableStoreHook(page);
-    await page.getByTestId('page-mode-tab-nodos').click().catch(() => undefined);
+    await page.getByTestId('topdock-mode-nodos').click().catch(() => undefined);
     await expect(page.locator('.react-flow__renderer')).toBeVisible({
       timeout: 10_000,
     });
@@ -439,13 +434,13 @@ test.describe('E2E: modo nodos full flow', () => {
     await login(page);
     await createWorkspace(page);
 
-    await page.getByTestId('page-mode-tab-nodos').click();
+    await page.getByTestId('topdock-mode-nodos').click();
     await expect(page.locator('.react-flow__renderer')).toBeVisible({
       timeout: 10_000,
     });
 
     await enableStoreHook(page);
-    await page.getByTestId('page-mode-tab-nodos').click().catch(() => undefined);
+    await page.getByTestId('topdock-mode-nodos').click().catch(() => undefined);
     await expect(page.locator('.react-flow__renderer')).toBeVisible({
       timeout: 10_000,
     });
@@ -605,25 +600,30 @@ test.describe('E2E: modo nodos full flow', () => {
     );
   });
 
-  test('root-level TopDock "Nodes" redirects to /workspaces', async ({ page }) => {
+  test('root-level TopDock "Nodos" redirects to a workspace surface', async ({ page }) => {
     await login(page);
 
-    // From /workspaces, ensure the TopDock isn't visible (workspaces list
-    // owns its own chrome). Navigate to root (`/`) to land on the legacy
-    // chat-only layout where the TopDock lives.
+    // Clear any cached last-workspace id from a prior test run so the
+    // redirect lands deterministically on the list (the only safe
+    // fallback when there's no last id).
+    await page.evaluate(() => window.localStorage.removeItem('studio-last-workspace-id'));
+
+    // From /workspaces, navigate to root (`/`) to land on the chat-only
+    // layout where the unified TopDock segmented control lives.
     await page.goto('/');
 
-    // The chat root mounts the TopDock; the Nodes button should be there.
-    const nodesBtn = page.getByTestId('topdock-mode-nodes');
+    // The chat root mounts the TopDock; the Nodos button should be there.
+    const nodesBtn = page.getByTestId('topdock-mode-nodos');
     await expect(nodesBtn).toBeVisible({ timeout: 10_000 });
     await nodesBtn.click();
 
-    // F1 (App.tsx) redirects /+canvas-mode → /workspaces. The redirect is
+    // Unified top-nav redirects /+nodos-mode → /workspaces/:lastId, or
+    // /workspaces (list) when there is no last id. The redirect is
     // routed via window.location, so a URL assertion is the cleanest probe.
-    await expect(page).toHaveURL(/\/workspaces$/, { timeout: 10_000 });
+    await expect(page).toHaveURL(/\/workspaces(\/.+)?$/, { timeout: 10_000 });
 
-    // And the canvas (ReactFlow) is NOT mounted at the root — workspaces
-    // list owns the page now.
-    await expect(page.locator('.react-flow__renderer')).toHaveCount(0);
+    // The chat-only root layout is gone — we're now on a workspaces
+    // surface (list or canvas) so the URL no longer matches '/'.
+    await expect(page).not.toHaveURL(/\/$/);
   });
 });
