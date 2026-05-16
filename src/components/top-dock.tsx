@@ -4,6 +4,7 @@ import { useActiveGraphStore } from '@/store';
 import { cn } from '@/lib/utils';
 import { useTheme } from '@/lib/theme-context';
 import { useAuthStore } from '@/store/useAuthStore';
+import { navigate } from '@/lib/router';
 
 interface TopDockProps {
   onOpenHistory?: () => void;
@@ -25,16 +26,24 @@ export function TopDock({ onOpenHistory, onToggleHistory, isHistoryOpen, onOpenN
   return (
     <header className="sticky top-0 z-[90] w-full">
       <div className="w-full bg-white/80 dark:bg-[#0b1120]/80 border-b border-white/60 dark:border-white/10 backdrop-blur-xl shadow-[0_4px_20px_rgba(0,0,0,0.06)] dark:shadow-[0_4px_20px_rgba(0,0,0,0.3)] px-3 py-2 md:px-4 md:py-2.5 flex items-center justify-between gap-2 md:gap-4">
-        {/* Brand */}
-        <div className="flex items-center gap-2 min-w-0">
+        {/* Brand — clickable, navigates to /workspaces list (single portal,
+            replaces previously duplicated floating button on Chat surface). */}
+        <button
+          type="button"
+          onClick={() => navigate('/workspaces')}
+          className="flex items-center gap-2 min-w-0 rounded-xl hover:opacity-90 transition-opacity focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1534dc]/50"
+          title="Ir a mis workspaces"
+          aria-label="Ir a mis workspaces"
+          data-testid="topdock-brand"
+        >
           <div className="h-9 px-3 rounded-xl bg-white/80 dark:bg-white/5 border border-white/80 dark:border-white/10 shadow-sm flex items-center">
             <DynamicSVG path="/logo.svg" className="h-[18px] w-auto" />
           </div>
-          <div className="hidden xl:flex flex-col leading-tight">
+          <div className="hidden xl:flex flex-col leading-tight items-start">
             <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-[#0e1745]/35 dark:text-white/35">Shift Studio</span>
             <span className="text-[11px] font-medium text-[#0e1745]/70 dark:text-white/70">Legio Digitalis Workspace</span>
           </div>
-        </div>
+        </button>
 
         {/* Workspace toggle — 3 modos (Chat | Workspace | Nodos). Selected
             state usa el mismo solid `bg-white dark:bg-white/10 shadow-sm`
