@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useEffect, useMemo } from 'react';
 import { Handle, Position } from '@xyflow/react';
-import { Bot, Settings2, Loader2, CheckCircle2, AlertTriangle, ChevronDown, ChevronUp } from 'lucide-react';
+import { Bot, Settings2, Loader2, CheckCircle2, AlertTriangle, ChevronDown, ChevronUp, GitMerge } from 'lucide-react';
 import { useActiveGraphStore } from '../../store';
 import { useConnectionDrag } from '../../lib/connection-drag-context';
 import { validateConnection } from '../../lib/graph-rules';
@@ -123,6 +123,16 @@ export function SpecialistNode({ id, data }: any) {
   const iconBgClass = status === 'FAILED' ? 'bg-red-100 dark:bg-red-800 text-red-600 dark:text-red-300' : 'bg-indigo-100 dark:bg-indigo-800 text-indigo-600 dark:text-indigo-300';
   const titleClass = status === 'FAILED' ? 'text-red-900 dark:text-red-100' : 'text-indigo-900 dark:text-indigo-100';
 
+  // ─── Wave-E: incoming-edge consolidation badge ─────────────────────
+  // When N > 1 edges point at this node, surface "Consolida N entradas"
+  // so the user knows the prompt will receive the aggregated output of
+  // every predecessor (executor's _aggregate_predecessor_input). Cheap
+  // re-render — we subscribe with a primitive selector so unrelated
+  // store updates don't redraw the node.
+  const incomingCount = useActiveGraphStore(
+    (s) => s.edges.filter((e) => e.target === id).length,
+  );
+
   // ─── Connection feedback (F2) ───
   const drag = useConnectionDrag();
   const isSource = drag.active && drag.sourceNodeId === id;
@@ -145,13 +155,23 @@ export function SpecialistNode({ id, data }: any) {
       />
 
       <div className={`${headerBgClass} px-4 py-2 flex items-center justify-between`}>
-        <div className="flex items-center gap-2">
-          <div className={`w-6 h-6 rounded-md flex items-center justify-center ${iconBgClass}`}>
+        <div className="flex items-center gap-2 min-w-0">
+          <div className={`w-6 h-6 rounded-md flex items-center justify-center shrink-0 ${iconBgClass}`}>
             <Bot className="w-3.5 h-3.5" />
           </div>
-          <div className={`font-semibold text-sm ${titleClass}`}>Nodo Especialista</div>
+          <div className={`font-semibold text-sm truncate ${titleClass}`}>Nodo Especialista</div>
+          {incomingCount > 1 && (
+            <span
+              data-testid="specialist-merge-badge"
+              title="Este nodo recibe múltiples entradas y las combina antes de correr el prompt."
+              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] font-semibold bg-amber-500/15 text-amber-700 dark:text-amber-300 shrink-0"
+            >
+              <GitMerge className="w-3 h-3" />
+              Consolida {incomingCount} entradas
+            </span>
+          )}
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 shrink-0">
           {status === 'RUNNING' && <Loader2 className="w-4 h-4 text-indigo-500 animate-spin" />}
           {status === 'COMPLETED' && <CheckCircle2 className="w-4 h-4 text-emerald-500" />}
           {status === 'FAILED' && <AlertTriangle className="w-4 h-4 text-red-500" />}
