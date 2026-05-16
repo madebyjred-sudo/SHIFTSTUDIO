@@ -69,6 +69,24 @@ function normalizeFormat(raw: unknown): ExportFormat {
 export function ExportNode({ id, data }: any) {
   const updateNodeData = useActiveGraphStore((s) => s.updateNodeData);
 
+  // ─── Wave-E: incoming-edge preview ─────────────────────────────────
+  // Show the user (before they hit "Ejecutar") which specialists will
+  // feed this exporter — same labels the BFF will use when building
+  // `sections[]`. Subscribe via a primitive selector that returns the
+  // already-mapped string array so React only re-renders when the
+  // joined preview changes, not on every store mutation.
+  const previewSources = useActiveGraphStore((s) => {
+    const incoming = s.edges.filter((e) => e.target === id);
+    return incoming.map((e) => {
+      const node = s.nodes.find((n) => n.id === e.source);
+      const d = (node?.data ?? {}) as Record<string, unknown>;
+      const label = (d['label'] as string | undefined)?.trim();
+      const agent =
+        (d['agent'] as string | undefined) || (d['agent_id'] as string | undefined);
+      return label || agent || 'specialist';
+    });
+  });
+
   const format: ExportFormat = useMemo(() => normalizeFormat(data?.format), [data?.format]);
   const rawStatus = (data?.status as string) || 'IDLE';
   const status: VisualStatus = STORE_TO_VISUAL[rawStatus] ?? 'idle';
@@ -234,6 +252,36 @@ export function ExportNode({ id, data }: any) {
             {meta.hint}
           </p>
         </div>
+
+        {/* Wave-E incoming preview — shows the user which specialists
+            will feed this exporter, before they hit "Ejecutar". When
+            no edges are connected we surface a soft hint instead. */}
+        {previewSources.length > 0 ? (
+          <div
+            data-testid="export-preview-sources"
+            className="text-[11px] rounded-md px-2 py-1.5 leading-snug"
+            style={{
+              background: 'color-mix(in srgb, var(--color-shift-primary) 5%, transparent)',
+              color: 'var(--color-muted-foreground)',
+              border: '1px dashed var(--color-border)',
+            }}
+          >
+            <span className="font-semibold" style={{ color: 'var(--color-card-foreground)' }}>
+              Va a consolidar:
+            </span>{' '}
+            {previewSources.join(', ')}
+          </div>
+        ) : (
+          <div
+            className="text-[11px] rounded-md px-2 py-1.5 leading-snug italic"
+            style={{
+              color: 'var(--color-muted-foreground)',
+              border: '1px dashed var(--color-border)',
+            }}
+          >
+            Conectá uno o más especialistas para exportar.
+          </div>
+        )}
 
         {/* Complete: download link */}
         {isComplete && exportUrl && (

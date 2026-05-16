@@ -13,7 +13,7 @@ import {
   type OnConnectStart,
   type OnConnectEnd,
 } from '@xyflow/react';
-import { Play, Square, LayoutGrid, Loader2, Check, AlertCircle, CloudOff, MessageSquare } from 'lucide-react';
+import { Play, Square, LayoutGrid, Loader2, Check, AlertCircle, CloudOff, MessageSquare, Sparkles } from 'lucide-react';
 import '@xyflow/react/dist/style.css';
 import { useActiveGraphStore } from '../store';
 import { useGraphStoreV2 } from '../store/useGraphStoreV2';
@@ -23,6 +23,7 @@ import { SpecialistNode } from './nodes/SpecialistNode';
 import { ExportNode } from './nodes/ExportNode';
 import { GraphChatSidebar } from './nodes/GraphChatSidebar';
 import { GraphCommandBar, type GraphCommandBarHandle } from './nodes/GraphCommandBar';
+import { GraphTemplateGallery, consumeFirstVisitFlag } from './nodes/GraphTemplateGallery';
 import { AnimatedEdge } from './edges/AnimatedEdge';
 import { HITLModal } from './HITLModal';
 import { CanvasContextMenu } from './CanvasContextMenu';
@@ -126,6 +127,9 @@ function ShiftyNodeCanvasInner() {
   // surfaces share `useGraphArchitectChat` state via localStorage scope.
   const [chatSidebarOpen, setChatSidebarOpen] = useState(false);
   const commandBarRef = useRef<GraphCommandBarHandle | null>(null);
+  // Wave-E: template gallery state. First-visit auto-open runs once
+  // per browser via the localStorage flag in `consumeFirstVisitFlag`.
+  const [showTemplateGallery, setShowTemplateGallery] = useState(false);
   const { fitView, getViewport, setViewport } = useReactFlow();
 
   // Workspace id is set by `WorkspaceCanvasPage` on mount via the V2
@@ -217,6 +221,21 @@ function ShiftyNodeCanvasInner() {
       ac.abort();
     };
   }, [workspaceId, setNodes, setEdges, setViewport]);
+
+  // ─── Wave-E: first-visit gallery auto-open ─────────────────────────
+  // Open the template gallery once per browser the first time the user
+  // lands on modo nodos. The flag is consumed on read so subsequent
+  // visits go straight to the empty canvas (with the "+ Template"
+  // button available in the top-right panel). We schedule this on a
+  // microtask after hydration so the gallery doesn't race the autosave.
+  useEffect(() => {
+    const t = window.setTimeout(() => {
+      if (consumeFirstVisitFlag()) setShowTemplateGallery(true);
+    }, 400);
+    return () => window.clearTimeout(t);
+    // Intentionally empty deps — run exactly once per mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // ─── Save runner ──────────────────────────────────────────────────
   // Pulled out so it can be invoked from the debounce callback AND
@@ -730,6 +749,18 @@ function ShiftyNodeCanvasInner() {
                 CHAT
               </button>
 
+              {/* Wave-E: open template gallery. Pre-armed DAGs as starting
+                  points; Shifty can iterate on them via chat afterwards. */}
+              <button
+                data-testid="open-template-gallery"
+                onClick={() => setShowTemplateGallery(true)}
+                title="Cargar un template pre-armado"
+                className="flex items-center gap-2 min-h-9 px-4 py-2 text-[12px] font-bold rounded-xl shadow-lg border-2 transition-all bg-white dark:bg-black/50 text-gray-700 dark:text-white border-gray-200 dark:border-white/10 hover:border-amber-500 dark:hover:border-amber-500 backdrop-blur-md"
+              >
+                <Sparkles className="w-3.5 h-3.5" />
+                + TEMPLATE
+              </button>
+
               {nodes.length > 0 && (
                 <button
                   onClick={handleRelayout}
@@ -791,6 +822,27 @@ function ShiftyNodeCanvasInner() {
       </div>
 
       <ShareWorkflowModal isOpen={showShareModal} onClose={() => setShowShareModal(false)} />
+      <GraphTemplateGallery
+        isOpen={showTemplateGallery}
+        onClose={() => setShowTemplateGallery(false)}
+        onTemplateApplied={(template) => {
+          // Hook for the Shifty sidebar to surface "Este flow hace X.
+          // ¿Lo personalizamos para tu caso?". The sidebar isn't part
+          // of this Wave-E task — emit a custom DOM event so whatever
+          // owns the sidebar can subscribe without us coupling here.
+          if (typeof window !== 'undefined') {
+            window.dispatchEvent(
+              new CustomEvent('shifty:template-loaded', {
+                detail: {
+                  slug: template.slug,
+                  name: template.name,
+                  description: template.description,
+                },
+              }),
+            );
+          }
+        }}
+      />
       <HITLModal />
 
       {/* Floating connection-validation tooltip. role="status" + aria-live
