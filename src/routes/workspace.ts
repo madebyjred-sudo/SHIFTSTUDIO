@@ -821,7 +821,39 @@ workspaceRouter.get('/:id/graph', async (req: Request, res: Response) => {
       .select('nodes, edges, viewport, updated_at')
       .eq('workspace_id', id)
       .maybeSingle();
-    if (error) throw new Error(error.message);
+    if (error) {
+      // Differentiate "table missing" (migration not applied) from
+      // generic errors so the client + ops know what to do. Postgres
+      // returns SQLSTATE 42P01 for "relation does not exist"; Supabase
+      // surfaces it via `error.code`.
+      const code = (error as { code?: string; details?: string }).code;
+      if (code === '42P01' || /relation .* does not exist/i.test(error.message)) {
+        reqLog(req).error('workspace.graph.table_missing', {
+          workspaceId: id,
+          code,
+          message: error.message,
+        });
+        res.status(503).json({
+          ok: false,
+          error: 'studio_workspace_graphs_table_missing',
+          detail:
+            'Migration 20260510000001_studio_workspace_graphs.sql is not applied on this Supabase project.',
+        });
+        return;
+      }
+      reqLog(req).error('workspace.graph.supabase_error', {
+        workspaceId: id,
+        code,
+        message: error.message,
+        details: (error as { details?: string }).details,
+      });
+      res.status(500).json({
+        ok: false,
+        error: 'graph_fetch_failed',
+        supabase_code: code ?? null,
+      });
+      return;
+    }
 
     if (!data) {
       // No row yet — return a valid empty graph so the client can render.
@@ -839,6 +871,7 @@ workspaceRouter.get('/:id/graph', async (req: Request, res: Response) => {
     reqLog(req).error('workspace.graph.fetch.failed', {
       workspaceId: id,
       message: (err as Error).message,
+      stack: (err as Error).stack?.slice(0, 2000),
     });
     res.status(500).json({ ok: false, error: 'graph_fetch_failed' });
   }
