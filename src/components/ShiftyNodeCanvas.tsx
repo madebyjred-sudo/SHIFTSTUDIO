@@ -106,6 +106,87 @@ function safeViewport(v: Viewport | undefined): { x: number; y: number; zoom: nu
   return { x: v.x, y: v.y, zoom: v.zoom };
 }
 
+// Fields that the autosave layer treats as TRANSIENT — present in the
+// store but never persisted (set by applyGraphWithDiff for animation,
+// by SSE handlers for live output streaming, etc.). When only these
+// change between snapshots, no save is scheduled.
+const TRANSIENT_DATA_KEYS = new Set<string>([
+  'diffState',
+  '__pendingRemoval',
+  'outputText',
+  'tokens',
+  'costUsd',
+  'errorMsg',
+  'exportUrl',
+  'status',
+  'presetSections',
+]);
+
+function persistableDataFingerprint(data: unknown): string {
+  if (!data || typeof data !== 'object') return '';
+  const persistable: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(data as Record<string, unknown>)) {
+    if (TRANSIENT_DATA_KEYS.has(k)) continue;
+    persistable[k] = v;
+  }
+  // JSON serialization is deterministic for our shapes (plain objects +
+  // primitives). Stable enough for shallow equality of small graphs.
+  try {
+    return JSON.stringify(persistable);
+  } catch {
+    return '';
+  }
+}
+
+interface AnyNode {
+  id: string;
+  type?: string;
+  position?: { x: number; y: number };
+  data?: unknown;
+}
+
+interface AnyEdge {
+  id?: string;
+  source: string;
+  target: string;
+}
+
+/**
+ * Return true when the two graphs are equal across all PERSISTABLE
+ * fields. Used by the autosave subscriber to skip spurious saves when
+ * only transient flags changed (diff animation, status flips, streaming
+ * token deltas, etc.).
+ */
+function isPersistableEqual(
+  nodesA: readonly AnyNode[],
+  nodesB: readonly AnyNode[],
+  edgesA: readonly AnyEdge[],
+  edgesB: readonly AnyEdge[],
+): boolean {
+  if (nodesA.length !== nodesB.length) return false;
+  if (edgesA.length !== edgesB.length) return false;
+  for (let i = 0; i < nodesA.length; i++) {
+    const a = nodesA[i];
+    const b = nodesB[i];
+    if (a.id !== b.id) return false;
+    if (a.type !== b.type) return false;
+    const ax = a.position?.x ?? 0;
+    const ay = a.position?.y ?? 0;
+    const bx = b.position?.x ?? 0;
+    const by = b.position?.y ?? 0;
+    if (ax !== bx || ay !== by) return false;
+    if (persistableDataFingerprint(a.data) !== persistableDataFingerprint(b.data)) {
+      return false;
+    }
+  }
+  for (let i = 0; i < edgesA.length; i++) {
+    const a = edgesA[i];
+    const b = edgesB[i];
+    if (a.source !== b.source || a.target !== b.target) return false;
+  }
+  return true;
+}
+
 function ShiftyNodeCanvasInner() {
   const {
     nodes,
@@ -143,6 +224,11 @@ function ShiftyNodeCanvasInner() {
   // Track hydration so the first store-set from the server doesn't
   // immediately re-fire a save with the same payload.
   const hydratedRef = useRef(false);
+  // Separate gate for autosave. On hydration FAILURE we still flip
+  // hydratedRef=true (so the UI doesn't block) but we leave canAutosaveRef
+  // at false — otherwise every subsequent store mutation hits a broken
+  // endpoint and triggers the exponential-backoff retry loop.
+  const canAutosaveRef = useRef(false);
   // Debounce + queue plumbing.
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inflightRef = useRef<AbortController | null>(null);
@@ -167,6 +253,7 @@ function ShiftyNodeCanvasInner() {
     // Reset hydration when workspace changes so re-mounting doesn't
     // leak state across workspaces.
     hydratedRef.current = false;
+    canAutosaveRef.current = false;
     if (!workspaceId) {
       // Legacy chat-mode canvas — no persistence target.
       setSaveStatus('idle');
@@ -202,16 +289,23 @@ function ShiftyNodeCanvasInner() {
         // Mark hydrated AFTER the setters have flushed so the change
         // subscription below ignores the hydration writes.
         setTimeout(() => {
-          if (!cancelled) hydratedRef.current = true;
+          if (!cancelled) {
+            hydratedRef.current = true;
+            // Hydration succeeded → autosave can fire on subsequent changes.
+            canAutosaveRef.current = true;
+          }
         }, 0);
         setLastSavedAt(graph.updated_at ? Date.parse(graph.updated_at) : null);
         setSaveStatus(graph.updated_at ? 'saved' : 'idle');
       })
       .catch((err) => {
         if (cancelled || ac.signal.aborted) return;
-        // Hydration failure is non-fatal — the user can still build a
-        // graph and the autosave will try to PUT on the next change.
-        // Mark hydrated so changes don't get blocked indefinitely.
+        // Hydration failure is non-fatal for the UI — the user can still
+        // build a graph locally. But we deliberately leave canAutosaveRef
+        // at false: every subsequent change would otherwise PUT to the
+        // same broken endpoint and the exponential-backoff retry would
+        // loop. The error badge surfaces it; user can refresh once the
+        // BFF recovers.
         console.error('[ShiftyNodeCanvas] graph hydration failed:', err);
         hydratedRef.current = true;
         setSaveStatus('error');
@@ -357,13 +451,24 @@ function ShiftyNodeCanvasInner() {
   // ─── Mark dirty + schedule save on store changes ──────────────────
   useEffect(() => {
     if (!workspaceId) return;
-    // Subscribe directly to the V2 store. We watch nodes + edges
-    // identity; xyflow gives us new arrays on every interaction so a
-    // simple `===` compare is enough. Viewport changes fire through
-    // onMoveEnd separately (see below).
+    // Subscribe directly to the V2 store. We compare PERSISTABLE shape
+    // only — bare `===` on nodes/edges arrays catches every internal
+    // mutation (diff animation cleanup, transient outputText streaming,
+    // status flips, etc.) and produced spurious saves against the BFF.
+    // When the BFF was returning 500 on /api/workspace/:id/graph, those
+    // spurious saves looped on the exponential backoff.
+    //
+    // We also gate on `canAutosaveRef` — set FALSE when hydration failed.
+    // Hitting a broken endpoint with successive PUTs makes nothing better.
     const unsub = useGraphStoreV2.subscribe((state, prev) => {
       if (!hydratedRef.current) return;
+      if (!canAutosaveRef.current) return;
+      // Cheap identity short-circuit first — only invoke deep compare
+      // when references actually changed.
       if (state.nodes === prev.nodes && state.edges === prev.edges) return;
+      if (isPersistableEqual(state.nodes, prev.nodes, state.edges, prev.edges)) {
+        return;
+      }
       setSaveStatus((s) => (s === 'saving' ? s : 'unsaved'));
       scheduleSaveRef.current();
     });

@@ -13,6 +13,7 @@
     "test:smoke": "playwright test tests/smoke",
     "test:security": "playwright test tests/security",
     "test:e2e": "playwright test tests/e2e",
+    "test:honest": "E2E_HONEST=true playwright test tests/e2e/modo-nodos-honest.spec.ts --workers=1",
     "test": "playwright test"
   },
   "dependencies": {

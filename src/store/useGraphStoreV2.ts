@@ -547,6 +547,22 @@ export const useGraphStoreV2 = create<AppState>((set, get) => ({
     }
     diffCleanupTimer = setTimeout(() => {
       diffCleanupTimer = null;
+      // Identity-preserving cleanup: only call set() if there is real work
+      // to do. Each set() produces a new `nodes` array reference, which
+      // ShiftyNodeCanvas's autosave subscriber treats as a dirty signal
+      // and schedules a save against /api/workspace/:id/graph. Previous
+      // bug: cleanup fired even when no node had `diffState` or
+      // `__pendingRemoval`, kicking a no-op save (and, when the endpoint
+      // is 500-ing, a retry loop).
+      const cur = get().nodes;
+      const hasPendingRemoval = cur.some(
+        (n) => (n.data as { __pendingRemoval?: boolean })?.__pendingRemoval,
+      );
+      const hasDiffState = cur.some(
+        (n) => (n.data as { diffState?: unknown })?.diffState,
+      );
+      if (!hasPendingRemoval && !hasDiffState) return;
+
       set((state) => ({
         nodes: state.nodes
           .filter(
@@ -593,12 +609,21 @@ export const useGraphStoreV2 = create<AppState>((set, get) => ({
       activeUnsubscribe = null;
     }
 
-    set({
+    // Batched mutation: reset all node statuses to IDLE + flip isExecuting
+    // in a single `set()` call. The previous per-node forEach produced N
+    // synchronous set() calls inside an async context, each triggering a
+    // React re-render — on 6-node graphs this cascaded into React error
+    // #185 (max update depth) because ReactFlow re-reconciled nodes on
+    // every render.
+    set((state) => ({
       isExecuting: true,
       currentNarration: 'Iniciando ejecución…',
       currentExecutionId: null,
-    });
-    get().nodes.forEach((n) => get().updateNodeStatus(n.id, 'IDLE'));
+      nodes: state.nodes.map((n) => ({
+        ...n,
+        data: { ...n.data, status: 'IDLE' as const },
+      })),
+    }));
 
     const { nodes, edges, workspaceId } = get();
     const wireNodes: GraphExecutionNode[] = nodes.map((n) => ({

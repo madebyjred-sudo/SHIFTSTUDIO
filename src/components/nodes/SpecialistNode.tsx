@@ -40,35 +40,40 @@ const MAX_TOKENS_MIN = 100;
 const MAX_TOKENS_MAX = 4000;
 
 export function SpecialistNode({ id, data }: any) {
-  const [agent, setAgent] = useState(data.agent || 'shiftai');
-  const [prompt, setPrompt] = useState(data.prompt || '');
-  const [label, setLabel] = useState<string>(data.label ?? '');
-  const [model, setModel] = useState<string>(data.model || DEFAULT_MODEL);
-  const [maxTokens, setMaxTokens] = useState<number>(
-    typeof data.max_tokens === 'number' ? data.max_tokens : DEFAULT_MAX_TOKENS,
-  );
-  const [temperature, setTemperature] = useState<number>(
-    typeof data.temperature === 'number' ? data.temperature : DEFAULT_TEMPERATURE,
-  );
+  // ─── Persistable fields are derived from `data` — no local useState ─
+  //
+  // Previously these 6 fields lived in local useState seeded from `data`.
+  // useState seeds run ONCE on mount; subsequent external `data` changes
+  // (template apply, architect iteration, graph re-hydration) did NOT
+  // resync local state, so the UI silently displayed stale values while
+  // the store held the new ones. ReactFlow reuses the component instance
+  // across data swaps when the node id is the same, which made this
+  // failure mode invisible at first glance.
+  //
+  // The store is the single source of truth. Values are derived directly;
+  // the handlers route every change through `updateNodeData` so the store
+  // re-renders the node with the new value naturally.
+  const agent: string = data.agent || 'shiftai';
+  const prompt: string = data.prompt || '';
+  const label: string = data.label ?? '';
+  const model: string = data.model || DEFAULT_MODEL;
+  const maxTokens: number =
+    typeof data.max_tokens === 'number' ? data.max_tokens : DEFAULT_MAX_TOKENS;
+  const temperature: number =
+    typeof data.temperature === 'number' ? data.temperature : DEFAULT_TEMPERATURE;
   const updateNodeData = useActiveGraphStore((s) => s.updateNodeData);
   const status = data.status || 'IDLE';
 
   const handleAgentChange = useCallback((e: React.ChangeEvent<HTMLSelectElement>) => {
-    const val = e.target.value;
-    setAgent(val);
-    updateNodeData(id, { agent: val });
+    updateNodeData(id, { agent: e.target.value });
   }, [id, updateNodeData]);
 
   const handleLabelChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
-    const val = e.target.value;
-    setLabel(val);
-    updateNodeData(id, { label: val });
+    updateNodeData(id, { label: e.target.value });
   }, [id, updateNodeData]);
 
   const handleModelChange = useCallback((e: React.ChangeEvent<HTMLSelectElement>) => {
-    const val = e.target.value;
-    setModel(val);
-    updateNodeData(id, { model: val });
+    updateNodeData(id, { model: e.target.value });
   }, [id, updateNodeData]);
 
   const handleMaxTokensChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
@@ -76,14 +81,12 @@ export function SpecialistNode({ id, data }: any) {
     // pastes a non-numeric value. Empty input falls back to default.
     const raw = e.target.value;
     if (raw === '') {
-      setMaxTokens(DEFAULT_MAX_TOKENS);
       updateNodeData(id, { max_tokens: DEFAULT_MAX_TOKENS });
       return;
     }
     const parsed = Number(raw);
     if (!Number.isFinite(parsed)) return;
     const clamped = Math.max(MAX_TOKENS_MIN, Math.min(MAX_TOKENS_MAX, Math.round(parsed)));
-    setMaxTokens(clamped);
     updateNodeData(id, { max_tokens: clamped });
   }, [id, updateNodeData]);
 
@@ -91,10 +94,11 @@ export function SpecialistNode({ id, data }: any) {
     const parsed = Number(e.target.value);
     if (!Number.isFinite(parsed)) return;
     const clamped = Math.max(0, Math.min(1, parsed));
-    setTemperature(clamped);
     updateNodeData(id, { temperature: clamped });
   }, [id, updateNodeData]);
 
+  // UI-only toggles stay as local state — they aren't persistable + don't
+  // need to survive a data swap.
   const [expanded, setExpanded] = useState(false);
   // Advanced config (model + max_tokens + temperature) is collapsed by
   // default — keeps the node visually quiet for the 90% case where the
@@ -102,9 +106,7 @@ export function SpecialistNode({ id, data }: any) {
   const [configOpen, setConfigOpen] = useState(false);
 
   const handlePromptChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    const val = e.target.value;
-    setPrompt(val);
-    updateNodeData(id, { prompt: val });
+    updateNodeData(id, { prompt: e.target.value });
   }, [id, updateNodeData]);
 
   // Auto-expand when status becomes COMPLETED or FAILED and there is output
