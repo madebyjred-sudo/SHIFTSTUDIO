@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useMemo } from 'react';
+import React, { useCallback, useMemo } from 'react';
 import { Handle, Position } from '@xyflow/react';
 import { FileText, Paperclip, Loader2, CheckCircle2 } from 'lucide-react';
 import { useActiveGraphStore } from '../../store';
@@ -8,14 +8,18 @@ export function ContextNode({ id, data }: any) {
   // Field rename: Cerebro executor reads `data.content` for context nodes.
   // Keep `data.text` fallback for backwards-compat with graphs persisted
   // before this rename. New writes always go to `data.content`.
-  const [text, setText] = useState(data.content ?? data.text ?? '');
+  //
+  // Note: text is derived directly from `data` — NO local useState. Local
+  // useState would skip re-init when ReactFlow reuses the component
+  // instance (same node id) across a template apply, leaving stale text
+  // in the textarea while the store has the new content. The store is
+  // the single source of truth; the textarea reads from it.
+  const text: string = data.content ?? data.text ?? '';
   const updateNodeData = useActiveGraphStore((s) => s.updateNodeData);
   const status = data.status || 'IDLE';
 
   const handleTextChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    const val = e.target.value;
-    setText(val);
-    updateNodeData(id, { content: val });
+    updateNodeData(id, { content: e.target.value });
   }, [id, updateNodeData]);
 
   const ringClass = status === 'RUNNING' ? 'ring-2 ring-blue-500 ring-offset-2 dark:ring-offset-[#1A1A1A] animate-pulse duration-1000' : status === 'COMPLETED' ? 'ring-2 ring-emerald-500 ring-offset-2 dark:ring-offset-[#1A1A1A]' : '';

@@ -1,5 +1,6 @@
 import React, { useCallback, useMemo } from 'react';
 import { Handle, Position } from '@xyflow/react';
+import { useShallow } from 'zustand/react/shallow';
 import {
   Download,
   Loader2,
@@ -72,20 +73,34 @@ export function ExportNode({ id, data }: any) {
   // ─── Wave-E: incoming-edge preview ─────────────────────────────────
   // Show the user (before they hit "Ejecutar") which specialists will
   // feed this exporter — same labels the BFF will use when building
-  // `sections[]`. Subscribe via a primitive selector that returns the
-  // already-mapped string array so React only re-renders when the
-  // joined preview changes, not on every store mutation.
-  const previewSources = useActiveGraphStore((s) => {
-    const incoming = s.edges.filter((e) => e.target === id);
-    return incoming.map((e) => {
-      const node = s.nodes.find((n) => n.id === e.source);
-      const d = (node?.data ?? {}) as Record<string, unknown>;
-      const label = (d['label'] as string | undefined)?.trim();
-      const agent =
-        (d['agent'] as string | undefined) || (d['agent_id'] as string | undefined);
-      return label || agent || 'specialist';
-    });
-  });
+  // `sections[]`.
+  //
+  // CRITICAL — must use `useShallow`: the previous bare selector
+  // returned `incoming.map(...)` directly, which allocates a NEW array
+  // on every store read. Zustand uses Object.is for equality, so a new
+  // array reference looks "changed" every time, causing ExportNode to
+  // re-render on every store mutation. For DAGs with ≥1 edge into the
+  // export node (i.e. every real template), this triggered React error
+  // #185 (max update depth) when a template was applied — ExportNode
+  // re-rendered → ReactFlow updated edges → store mutated → selector
+  // re-ran with new array → render → loop.
+  //
+  // `useShallow` compares array elements pairwise; identical content
+  // returns the previous reference so React skips the re-render.
+  const previewSources = useActiveGraphStore(
+    useShallow((s) => {
+      const incoming = s.edges.filter((e) => e.target === id);
+      return incoming.map((e) => {
+        const node = s.nodes.find((n) => n.id === e.source);
+        const d = (node?.data ?? {}) as Record<string, unknown>;
+        const label = (d['label'] as string | undefined)?.trim();
+        const agent =
+          (d['agent'] as string | undefined) ||
+          (d['agent_id'] as string | undefined);
+        return label || agent || 'specialist';
+      });
+    }),
+  );
 
   const format: ExportFormat = useMemo(() => normalizeFormat(data?.format), [data?.format]);
   const rawStatus = (data?.status as string) || 'IDLE';
